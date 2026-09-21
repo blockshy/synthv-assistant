@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "synthv-assistant": {
+      "command": "C:\\path\\to\\synthv-assistant\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "synthv_assistant", "mcp"],
+      "env": {
+        "SYNTHV_ASSISTANT_DATA": "C:\\path\\to\\synthv-assistant\\data",
+        "SYNTHV_AUDIO_PROVIDER": "none"
+      }
+    }
+  }
+}

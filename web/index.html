@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>SynthV 对话工作台</title>
+  <!-- 提前应用已保存主题，再加载样式，避免页面首帧使用错误配色。 -->
+  <script src="/layout.js"></script>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+  <script src="/pages.js" defer></script>
+  <script src="/models.js" defer></script>
+  <script src="/chat.js" defer></script>
+</head>
+<body class="conversation-workbench">
+  <a id="skip-to-chat" class="skip-link" href="#chat-input">跳到消息输入框</a>
+  <!-- 三栏工作台以对话为主；工程写入与试听控件集中在独立检查器中。 -->
+  <header class="desktop-topbar">
+    <div class="desktop-identity"><button id="toggle-sidebar" class="icon-button mobile-only" type="button" aria-label="显示会话列表" aria-expanded="false">☰</button><span class="brand-mark" aria-hidden="true">∿</span><strong>SynthV <span>工作台</span></strong><span class="desktop-local">本地</span></div>
+    <ul class="status-list" aria-label="服务连接状态">
+      <li id="bridge-status" class="status-pill" data-state="pending"><i aria-hidden="true"></i><span>调教桥接 · 检查中</span></li>
+      <li id="capture-status" class="status-pill" data-state="pending"><i aria-hidden="true"></i><span>音频采集 · 检查中</span></li>
+      <li id="review-status" class="status-pill" data-state="pending"><i aria-hidden="true"></i><span>模型服务 · 检查中</span></li>
+    </ul>
+    <div class="desktop-header-actions"><button id="refresh-status" class="icon-button" type="button" aria-label="刷新服务状态" title="刷新服务状态">↻</button><button id="toggle-inspector" class="button button-quiet" type="button" aria-controls="manual-inspector" aria-expanded="false">工程工具</button></div>
+  </header>
+  <main id="workspace" class="desktop-shell">
+    <aside id="app-sidebar" class="app-sidebar" aria-label="会话与素材">
+      <button id="new-conversation" class="new-conversation" type="button"><span aria-hidden="true">＋</span> 新会话</button>
+      <div class="sidebar-section-label"><span>最近会话</span><button id="refresh-conversations" class="icon-button" type="button" aria-label="刷新会话列表">↻</button></div>
+      <nav id="conversation-list" class="conversation-list" aria-label="已保存会话"><p class="sidebar-empty">正在读取会话…</p></nav>
+      <p id="conversation-feedback" class="sidebar-feedback" role="status" aria-live="polite"></p>
+      <div class="sidebar-bottom"><button id="open-record-page" class="sidebar-action" type="button" data-page-target="record"><span aria-hidden="true">●</span> 录音</button><button id="open-audio-library" class="sidebar-action" type="button" aria-controls="audio-library-dialog"><span aria-hidden="true">♫</span> 音频素材<span id="library-count" class="sidebar-count">—</span></button><button id="open-audio-settings" class="sidebar-action" type="button" aria-controls="audio-settings-dialog"><span aria-hidden="true">⚙</span> 设置</button><button id="open-trash-page" class="sidebar-action" type="button" data-page-target="trash"><span aria-hidden="true">▧</span> 回收站</button><div class="sidebar-footer"><i aria-hidden="true"></i><span id="last-updated">等待本地服务</span></div></div>
+    </aside>
+    <div id="sidebar-resizer" class="sidebar-resizer" data-resize-side="left" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整导航栏宽度" aria-controls="app-sidebar"></div>
+    <div id="main-pages" class="main-pages">
+    <section id="page-chat" class="chat-workspace workbench-page" data-page="chat" aria-labelledby="chat-title">
+      <header class="chat-header"><div><h1 id="chat-title">新的调教会话</h1><p id="chat-subtitle">讨论想法，预览调整，再由你确认应用。</p></div><div class="conversation-header-actions"><span id="chat-model-label" class="chat-model-label">尚未配置模型</span><button id="star-conversation" class="icon-button star-button" type="button" aria-label="星标当前会话" aria-pressed="false" disabled>☆</button><button id="edit-conversation" class="button button-quiet" type="button" aria-controls="conversation-editor" aria-expanded="false" disabled>备注</button><button id="delete-conversation" class="icon-button" type="button" aria-label="删除当前会话" title="删除当前会话" aria-controls="conversation-delete-confirm" disabled>⌫</button></div></header>
+      <section id="conversation-editor" class="metadata-editor" aria-label="会话信息" hidden><form id="conversation-metadata-form" class="metadata-form"><label for="conversation-title-input">会话名称<input id="conversation-title-input" type="text" maxlength="80" required></label><label for="conversation-note-input">备注<textarea id="conversation-note-input" maxlength="2000" rows="3" placeholder="仅保存在本机，不会自动发送给模型"></textarea></label><div class="metadata-actions"><button id="save-conversation-metadata" class="button button-secondary" type="submit">保存信息</button><button id="cancel-conversation-metadata" class="button button-quiet" type="button">取消</button></div></form></section>
+      <!-- 删除方式先在页面内选择；目标名称与不可恢复提示由纯文本节点填入。 -->
+      <div id="conversation-delete-confirm" class="inline-confirm delete-confirm" hidden><label for="conversation-delete-mode">删除方式<select id="conversation-delete-mode"><option value="trash">移到回收站</option><option value="permanent">永久删除</option></select></label><p id="conversation-delete-description" aria-live="polite"></p><div class="confirmation-actions"><button id="confirm-delete-conversation" class="button button-danger-quiet" type="button">确认移到回收站</button><button id="cancel-delete-conversation" class="button button-quiet" type="button">取消</button></div></div>
+      <div id="global-notice" class="notice chat-notice" role="status" aria-live="polite" hidden></div>
+      <div id="chat-history" class="chat-history" role="log" aria-live="polite" aria-relevant="additions text">
+        <div id="chat-welcome" class="chat-welcome"><div class="welcome-symbol" aria-hidden="true">∿</div><p class="eyebrow">YOUR VOCAL WORKSPACE</p><h2>一起把这句唱得更好。</h2><p>聊调教思路，或附上参考音频。<br>AI 提出建议，你确认每一次修改。</p><div class="starter-prompts"><button type="button" data-prompt="请读取当前选区，分析可以怎样改善这句的表达。先给建议，不要直接修改。"><span aria-hidden="true">◈</span><strong>看看当前这句</strong><small>结合选区，讨论调教方向</small></button><button type="button" data-prompt="我想让歌声更温柔、气声更自然。请先解释调教思路，再给出小幅参数建议。"><span aria-hidden="true">∿</span><strong>让声音更自然</strong><small>从气声、张力和尾音开始</small></button><button type="button" data-prompt="请帮我比较将要附加的两段音频，并区分实际听到的差异与不确定的推测。"><span aria-hidden="true">♫</span><strong>听一听 A / B</strong><small>手动选择要发送的音频</small></button></div></div>
+      </div>
+      <div class="composer-area">
+        <!-- 任务状态与输入框共用居中容器；宽屏下不再贴到会话页面的最左边。 -->
+        <div id="chat-job-status" class="chat-job-status" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div class="chat-job-copy"><span id="chat-job-text">正在等待模型回复…</span><span id="chat-job-time" aria-live="off">已等待 0 秒</span></div></div>
+        <p id="chat-feedback" class="inline-feedback" role="status" aria-live="polite"></p>
+        <form id="chat-form" class="chat-composer">
+          <!-- 模型选项属于当前会话；获取模型目录仅由右侧刷新按钮显式触发。 -->
+          <div class="model-toolbar"><label for="chat-platform">平台<select id="chat-platform" disabled><option value="default">默认平台</option></select></label><label for="chat-model">模型<input id="chat-model" type="text" list="chat-model-options" maxlength="200" autocomplete="off" spellcheck="false" placeholder="使用平台默认模型" disabled><datalist id="chat-model-options"></datalist></label><button id="refresh-chat-models" class="icon-button" type="button" aria-label="从当前平台刷新模型列表" title="从当前平台刷新模型列表（会访问供应商）" disabled>↻</button><label id="chat-reasoning-label" for="chat-reasoning">推理强度<select id="chat-reasoning" disabled><option value="default">默认 · 不额外指定</option></select></label></div>
+          <!-- 能力说明保留给辅助技术与控件悬停提示；输入框只展示需要处理的错误。 -->
+          <p id="chat-model-feedback" class="inline-feedback" role="status" aria-live="polite" hidden></p><p id="chat-model-capability" hidden></p>
+          <div id="composer-attachments" class="composer-attachments" aria-label="本次消息的音频附件"></div>
+          <label class="visually-hidden" for="chat-input">消息或调教目标</label><textarea id="chat-input" rows="3" maxlength="4000" placeholder="描述你的调教想法…" title="Enter 发送，Shift+Enter 换行" aria-describedby="send-scope"></textarea>
+          <div class="composer-controls"><div class="composer-options"><button id="attach-audio" class="icon-button" type="button" aria-label="选择音频附件" title="选择音频附件" aria-controls="audio-library-dialog">＋</button><label class="selection-context-toggle"><input id="include-selection" type="checkbox" checked><span>附带当前选区</span></label></div><button id="send-message" class="send-message" type="submit" disabled><span>发送</span><span aria-hidden="true">↑</span></button></div>
+        </form>
+        <div class="composer-caption"><span id="send-scope" hidden></span></div>
+      </div>
+    </section>
+<!-- 素材列表单独滚动，操作栏作为同级区域始终占据页底，不遮挡最后一条素材。 -->
+<section id="page-library" class="workbench-page" data-page="library" aria-labelledby="audio-library-heading" hidden><div id="audio-library-dialog" class="library-page-content" aria-labelledby="audio-library-heading"><div class="main-page-scroll"><div class="page-content">
+    <div class="settings-dialog-header"><div><p class="eyebrow">AUDIO LIBRARY</p><h2 id="audio-library-heading">音频素材</h2></div><button id="close-audio-library" class="button button-quiet" type="button">返回会话</button></div>
+    <p class="settings-description">上传到本机，或选择已有录音。每条消息最多附加两段，合计不超过 12 MB；未选中的音频不会发送给模型。</p>
+    <div class="upload-dropzone"><span aria-hidden="true">↑</span><div><strong>添加参考音频</strong><p>WAV / MP3 · 最大 12 MB · 最长 60 秒</p></div><button id="choose-audio-file" class="button button-secondary" type="button">选择文件</button><input id="audio-file-input" type="file" accept=".wav,.mp3,audio/wav,audio/mpeg" hidden></div>
+    <p class="field-help">MP3 由本机 ffmpeg 转为 WAV；转换失败会明确提示。上传本身不会调用模型。</p>
+    <p id="library-feedback" class="inline-feedback" role="status" aria-live="polite"></p>
+    <div class="library-heading"><h3>可用音频</h3><button id="reload-audio-library" class="text-button" type="button">刷新素材</button></div><div id="audio-library-items" class="audio-library-items"><p class="library-empty">正在读取音频素材…</p></div>
+  </div></div><footer class="library-footer" aria-label="音频选择操作"><div class="page-content settings-dialog-actions"><span id="library-selection-count" class="field-help">已选 0 / 2 段</span><div><button id="cancel-audio-library" class="button button-quiet" type="button">返回会话</button><button id="use-audio-attachments" class="button button-primary" type="button">使用所选素材</button></div></div></footer></div></section>
+<section id="page-settings" class="workbench-page" data-page="settings" aria-labelledby="settings-page-heading" hidden><header class="main-page-header"><div><h1 id="settings-page-heading">设置</h1><p>调整界面外观与 AI 模型服务。</p></div></header><div class="main-page-scroll"><div id="audio-settings-dialog" class="page-content settings-page-content" aria-labelledby="audio-settings-heading" aria-describedby="audio-settings-description">
+    <section class="page-section appearance-settings" aria-labelledby="appearance-heading"><h2 id="appearance-heading">外观</h2><label for="theme-preference">界面主题<select id="theme-preference"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><p class="field-help">默认跟随系统，选择立即生效并保留在本机浏览器。</p></section>
+    <div class="settings-dialog-header"><div><p class="eyebrow">AI MODEL</p><h2 id="audio-settings-heading">AI 模型设置</h2></div><button id="close-audio-settings" class="button button-quiet" type="button">返回会话</button></div>
+    <p id="audio-settings-description" class="settings-description">保存多个命名平台，在每个会话的输入区选择平台和模型。可指定新会话默认平台；内置“默认平台”继续供独立听评使用。纯文字可使用普通文本模型；附加音频或听评时，需要模型支持音频输入。保存立即生效，不会调用供应商。</p>
+    <div class="platform-management"><label for="settings-platform">编辑平台<select id="settings-platform" disabled><option value="default">默认平台</option></select></label><button id="new-model-platform" class="button button-secondary" type="button" disabled>新建平台</button><label for="settings-platform-name">平台名称<input id="settings-platform-name" type="text" maxlength="80" form="audio-settings-form" autocomplete="off" placeholder="例如：我的模型服务" required disabled></label></div>
+    <!-- 默认指针只引用已保存的平台，和下方模型配置表单分开提交。 -->
+    <div class="settings-source-row"><span id="settings-default-platform" class="small-badge">正在读取新会话默认平台</span><button id="set-default-model-platform" class="button button-secondary" type="button" aria-describedby="settings-default-help" disabled>设为新会话默认</button></div><p id="settings-default-help" class="field-help">仅影响之后新建的会话。请先保存当前平台的所有修改，再设为默认。</p>
+    <div class="settings-storage-note"><span aria-hidden="true">◈</span><p>密钥由当前 Windows 账户在本机加密保存，下次启动保留。密钥不会回显，也不保存在浏览器中。</p></div>
+    <div class="settings-source-row"><span id="settings-source" class="small-badge">正在读取设置</span><button id="reload-audio-settings" class="text-button" type="button">重新加载已保存设置</button></div>
+    <form id="audio-settings-form" autocomplete="off">
+      <fieldset id="audio-settings-fields" class="settings-fields" disabled>
+        <label for="settings-provider">服务协议<select id="settings-provider"><option value="none">暂不启用模型服务</option><option value="openai">OpenAI / OpenAI 兼容服务</option><option value="gemini">Google Gemini</option></select></label>
+        <div class="settings-fields-grid"><label for="settings-model">模型名称<input id="settings-model" type="text" maxlength="200" placeholder="gpt-audio-1.5" autocomplete="off" spellcheck="false"></label><label for="settings-timeout">请求超时 <span class="unit-label">秒</span><input id="settings-timeout" type="number" min="5" max="180" step="1" value="60" required></label></div>
+        <label for="settings-base-url">HTTPS Base URL<input id="settings-base-url" type="url" maxlength="2048" placeholder="https://api.openai.com/v1" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="settings-endpoint-help"></label>
+        <p id="settings-endpoint-help" class="field-help">填写 API 根地址，不含具体方法、用户名密码、查询参数或片段。自定义服务会收到密钥，以及你发送的文字、勾选的选区和所选音频。</p>
+        <label for="settings-api-key">API key <span id="settings-key-state" class="unit-label">未配置</span><input id="settings-api-key" type="password" maxlength="8192" placeholder="输入当前服务的 API key" autocomplete="new-password" autocapitalize="off" spellcheck="false" aria-describedby="settings-key-help"></label>
+        <p id="settings-key-help" class="field-help">请选择服务，再填写对应密钥。保存前不会发送音频。</p>
+      </fieldset>
+      <p id="settings-feedback" class="inline-feedback settings-feedback" role="status" aria-live="polite"></p>
+      <p id="settings-conflict-help" class="settings-conflict" hidden>已保存的设置发生了变化。本次未覆盖；请先重新加载，再确认并提交。</p>
+      <div class="settings-dialog-actions"><button id="clear-audio-settings" class="button button-danger-quiet" type="button" disabled>清除密钥并停用</button><div><button id="cancel-audio-settings" class="button button-quiet" type="button">放弃输入并返回</button><button id="save-audio-settings" class="button button-primary" type="submit" disabled>保存并立即生效</button></div></div>
+    </form>
+  </div></div></section>
+<section id="page-record" class="workbench-page" data-page="record" aria-labelledby="record-page-heading" hidden>
+      <header class="main-page-header"><div><h1 id="record-page-heading">录音</h1><p>采集 SynthV 的实际播放声音，保存后可试听或附加到会话。</p></div><button class="button button-quiet" type="button" data-page-target="chat">返回会话</button></header>
+      <div class="main-page-scroll"><div class="page-content"><div class="record-page-grid">
+        <section class="page-section"><h2>录制片段</h2><form id="page-record-form" class="record-page-form"><label for="page-record-name">录音名称<input id="page-record-name" type="text" maxlength="80" value="调教片段" required></label><div class="field-grid"><label for="page-record-start">起点（秒）<input id="page-record-start" type="number" min="0" max="86400" step="0.1" value="0" required></label><label for="page-record-duration">播放时长（秒）<input id="page-record-duration" type="number" min="1" max="30" step="0.1" value="5" required></label></div><p class="field-help">每次播放 1–30 秒。回录文件可能包含采集尾音，以完成后的实际音频时长为准。请等待 SynthV 合成完成。</p><div class="button-row"><button id="page-record-read-selection" class="button button-secondary" type="button" disabled>读取选区</button><button id="page-record-use-selection" class="button button-quiet" type="button" disabled>使用已读取选区</button><button id="page-record-submit" class="button button-primary" type="submit" disabled>开始录制</button></div></form><div id="page-record-progress" class="task-progress" hidden role="status"><span class="spinner" aria-hidden="true"></span><span>正在录制，请等待实际结果…</span></div><p id="page-record-feedback" class="inline-feedback" role="status" aria-live="polite"></p></section>
+        <section class="page-section" aria-labelledby="record-result-heading"><h2 id="record-result-heading">本次录音</h2><p id="page-record-empty" class="record-page-empty">录制完成后显示实际音频；不会自动发送给模型。</p><div id="page-record-result" class="record-page-result" hidden><h3 id="page-record-result-name"></h3><p id="page-record-summary" class="field-help"></p><audio id="page-record-audio" controls preload="metadata" aria-label="播放本次录音"></audio><dl id="page-record-metrics" class="audio-metrics"></dl><p id="page-record-warnings" class="inline-feedback error"></p><div class="button-row"><button id="page-record-attach" class="button button-secondary" type="button">附加到当前会话</button><button id="page-record-library" class="button button-quiet" type="button">在素材库中查看</button></div></div></section>
+      </div></div></div>
+    </section>
+<section id="page-trash" class="workbench-page" data-page="trash" aria-labelledby="trash-page-heading" hidden><header class="main-page-header"><div><h1 id="trash-page-heading">回收站</h1><p>可恢复这里的会话与音频；永久删除后无法恢复。</p></div><button id="refresh-trash" class="button button-secondary" type="button">刷新</button></header><div class="main-page-scroll"><div class="page-content"><p id="trash-feedback" class="inline-feedback" role="status" aria-live="polite"></p><div id="trash-list" class="trash-list"></div></div></div></section>
+    </div>
+    <div id="inspector-resizer" class="sidebar-resizer" data-resize-side="right" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整工程工具宽度" aria-controls="manual-inspector"></div>
+    <aside id="manual-inspector" class="manual-inspector" aria-label="工程与手动工具">
+      <div class="inspector-heading"><span>工程检查器</span><span id="mode-badge" class="mode-badge">只读模式</span></div>
+      <div class="inspector-tabs" role="tablist" aria-label="工具面板"><button id="tab-project" role="tab" aria-selected="true" aria-controls="pane-project" type="button">工程与调教</button><button id="tab-listen" role="tab" aria-selected="false" aria-controls="pane-listen" tabindex="-1" type="button">A / B 试听</button></div>
+      <div class="inspector-scroll"><div id="pane-project" role="tabpanel" aria-labelledby="tab-project"><section class="panel project-panel" aria-labelledby="project-heading">
+          <div class="section-title"><span class="step-number">01</span><h2 id="project-heading">工程与选区</h2></div>
+          <p class="section-description">在 SynthV 中打开工程，选中需要调教的音符。</p>
+          <div class="project-name"><span class="file-icon" aria-hidden="true">♪</span><div><span class="field-caption">当前工程</span><strong id="project-name">尚未读取</strong></div></div>
+          <dl class="context-stats"><div><dt>软件版本</dt><dd id="host-version">—</dd></div><div><dt>选中音符</dt><dd id="selection-count">—</dd></div><div><dt>选区时间</dt><dd id="selection-time">—</dd></div></dl>
+          <div class="button-row"><button id="read-project" class="button button-secondary" type="button">读取工程</button><button id="read-selection" class="button button-secondary" type="button">读取选区</button></div>
+          <p id="context-feedback" class="inline-feedback" role="status" aria-live="polite"></p>
+          <details class="data-details"><summary>查看读取结果</summary><pre id="context-details">读取后会在这里显示工程与选区信息。</pre></details>
+        </section><section class="panel mode-panel" aria-labelledby="mode-heading">
+          <div class="section-title"><span class="section-icon" aria-hidden="true">◈</span><h2 id="mode-heading">编辑模式</h2></div>
+          <p class="section-description">开启时自动备份已保存的工程。每次修改仍需先预览，再由你确认应用。</p>
+          <label class="switch-row" for="write-mode"><span><strong>允许修改选区</strong><small>仅对当前选中音符的时间范围生效</small></span><input id="write-mode" type="checkbox" role="switch" disabled><span class="switch-track" aria-hidden="true"></span></label>
+          <p id="mode-feedback" class="inline-feedback" role="status" aria-live="polite"></p>
+        </section><div class="inspector-rule"><strong>先预览，再确认</strong><p>AI 建议会显示在对话中。每次只确认一项修改；仅最新预览有效，恢复只针对最近一次修改。</p></div><section class="panel tuning-panel" aria-labelledby="tuning-heading">
+            <div class="section-title"><span class="step-number">03</span><h2 id="tuning-heading">参数微调</h2></div>
+            <p class="section-description">先查看调整范围与数值，再应用到当前选区。</p>
+            <form id="tuning-form">
+              <div class="field-grid"><label for="parameter">调整参数<select id="parameter"><option value="breathiness">气声 · Breathiness</option><option value="tension">张力 · Tension</option><option value="loudness">响度 · Loudness</option><option value="gender">性别 · Gender</option><option value="pitchDelta">音高偏移 · Pitch Delta</option></select></label><label for="parameter-delta">调整量 <span id="delta-unit" class="unit-label">参数值</span><input id="parameter-delta" type="number" step="0.01" min="-0.2" max="0.2" value="0.05" required></label></div>
+              <p id="parameter-help" class="field-help">在选区内增加或减少气声；建议从小幅调整开始。</p>
+              <button id="preview-change" class="button button-secondary full-width" type="submit">预览修改</button>
+            </form>
+            <div id="preview-result" class="preview-result" hidden><span class="field-caption">待应用的修改</span><p id="preview-summary"></p><details class="data-details"><summary>修改明细</summary><pre id="preview-details"></pre></details></div>
+            <div class="button-row tuning-actions"><button id="apply-change" class="button button-primary" type="button" disabled>应用修改</button><button id="restore-change" class="button button-quiet" type="button" disabled>恢复最后修改</button></div>
+            <p id="tuning-feedback" class="inline-feedback" role="status" aria-live="polite"></p>
+          </section></div><div id="pane-listen" role="tabpanel" aria-labelledby="tab-listen" hidden><section class="panel listen-panel" aria-labelledby="listen-heading">
+          <div class="section-heading"><div class="section-title"><span class="step-number">02</span><h2 id="listen-heading">片段试听</h2></div><span class="subtle-label">A / B LISTENING</span></div>
+          <p class="section-description">录制 SynthV 的实际播放声音。A、B 使用相同起点与时长，便于比较。</p>
+          <form id="range-form" class="range-form">
+            <label for="start-seconds">起点 <span class="unit-label">秒</span><input id="start-seconds" type="number" min="0" max="86400" step="0.1" value="0" required></label>
+            <label for="duration-seconds">时长 <span class="unit-label">秒</span><input id="duration-seconds" type="number" min="1" max="30" step="0.1" value="10" required></label>
+            <button id="use-selection-range" class="button button-quiet" type="button" disabled>使用选区时间</button>
+            <p class="range-help">每次 1–30 秒<br><span>请等待 SynthV 完成合成</span></p>
+          </form>
+          <!-- 两个播放器使用真实录音文件；空状态不使用示意波形或模拟读数。 -->
+          <div class="recording-grid">
+            <article class="recording-card recording-a" aria-labelledby="recording-a-heading">
+              <div class="recording-title"><div><span class="take-letter">A</span><h3 id="recording-a-heading">原始效果</h3></div><button id="record-a" class="button button-record" type="button"><span aria-hidden="true">●</span> 录制 A</button></div>
+              <label class="visually-hidden" for="select-a">选择 A 录音</label><select id="select-a"><option value="">暂无录音</option></select>
+              <div class="waveform-wrap"><canvas id="waveform-a" role="img" aria-label="A 录音波形，暂无音频"></canvas><p id="empty-a" class="waveform-empty">录制后显示真实音频波形</p></div>
+              <audio id="audio-a" controls preload="metadata" aria-label="播放 A 原始效果"></audio>
+              <p id="meta-a" class="recording-meta">还没有录制原始效果</p><p id="warning-a" class="inline-feedback error"></p><dl id="metrics-a" class="audio-metrics"></dl>
+            </article>
+            <article class="recording-card recording-b" aria-labelledby="recording-b-heading">
+              <div class="recording-title"><div><span class="take-letter">B</span><h3 id="recording-b-heading">调整效果</h3></div><button id="record-b" class="button button-record" type="button"><span aria-hidden="true">●</span> 录制 B</button></div>
+              <label class="visually-hidden" for="select-b">选择 B 录音</label><select id="select-b"><option value="">暂无录音</option></select>
+              <div class="waveform-wrap"><canvas id="waveform-b" role="img" aria-label="B 录音波形，暂无音频"></canvas><p id="empty-b" class="waveform-empty">录制后显示真实音频波形</p></div>
+              <audio id="audio-b" controls preload="metadata" aria-label="播放 B 调整效果"></audio>
+              <p id="meta-b" class="recording-meta">还没有录制调整效果</p><p id="warning-b" class="inline-feedback error"></p><dl id="metrics-b" class="audio-metrics"></dl>
+            </article>
+          </div>
+          <div id="record-progress" class="task-progress" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="record-progress-text">正在录制…</span></div>
+          <p id="record-feedback" class="inline-feedback" role="status" aria-live="polite"></p>
+          <div class="comparison-bar"><div><strong>客观指标对比</strong><p>查看响度、峰值等差异，结合试听判断效果。</p></div><button id="compare-recordings" class="button button-secondary" type="button" disabled>比较 A 与 B</button></div>
+          <div id="compare-result" class="result-box" hidden></div>
+        </section><details class="standalone-review"><summary>独立音频评审</summary><section class="panel review-panel" aria-labelledby="review-heading">
+            <div class="section-heading"><div class="section-title"><span class="section-icon" aria-hidden="true">✧</span><h2 id="review-heading">AI 音频评审</h2></div><span id="review-label" class="small-badge">未配置</span></div>
+            <p class="section-description">把实际录音交给支持音频输入的模型，针对你的目标给出建议。</p>
+            <div id="review-unconfigured" class="empty-state"><span aria-hidden="true">◌</span><div><strong>尚未配置音频评审模型</strong><p>填写模型、服务地址和密钥，保存后立即可用。录音、试听和本地指标对比不受影响。</p></div></div>
+            <div class="review-settings-row"><span id="review-model-summary">配置仅保存在本机</span><button id="configure-audio-model" class="button button-secondary" type="button" aria-controls="audio-settings-dialog">配置 AI 模型</button></div>
+            <form id="review-form"><label for="review-prompt">这次希望改善什么？<textarea id="review-prompt" rows="3" maxlength="4000" placeholder="例如：比较这两版尾音是否自然，气声是否过重，指出需要继续调整的位置。"></textarea></label><p class="field-help">提交后会把所选 A、B 录音发送到已配置的模型服务。</p><button id="review-recordings" class="button button-secondary full-width" type="submit" disabled>听取 A / B 并给出建议</button></form>
+            <p id="review-feedback" class="inline-feedback" role="status" aria-live="polite"></p><div id="review-result" class="result-box review-result" hidden></div>
+          </section></details></div></div>
+    </aside>
+  </main>
+</body>
+</html>
