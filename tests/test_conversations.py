@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 from synthv_assistant.conversations import ConversationError, ConversationManager, MAX_FILE_BYTES
 from synthv_assistant.operations import OperationLock
 from synthv_assistant.planner import PlannerError
+from tests.test_parameters import modern_selection
 
 
 class ConversationTests(unittest.TestCase):
@@ -74,6 +75,78 @@ class ConversationTests(unittest.TestCase):
 
     def read_saved(self):
         return json.loads((self.directory / "conversations" / (self.identifier + ".json")).read_text(encoding="utf-8"))
+
+    def test_curve_plan_preview_and_confirm_preserve_shape_and_private_guards(self):
+        """曲线仅在预览后获得确认入口；声库、指纹不进入模型和公开消息。"""
+        self.selection.update(modern_selection())
+        self.selection["voiceFingerprint"] = "private-voice-fingerprint"
+        self.selection["parameters"]["vocalMode_Soft"]["fingerprint"] = "private-parameter-fingerprint"
+        curve = [[0, 0], [0.5, 20], [1, 0]]
+        self.plan["actions"] = [{"parameter": "vocalMode_Soft", "curve": curve, "reason": "逐渐增加柔和模式。"}]
+        self.service.preview.side_effect = None
+        self.service.preview.return_value = {"previewId": "curve-preview", "parameter": "vocalMode_Soft",
+            "curve": curve, "renderMode": "smooth", "representation": "automation-simplified",
+            "label": "柔和", "unit": "%", "beforePointCount": 20, "pointCount": 8, "pointReduction": 12,
+            "curvePreview": [{"position": 0, "before": 0, "after": 0}, {"position": 1, "before": 0, "after": 0}],
+            "capabilityWarnings": ["目录仅包含当前已返回的模式"], "voiceFile": "private-path"}
+        action = self.proposed()
+        self.assertEqual(action["curve"], curve)
+        self.assertEqual(action["label"], "柔和")
+        self.assertEqual(action["modeName"], "Soft")
+        model_selection = self.planner.call_args.args[1]
+        self.assertTrue(model_selection["capabilities"]["curves"])
+        self.assertEqual(model_selection["groupPitchOffset"], 12)
+        self.assertNotIn("fingerprint", model_selection["parameters"]["vocalMode_Soft"])
+        self.assertNotIn("voiceFingerprint", model_selection)
+        preview = self.manager.preview_action(action["id"])
+        self.service.preview.assert_called_once_with("vocalMode_Soft", curve=curve, render_mode="smooth")
+        self.assertEqual(preview["preview"]["pointReduction"], 12)
+        self.assertNotIn("voiceFile", preview["preview"])
+        self.service.edit.assert_not_called()
+        applied = self.manager.apply_action(action["id"])
+        self.assertEqual(applied["status"], "applied")
+        self.service.edit.assert_called_once_with("apply", {"previewId": "curve-preview"})
+
+    def test_voice_or_same_point_count_fingerprint_change_blocks_new_preview(self):
+        self.selection.update(modern_selection())
+        self.selection["voiceFingerprint"] = "voice-original"
+        self.selection["parameters"]["breathiness"]["fingerprint"] = "curve-original"
+        action = self.proposed()
+        self.selection["voiceFingerprint"] = "voice-other"
+        with self.assertRaises(ConversationError):
+            self.manager.preview_action(action["id"])
+        self.selection["voiceFingerprint"] = "voice-original"
+        self.selection["parameters"]["breathiness"]["fingerprint"] = "same-point-count-different-values"
+        with self.assertRaises(ConversationError):
+            self.manager.preview_action(action["id"])
+        self.service.preview.assert_not_called()
+
+    def test_curve_capability_loss_and_invalid_preview_cannot_expose_confirmation(self):
+        self.selection.update(modern_selection())
+        self.plan["actions"] = [{"parameter": "tension", "curve": [[0, 0], [1, 0.1]], "reason": "逐渐变化。"}]
+        action = self.proposed()
+        self.selection["capabilities"]["curves"] = False
+        with self.assertRaises(ConversationError):
+            self.manager.preview_action(action["id"])
+        self.service.preview.assert_not_called()
+        self.selection["capabilities"]["curves"] = True
+        self.service.preview.side_effect = None
+        self.service.preview.return_value = {"previewId": "bad", "curvePreview": [{"position": 0, "after": True}]}
+        with self.assertRaises(ConversationError):
+            self.manager.preview_action(action["id"])
+        saved = self.read_saved()["messages"][-1]["actions"][0]
+        self.assertEqual(saved["status"], "proposed")
+        self.assertNotIn("preview", saved)
+
+    def test_second_validation_rejects_mocked_duplicate_or_unknown_curve_fields(self):
+        self.selection.update(modern_selection())
+        action = {"parameter": "tension", "curve": [[0, 0], [1, 0.1]], "reason": "变化。"}
+        for actions in ([action, action], [{**action, "command": "unsafe"}]):
+            self.plan["actions"] = actions
+            result = self.send()
+            self.assertEqual(result["messages"][-1]["role"], "error")
+            self.assertEqual(result["messages"][-1]["actions"], [])
+        self.service.preview.assert_not_called()
 
     def test_model_choice_persists_without_entering_prompt_history(self):
         """会话记住选择，旧会话缺省兼容，摘要不被当作下一轮模型指令。"""

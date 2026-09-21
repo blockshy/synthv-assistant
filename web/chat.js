@@ -21,8 +21,8 @@
     jobProgress: { startedAt: 0, elapsedSeconds: 0, stage: "", text: "", reasoning: "", reasoningAvailable: false, receivedCharacters: 0 },
     jobTimer: null,
   };
-  const parameterNames = { breathiness: "气声", tension: "张力", loudness: "响度", gender: "性别", pitchDelta: "音高偏移" };
-  const parameterUnits = { breathiness: "参数值", tension: "参数值", loudness: "dB", gender: "参数值", pitchDelta: "音分" };
+  const parameterNames = { breathiness: "气声", tension: "张力", loudness: "响度", gender: "性别", pitchDelta: "音高偏移", toneShift: "音色偏移", vibratoEnv: "颤音包络", pitchCurve: "原生音高曲线" };
+  const parameterUnits = { breathiness: "参数值", tension: "参数值", loudness: "dB", gender: "参数值", pitchDelta: "音分", toneShift: "音分", vibratoEnv: "参数值", pitchCurve: "MIDI 半音" };
   const actionLabels = { proposed: "建议 · 尚未预览", previewed: "已生成预览", applied: "已应用", unknown: "结果待核实" };
   const MAX_FILE_BYTES = 12_000_000;
   const welcome = $("chat-welcome");
@@ -264,16 +264,30 @@
   function renderAction(action) {
     const card = element("article", "assistant-action"); card.dataset.actionId = action.id;
     const heading = element("div", "action-heading");
-    heading.append(element("strong", "", `${parameterNames[action.parameter] || action.parameter || "参数建议"} ${signed(action.delta)} ${parameterUnits[action.parameter] || ""}`));
+    const preview = action.preview;
+    const isVocalMode = action.kind === "vocalMode" || String(action.parameter || "").startsWith("vocalMode_");
+    // 优先使用提案时保存的公开名称，避免声库切换后把旧建议解释成新声库参数。
+    const modeName = action.modeName || (isVocalMode ? String(action.parameter).slice("vocalMode_".length) : "");
+    const label = action.label || preview?.label || parameterNames[action.parameter] || modeName || action.parameter || "参数建议";
+    const unit = action.unit || preview?.unit || parameterUnits[action.parameter] || (isVocalMode ? "百分点" : "参数值");
+    const curve = Array.isArray(action.curve) ? action.curve : null;
+    const amount = curve ? `曲线 · ${curve.length} 个点` : `${signed(action.delta)} ${unit}`;
+    heading.append(element("strong", "", `${label} ${amount}`));
     const status = element("span", "action-status", actionLabels[action.status] || "未知状态");
     status.dataset.state = action.status; heading.append(status); card.append(heading);
     if (action.reason) card.append(element("p", "action-reason", action.reason));
-    const preview = action.preview;
+    if (curve || action.renderMode || isVocalMode) {
+      const semantics = action.parameter === "pitchCurve" ? `绝对 MIDI 半音值，原生音高曲线` : `相对增量 · ${unit}`;
+      card.append(element("p", "action-curve-summary", `${modeName ? `声线：${modeName} · ` : ""}${semantics} · ${window.SynthVCurves.representation(preview?.representation, action.renderMode || preview?.renderMode || "smooth")}`));
+    }
     if (preview && typeof preview === "object") {
       const scope = element("dl", "action-scope");
       const fields = [["时间范围", `${number(preview.startSeconds)}–${number(preview.endSeconds)} 秒`], ["选中音符", Number.isFinite(preview.noteCount) ? `${preview.noteCount} 个` : "未返回"], ["控制点", Number.isFinite(preview.pointCount) ? `${preview.pointCount} 个` : "未返回"]];
       for (const [label, value] of fields) { const group = element("div"); group.append(element("dt", "", label), element("dd", "", value)); scope.append(group); }
-      card.append(scope, details("完整预览明细", preview));
+      card.append(scope);
+      if (Number.isFinite(preview.beforePointCount) || Number.isFinite(preview.pointReduction)) card.append(element("p", "action-curve-summary", `${Number.isFinite(preview.beforePointCount) ? `原有 ${preview.beforePointCount} 点` : "原有点数未提供"}${Number.isFinite(preview.pointReduction) ? ` · 精简减少 ${preview.pointReduction} 点` : ""} · ${window.SynthVCurves.representation(preview.representation, preview.renderMode)}`));
+      const chart = window.SynthVCurves.createPreview(preview); if (chart) card.append(chart);
+      card.append(details("完整预览明细", preview));
     }
     if (action.result) card.append(details("查看真实执行结果", action.result));
     if (action.status === "proposed" || action.status === "previewed") {
@@ -287,7 +301,7 @@
         apply.addEventListener("click", () => executeAction(action.id, "apply")); controls.append(apply);
       }
       card.append(controls);
-      const explanation = action.status === "proposed" ? "先读取当前选区生成预览；这一步不会修改工程。" : state.activePreview !== action.id ? "此预览目前不可应用。请重新预览，核对当前选区。" : !state.status?.writeEnabled ? "预览尚未写入工程。在右侧另存副本并开启写入后，再确认应用。" : "请核对数值和范围，点击“确认应用”才会修改工程。";
+      const explanation = action.status === "proposed" ? "先读取当前选区生成预览；这一步不会修改工程。" : state.activePreview !== action.id ? "此预览目前不可应用。请重新预览，核对当前选区。" : !state.status?.writeEnabled ? "预览尚未写入工程。开启选区写入后，再确认应用。" : "请核对数值和范围，点击“确认应用”才会修改工程。";
       card.append(element("p", "action-help", explanation));
     } else if (action.status === "unknown") {
       card.append(element("p", "action-help warning", "执行结果尚不能确认。请检查 SynthV 当前工程与服务记录，勿重复提交同一修改。"));
@@ -804,6 +818,11 @@
     const compact = matchMedia("(max-width: 1100px)").matches;
     const open = compact ? document.body.classList.toggle("inspector-open") : !document.body.classList.toggle("inspector-hidden");
     $("toggle-inspector").setAttribute("aria-expanded", String(open)); window.dispatchEvent(new Event("resize"));
+  });
+  // 桌面常驻面板切换为窄屏抽屉时，CSS 可见性会变化；同步读屏状态而不主动打开抽屉。
+  matchMedia("(max-width: 1100px)").addEventListener("change", (event) => {
+    const open = event.matches ? document.body.classList.contains("inspector-open") : !document.body.classList.contains("inspector-hidden");
+    $("toggle-inspector").setAttribute("aria-expanded", String(open));
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {

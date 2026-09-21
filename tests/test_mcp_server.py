@@ -42,7 +42,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         names = {tool.name for tool in tools}
         self.assertEqual(names, {"status", "get_project", "get_selection", "set_write_mode", "preview_parameter",
                                  "apply_preview", "restore_last_edit", "start_recording", "get_job", "list_recordings",
-                                 "compare_recordings", "review_recordings", "get_recording_audio"})
+                                 "compare_recordings", "review_recordings", "get_recording_audio", "preview_curve"})
         review = next(tool for tool in tools if tool.name == "review_recordings")
         self.assertTrue(review.annotations.openWorldHint)
         self.assertIn("上传", review.description)
@@ -52,6 +52,27 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         self.service.preview.assert_called_once_with("tension", 0.1)
         await self.server.call_tool("apply_preview", {"preview_id": "preview-1"})
         self.service.edit.assert_called_once_with("apply", {"previewId": "preview-1"})
+
+    async def test_curve_tools_forward_explicit_representation_without_applying(self):
+        curve = [[0, 0], [0.5, 25], [1, 0]]
+        await self.server.call_tool("preview_curve", {"parameter": "pitchDelta", "curve": curve, "render_mode": "points"})
+        self.service.preview.assert_called_once_with("pitchDelta", curve=curve, render_mode="points")
+        self.service.preview.reset_mock()
+        await self.server.call_tool("preview_parameter", {"parameter": "pitchDelta", "curve": curve})
+        self.service.preview.assert_called_once_with("pitchDelta", None, curve=curve, render_mode="smooth")
+        self.service.edit.assert_not_called()
+
+    async def test_parameter_tools_do_not_coerce_boolean_or_numeric_string(self):
+        # MCP 的 Pydantic 入口也要拒绝 bool/字符串，不能先转换为 float 绕过业务校验。
+        from mcp.server.fastmcp.exceptions import ToolError
+        for payload in ({"parameter": "loudness", "delta": True}, {"parameter": "loudness", "delta": "1"},
+                        {"parameter": "pitchDelta", "curve": [[0, 0], [1, True]]},
+                        {"parameter": "tension", "curve": "[[0, 0], [1, 0.1]]"},
+                        {"parameter": "tension", "delta": 0.1, "curve": None},
+                        {"parameter": "tension", "delta": 0.1, "code": "unsafe"}):
+            with self.subTest(fields=list(payload)), self.assertRaises(ToolError):
+                await self.server.call_tool("preview_parameter", payload)
+        self.service.preview.assert_not_called()
 
     async def test_long_tasks_return_job_id_without_waiting(self):
         result = await self.server.call_tool("start_recording", {"start_seconds": 2, "duration_seconds": 5})
@@ -81,6 +102,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         parameters = StdioServerParameters(
             command=sys.executable, args=["-m", "synthv_assistant", "mcp"],
             cwd=str(Path(__file__).resolve().parents[1]),
+            env={"SYNTHV_ASSISTANT_DATA": str(Path(self.temporary_data.name) / "stdio")},
         )
         async with stdio_client(parameters) as (reader, writer):
             async with ClientSession(reader, writer) as client:

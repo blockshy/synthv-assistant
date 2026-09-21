@@ -12,20 +12,45 @@ import re
 import wave
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import AudioContent, TextContent, ToolAnnotations
+from pydantic import StrictFloat, StrictInt
 
 from .service import AssistantService
 from .config import DATA
 from .metadata import LibraryMetadata
+from .parameters import ParameterError, validate_preview_payload
 
 
 MAX_MCP_AUDIO_BYTES = 12_000_000
 
 
+class ParameterMCPServer(FastMCP):
+    """仅收紧两个编辑预览工具的原始参数边界，其余 MCP 行为保持不变。
+
+    FastMCP 默认会解析字符串内嵌的 JSON，并忽略模型未声明的额外字段；参数
+    操作不能依赖这种宽松转换。先检查原始形状，再交给正常的工具类型及业务校验。
+    """
+
+    async def call_tool(self, name, arguments):
+        if name in {"preview_parameter", "preview_curve"}:
+            try:
+                if (not isinstance(arguments, dict)
+                        or set(arguments) - ({"parameter", "curve", "render_mode"}
+                                             if name == "preview_curve" else {"parameter", "delta", "curve", "render_mode"})):
+                    raise ParameterError("参数预览工具包含未知或无效字段。")
+                payload = {("renderMode" if key == "render_mode" else key): value for key, value in arguments.items()}
+                validate_preview_payload(payload)
+            except ParameterError as exc:
+                # 不沿用依赖库含原始 input_value 的错误文案，避免把输入全文回显给客户端。
+                raise ToolError(str(exc)) from None
+        return await super().call_tool(name, arguments)
+
+
 def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
     """创建可测试的 MCP 服务器；不在导入模块时连接或修改 SynthV。"""
     assistant = service if service is not None else AssistantService()
-    server = FastMCP(
+    server = ParameterMCPServer(
         "SynthV Assistant",
         instructions=(
             "协助调教 Synthesizer V Studio 2。先读取状态和选区，再预览参数变更。"
@@ -63,14 +88,30 @@ def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
         return assistant.write_mode(enabled)
 
     @server.tool(annotations=readonly)
-    def preview_parameter(parameter: str, delta: float) -> dict:
-        """预览当前选区的参数增量，返回 previewId，不立即改曲线。
+    def preview_parameter(parameter: str, delta: StrictFloat | StrictInt | None = None,
+                          curve: list[list[StrictFloat | StrictInt]] | None = None,
+                          render_mode: str = "smooth") -> dict:
+        """预览当前选区的增量或比例曲线，返回 previewId，不立即修改工程。
 
-        parameter 为 breathiness、tension、loudness、gender 或 pitchDelta。
-        增量上限由宿主检查：breathiness/tension/gender 为 0.3，
-        loudness 为 6 dB，pitchDelta 为 100 cents；均支持正负方向。
+        先读取 get_selection 的参数目录和 capabilities。delta 与 curve 二选一；
+        curve 为2至64个[position,value]，position严格递增且首尾为0和1。
+        通用参数及声库模式的value为偏移；pitchCurve为绝对MIDI、只接受curve，
+        只支持smooth，且限制在当前选区实际音域上下2半音内。不得猜测声库模式。
+        render_mode 为 smooth（默认精简）或 points。旧的参数增量调用保持兼容。
         """
-        return assistant.preview(parameter, delta)
+        if curve is None and render_mode == "smooth":
+            return assistant.preview(parameter, delta)
+        return assistant.preview(parameter, delta, curve=curve, render_mode=render_mode)
+
+    @server.tool(annotations=readonly)
+    def preview_curve(parameter: str, curve: list[list[StrictFloat | StrictInt]], render_mode: str = "smooth") -> dict:
+        """预览一条有界稀疏曲线，不自动应用；确认后另调 apply_preview。
+
+        curve 横轴为当前连续选区比例0..1，首尾0和1，2至64点严格递增；纵轴
+        通常为参数偏移，pitchCurve专用绝对MIDI半音。需先读取当前宿主参数目录。
+        smooth为默认精简表示，points为控制点表示；pitchCurve只能使用smooth。
+        """
+        return assistant.preview(parameter, curve=curve, render_mode=render_mode)
 
     @server.tool(annotations=local_change)
     def apply_preview(preview_id: str) -> dict:

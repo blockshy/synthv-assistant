@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 
 from .bridge import BridgeClient, BridgeError, atomic_json
@@ -20,6 +21,7 @@ from .capture import CaptureError, find_capture_executable, prepare_capture
 from .config import DATA, RECORDINGS, ensure_directories
 from .operations import exclusive_operation, operation_busy
 from .metadata import LibraryMetadata, validate_identity
+from .parameters import LEGACY_PARAMETERS, finite, public_preview, validate_change
 
 
 def finite_number(value, name: str, low: float, high: float) -> float:
@@ -212,6 +214,46 @@ class AssistantService:
     def get_selection(self) -> dict:
         return self.bridge.call("get_selection")
 
+    @exclusive_operation(lambda _service: DATA / "operation.lock")
+    def register_vocal_mode(self, payload: dict) -> dict:
+        """把用户已核对的声线名称临时补入当前宿主目录，不写工程或持久文件。
+
+        官方 getVoice 返回值不保证枚举全部模式，因此这个入口仅接收用户在声线
+        面板确认的原名。页面须附带读取时的身份快照，由 Lua 在同一次处理内核对；
+        不能在工程、音符组或声库已切换后，把旧页面输入注册到新的上下文中。
+        """
+        with self.operation_lock:
+            if self.recording:
+                raise ValueError("正在录音，请等待结束后补充声线目录。")
+            if not isinstance(payload, dict) or set(payload) != {"name", "selection"}:
+                raise ValueError("补充声线目录只接受名称和当前选区身份。")
+            raw_name, selection = payload["name"], payload["selection"]
+            if not isinstance(raw_name, str):
+                raise ValueError("声线名称必须是非空文本，且 UTF-8 长度不得超过 80 字节。")
+            name = raw_name.strip()
+            try:
+                valid_name = 1 <= len(name.encode("utf-8")) <= 80
+            except UnicodeError:
+                valid_name = False
+            if not valid_name or any(unicodedata.category(character) == "Cc" for character in raw_name):
+                raise ValueError("声线名称必须是非空原名，不含控制字符，且 UTF-8 长度不得超过 80 字节。")
+            fields = ("projectFile", "groupUUID", "groupOffset", "groupPitchOffset", "voiceFingerprint")
+            if not isinstance(selection, dict) or any(key not in selection for key in fields):
+                raise ValueError("当前选区身份不完整，请重新读取选区后补充声线名称。")
+            expected = {key: selection[key] for key in fields}
+            # projectFile 可为空，允许尚未保存工程的只读目录管理；开启写入仍由
+            # 原有备份流程另行要求已保存 SVP。这里不解析或访问任何客户端路径。
+            if (not isinstance(expected["projectFile"], str) or len(expected["projectFile"]) > 4096
+                    or not isinstance(expected["groupUUID"], str) or not 1 <= len(expected["groupUUID"]) <= 128
+                    or not isinstance(expected["voiceFingerprint"], str) or not 1 <= len(expected["voiceFingerprint"]) <= 256
+                    or not finite(expected["groupOffset"], -(2 ** 53), 2 ** 53)
+                    or not finite(expected["groupPitchOffset"], -127, 127)):
+                raise ValueError("当前选区身份格式无效，请重新读取选区后补充声线名称。")
+            result = self.bridge.call("register_vocal_mode", {"name": name, "expected": expected})
+            if not isinstance(result, dict):
+                raise ValueError("宿主未返回有效的更新目录，请重新读取选区。")
+            return result
+
     def get_audio_settings(self) -> dict:
         """返回可展示的听评设置，密钥只在后端请求供应商时使用。"""
         from .settings import get_audio_settings
@@ -256,14 +298,22 @@ class AssistantService:
             return result
 
     @exclusive_operation(lambda _service: DATA / "operation.lock")
-    def preview(self, parameter: str, delta: float) -> dict:
+    def preview(self, parameter: str, delta: float | None = None, *, curve=None, render_mode="smooth") -> dict:
+        """生成经过能力协商的预览，写入始终由另一次明确的 apply 完成。
+
+        五种旧增量保留原 IPC 形状；新增参数、绘制曲线或 points 表示必须先读取
+        本次宿主目录。Lua 还会再次检查读取与预览之间的选区/声库变化。
+        """
         with self.operation_lock:
             if self.recording:
                 raise ValueError("请等待录音结束后预览参数修改。")
             if not isinstance(parameter, str):
                 raise ValueError("参数名称必须是字符串。")
-            finite_number(delta, "调整量", -100, 100)
-            return self.bridge.call("preview", {"parameter": parameter, "delta": delta})
+            selection = None
+            if curve is not None or render_mode != "smooth" or parameter not in LEGACY_PARAMETERS:
+                selection = self.get_selection()
+            args = validate_change(parameter, delta, curve=curve, render_mode=render_mode, selection=selection)
+            return public_preview(self.bridge.call("preview", args))
 
     @exclusive_operation(lambda _service: DATA / "operation.lock")
     def edit(self, action: str, args: dict | None = None) -> dict:

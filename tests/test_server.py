@@ -99,6 +99,41 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(json.loads(body)["verified"])
         self.service.edit.assert_called_once_with("apply", {"previewId": "preview-1"})
 
+    def test_preview_routes_curve_and_mode_without_implicit_apply(self):
+        self.service.preview.return_value = {"previewId": "curve-preview"}
+        curve = [[0, 0], [0.5, 25], [1, 0]]
+        payload = {"parameter": "pitchDelta", "curve": curve, "renderMode": "points"}
+        self.assertEqual(self.request("POST", "/api/preview", body=payload)[0], 403)
+        self.service.preview.assert_not_called()
+        status, _, _ = self.request("POST", "/api/preview", headers={"X-SV-Token": "test-token"}, body=payload)
+        self.assertEqual(status, 200)
+        self.service.preview.assert_called_once_with("pitchDelta", curve=curve, render_mode="points")
+        self.service.edit.assert_not_called()
+
+    def test_preview_rejects_unknown_or_conflicting_payload_fields(self):
+        for payload in ({"parameter": "tension", "delta": 0.1, "curve": None},
+                        {"parameter": "tension", "curve": None}, {"parameter": "tension", "delta": 0.1, "code": "unsafe"}):
+            with self.subTest(fields=list(payload)):
+                status, _, _ = self.request("POST", "/api/preview", headers={"X-SV-Token": "test-token"}, body=payload)
+                self.assertEqual(status, 400)
+        self.service.preview.assert_not_called()
+
+    def test_curve_ui_module_is_on_static_whitelist(self):
+        status, headers, _ = self.request("GET", "/curves.js")
+        self.assertEqual(status, 200)
+        self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+
+    def test_manual_vocal_mode_registration_requires_token_and_returns_selection(self):
+        payload = {"name": "Soft", "selection": {"voiceFingerprint": "captured-voice"}}
+        self.service.register_vocal_mode.return_value = {"parameters": {"vocalMode_Soft": {"source": "user"}}}
+        self.assertEqual(self.request("POST", "/api/parameters/vocal-mode", body=payload)[0], 403)
+        self.service.register_vocal_mode.assert_not_called()
+        status, _, body = self.request("POST", "/api/parameters/vocal-mode", body=payload,
+                                       headers={"X-SV-Token": "test-token"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["parameters"]["vocalMode_Soft"]["source"], "user")
+        self.service.register_vocal_mode.assert_called_once_with(payload)
+
     def test_non_object_and_oversized_bodies_are_rejected(self):
         for body, extra in ((b"[]", {}), (b"{}", {"Content-Length": "65537"})):
             with self.subTest(body=body, extra=extra):

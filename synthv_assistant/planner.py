@@ -1,6 +1,6 @@
 """把自然语言需求转换为可预览的有限参数计划，不执行任何工程修改。
 
-模型响应始终视为不可信数据：只有规定的 JSON 结构及五种参数增量能够
+模型响应始终视为不可信数据：只有规定的 JSON 结构及宿主允许的有界参数能够
 通过校验。音频、歌词和历史属于参考资料，不能增加工具权限或修改范围。
 """
 
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import json
-import math
 from pathlib import Path
 import re
 import socket
@@ -17,21 +16,40 @@ from urllib import error
 from .review import _load_audio, _send_json
 from .settings import get_audio_configuration_snapshot
 from .model_options import normalize_model_options, validate_for_config, apply_reasoning
+from .parameters import PARAMETER_LIMITS, ParameterError, supports_curves, validate_action
 
 
-PARAMETER_LIMITS = {"breathiness": 0.3, "tension": 0.3, "gender": 0.3, "loudness": 6.0, "pitchDelta": 100.0}
 MAX_RESPONSE_CHARACTERS = 24_000
 SYSTEM_INSTRUCTION = """你是 Synthesizer V 调教咨询与参数计划助手，请用中文回复。
 你的输出必须只有一个严格 JSON 对象，顶层恰好含 text 和 actions：
 {"text":"中文解释、依据及局限","actions":[{"parameter":"tension","delta":-0.1,"reason":"中文调整原因"}]}
-actions 可为空，最多五项，参数不重复。每项只含 parameter、delta、reason。
-允许参数和单次增量绝对值上限：breathiness 0.3，tension 0.3，gender 0.3，
-loudness 6 dB，pitchDelta 100 cents。delta 是有限非零 JSON 数字，不能是字符串或布尔值。
+actions 可为空，最多五项，参数不重复。每项只含 parameter、reason，以及 delta 或 curve 二选一；
+可选 renderMode 只能为 smooth 或 points，默认 smooth，优先使用精简平滑表示。
+旧桥接只支持 breathiness/tension/gender 的单次增量绝对值不超过 0.3、loudness 6 dB、
+pitchDelta 100 cents。delta 必须是有限非零 JSON 数字，不能是字符串或布尔值。
+当 selection.capabilities 含 curves 字段时，旧五参数也必须出现在本次 parameters 目录且未禁用；
+目录缺项表示当前不可用，不能用旧桥接默认值补全。只有没有能力目录的旧桥接才兼容旧五参数回退。
+只在 selection.capabilities.curves=true 时才可提出曲线和新增参数；所有新增参数须出现在本次
+selection.parameters 中。toneShift 上限 200 cents，vibratoEnv 上限 0.3；
+vocalMode_Name 必须与目录 kind=vocalMode、modeName=Name 严格匹配，上限 30 个百分点。
+本次目录 maxDelta 若更小，采用更小上限。不得猜测、创造声库模式或采用别的声库目录。
+curve 格式为 [[position,value],...]，2 至 64 点，position 是当前连续选区内 0..1 比例，
+严格递增且首尾为 0 和 1。通用参数、vocalMode_Name、pitchDelta 的 value 都是偏移量，
+同样受上述增量上限限制，边缘淡入淡出由宿主处理。多个局部变化应放在同一参数曲线中。
+pitchCurve 与 pitchDelta 不同：仅当 capabilities.nativePitch=true 且本次目录
+pitchCurve.kind=pitch、available=true 时可用；value 是工程绝对 MIDI 半音 0..127，
+还须落在本次全部音符 pitch 加 groupPitchOffset 后的最低至最高音上下各 2 半音范围内。
+只支持 curve 和 renderMode=smooth，不支持 delta 或 points。不要把 cents 当 MIDI；
+这会按绝对 MIDI 音高覆盖当前连续选区；已有跨界曲线、区内引导点或非零 pitchDelta 时
+宿主会拒绝预览，不会自动覆盖冲突资料。应保守使用并在预览中说明限制。
+声库模式目录只包含宿主 getVoice 实际返回的当前组/轨道模式，可能不完整；未列出的模式不可猜测。
+目录 source=host 表示宿主已返回，source=user 表示用户已核对声线面板原名后临时补充；
+两者都只授权使用本次实际目录中的名称。你不能自行注册名称，不能把用户补充说成 API 完整枚举。
 采用保守的小幅调整，不必为了凑数提出动作。无法支持的需求应解释，actions 留空。
-本宿主只支持给当前所选音符覆盖的连续时间段叠加一个参数偏移，并在边缘淡入淡出。
-该时间段可能包含中间未选中的音符。每条动作的范围都是这同一段，不支持按词、按字、
-单独末音或任意时间点自动选区，不支持逐点绘制音高/力度，不支持自动精确处理尾音。
-如果需求依赖更细的范围，请让用户在 SynthV 手动选好范围后再生成计划，不要暗示你能替其选择。
+每条动作的范围都是当前所选音符覆盖的同一连续时间段，可能包含中间未选中的音符。
+曲线可在该段内表达稀疏的变化趋势，但不能自动按词、按字或任意时间点改变宿主选区。
+没有 curves 能力时只能整体偏移，不能声称能绘制曲线。不要承诺精确逐字处理或自动选中末音；
+必要时请用户在 SynthV 手动选好范围。依据结构规划音高不等于已听过音高效果。
 没有有效选区时可以咨询，但 actions 必须为空。计划尚未预览或应用，必须由用户预览确认后应用。
 禁止输出代码、命令、工具调用、文件路径、执行脚本、附加 action 字段或已修改工程的声明。
 有音频时区分实际听感、用户描述和推测，不伪造精确测量；无音频时只能依据选区结构与用户描述，
@@ -139,14 +157,16 @@ def _contains_code(value: str) -> bool:
     return any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in patterns)
 
 
-def _unsupported_claim(value: str, has_audio: bool) -> bool:
+def _unsupported_claim(value: str, has_audio: bool, has_curves: bool = False) -> bool:
     """拦截明确的已执行声明或超出当前界面的操作承诺，不尝试解释任意程序语言。"""
     patterns = [
         r"(?:我已|已为你|已帮你|已经为你).{0,12}(?:修改|调整|应用|执行|选中|选择)",
         r"(?:工程|参数|修改|计划)已(?:经)?(?:应用|写入|执行|完成)",
         r"(?<!不)(?:可|会|将|能够).{0,8}自动(?:选中|选择|选区)",
-        r"(?<!不)(?:可|会|将|能够).{0,8}(?:逐字|逐点)(?:调整|修改|绘制|调教)",
+        r"(?<!不)(?:可|会|将|能够).{0,8}逐字(?:调整|修改|绘制|调教)",
     ]
+    if not has_curves:
+        patterns.append(r"(?<!不)(?:可|会|将|能够).{0,8}逐点(?:调整|修改|绘制|调教)")
     if not has_audio:
         patterns.extend([r"(?:我|已经|本次).{0,6}(?:听过|听到|听了)", r"(?:听起来|听下来|试听后|听音后)"])
     for pattern in patterns:
@@ -161,7 +181,8 @@ def _unsupported_claim(value: str, has_audio: bool) -> bool:
     return False
 
 
-def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str) -> dict:
+def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
+                selection: dict | None = None) -> dict:
     """只接受完整 JSON 或完整外层 json 围栏，不从散文、工具调用中猜测计划。"""
     if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_RESPONSE_CHARACTERS:
         raise PlannerError("模型没有返回有效的调教计划，请调整需求后重试。")
@@ -186,31 +207,28 @@ def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str) 
         raise PlannerError("模型计划的操作数量无效，最多允许五种参数。")
     if actions and not has_selection:
         raise PlannerError("当前没有可用音符选区，模型不能提出应用动作；请先选中音符或仅咨询。")
-    if _contains_code(explanation) or _unsupported_claim(explanation, has_audio):
+    has_curves = supports_curves(selection)
+    if _contains_code(explanation) or _unsupported_claim(explanation, has_audio, has_curves):
         raise PlannerError("模型说明包含不支持的命令、执行声明或能力承诺，已拒绝该计划。")
     checked, seen = [], set()
     for action in actions:
-        if not isinstance(action, dict) or set(action) != {"parameter", "delta", "reason"}:
-            raise PlannerError("模型动作包含缺失或未知字段，已拒绝该计划。")
-        parameter, delta, reason = action["parameter"], action["delta"], action["reason"]
-        if not isinstance(parameter, str) or parameter not in PARAMETER_LIMITS or parameter in seen:
+        try:
+            normalized = validate_action(action, selection, reason_limit=1000)
+        except ParameterError as exc:
+            raise PlannerError(str(exc)) from None
+        parameter, reason = normalized["parameter"], normalized["reason"]
+        if parameter in seen:
             raise PlannerError("模型动作使用未知或重复参数，已拒绝该计划。")
-        # 先比较范围，避免超大 JSON 整数在 math.isfinite 转浮点时触发溢出。
-        if (isinstance(delta, bool) or not isinstance(delta, (int, float)) or delta == 0
-                or not -PARAMETER_LIMITS[parameter] <= delta <= PARAMETER_LIMITS[parameter]
-                or not math.isfinite(delta)):
-            raise PlannerError("模型动作的调整量为零、非数值或超出安全范围，已拒绝该计划。")
-        if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
-            raise PlannerError("模型动作缺少有效调整原因，已拒绝该计划。")
-        if _contains_code(reason) or _unsupported_claim(reason, has_audio):
+        if _contains_code(reason) or _unsupported_claim(reason, has_audio, has_curves):
             raise PlannerError("模型动作原因包含不支持的命令、执行声明或能力承诺，已拒绝该计划。")
         seen.add(parameter)
-        checked.append({"parameter": parameter, "delta": float(delta),
-                        "reason": _redact(reason.strip(), key) + "（仅作用于当前所选音符覆盖的连续时间段。）"})
+        scope = ("（按绝对 MIDI 音高覆盖当前连续选区；已有跨界曲线、区内引导点或非零 pitchDelta 会拒绝预览。）"
+                 if parameter == "pitchCurve" else "（仅作用于当前所选音符覆盖的连续时间段。）")
+        checked.append({**normalized, "reason": _redact(reason, key) + scope})
     limitation = ("已附加音频，听感判断仍需你试听确认。" if has_audio else
                   "本次未提供音频，建议仅依据结构和你的描述，尚未试听实际效果。")
     if checked:
-        limitation += " 各项仅调整当前选中音符跨度的连续时间段，不会自动选字、选区或逐点处理尾音。"
+        limitation += " 各项以当前选中音符跨度的连续时间段为目标，不会自动选字、改变选区或保证精确处理尾音。"
     limitation += " 本次只生成建议，尚未修改工程；应用前需要预览并确认。"
     return {"text": _redact(explanation.strip(), key) + "\n\n" + limitation, "actions": checked}
 
@@ -345,7 +363,8 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
                             {"x-goog-api-key": config["key"]})
             raw = _gemini_text(response)
         report("正在校验调教建议")
-        plan = _parse_plan(raw, has_selection=_has_selection(selection), has_audio=bool(files), key=config["key"])
+        plan = _parse_plan(raw, has_selection=_has_selection(selection), has_audio=bool(files), key=config["key"],
+                           selection=selection)
         return {**plan, "provider": config["provider"], "model": config["model"], "inputMode": "audio" if files else "text",
                 "platformId": options["platformId"], "reasoningEffort": options["reasoningEffort"],
                 "reasoningSummary": safe_reasoning()}

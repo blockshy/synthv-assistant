@@ -82,11 +82,13 @@ def build_script(destination: Path | None = None) -> Path:
     destination = destination or DATA_INSTALL()
     destination.parent.mkdir(parents=True, exist_ok=True)
     parser = (ROOT / "synthv" / "json.lua").read_text(encoding="utf-8")
+    # 原生音高模块与自动化桥接在同一脚本实例内，共用预览、撤销和失败恢复生命周期。
+    pitch = (ROOT / "synthv" / "pitch.lua").read_text(encoding="utf-8")
     body = (ROOT / "synthv" / "bridge.lua").read_text(encoding="utf-8")
     ipc_literal = str(IPC).replace("\\", "/")
     if "]]" in ipc_literal:
         raise ValueError("IPC 路径不能包含 Lua 长字符串终止符。")
-    destination.write_text("-- 本文件由安装器生成；请编辑项目内源文件。\nlocal json = (function()\n" + parser + "\nend)()\nlocal IPC_DIR = [[" + ipc_literal + "]]\n" + body, encoding="utf-8")
+    destination.write_text("-- 本文件由安装器生成；请编辑项目内源文件。\nlocal json = (function()\n" + parser + "\nend)()\nlocal NativePitch=(function()\n" + pitch + "\nend)()\nlocal IPC_DIR = [[" + ipc_literal + "]]\n" + body, encoding="utf-8")
     return destination
 
 

@@ -24,13 +24,8 @@
     gemini: { model: "gemini-3.8-flash", baseUrl: "https://generativelanguage.googleapis.com/v1beta" },
   };
 
-  const parameterDefinitions = {
-    breathiness: { unit: "参数值", step: 0.01, min: -0.2, max: 0.2, value: 0.05, hint: "在选区内增加或减少气声；建议从小幅调整开始。" },
-    tension: { unit: "参数值", step: 0.01, min: -0.2, max: 0.2, value: 0.05, hint: "在选区内调整发声张力；正数增强，负数减弱。" },
-    loudness: { unit: "dB", step: 0.1, min: -6, max: 6, value: 1, hint: "在选区内调整响度；建议先录制基线，避免仅因变响而误判改善。" },
-    gender: { unit: "参数值", step: 0.01, min: -0.2, max: 0.2, value: 0.05, hint: "在选区内调整性别参数；具体音色变化依声库而异。" },
-    pitchDelta: { unit: "音分", step: 1, min: -100, max: 100, value: 10, hint: "在选区内偏移音高曲线；100 音分等于一个半音。" },
-  };
+  // 目录、手绘草稿及局部校验由共享模块负责，API 请求与工程写入状态仍在本模块中。
+  let parameterEditor = null;
 
   /** 从结构化服务错误中提取可读信息，避免向界面输出 [object Object]。 */
   function errorMessage(value) {
@@ -87,7 +82,7 @@
 
   /** 只用 textContent 呈现返回内容；详细结果隐藏凭证字段，防止误显示敏感配置。 */
   function printable(value) {
-    return JSON.stringify(value, (key, item) => /token|api.?key|secret|authorization/i.test(key) ? "[已隐藏]" : item, 2);
+    return JSON.stringify(value, (key, item) => /token|api.?key|secret|authorization|fingerprint/i.test(key) ? "[已隐藏]" : item, 2);
   }
 
   function resultData(value) { return value?.result ?? value?.data ?? value ?? {}; }
@@ -95,6 +90,11 @@
   function numberText(value, digits = 2) { return finite(value) ? value.toLocaleString("zh-CN", { maximumFractionDigits: digits }) : "—"; }
   function getRecording(slot) { return state.recordings.find((recording) => recording.id === state.selected[slot]); }
   function bothRecordings() { return Boolean(getRecording("a") && getRecording("b") && state.selected.a !== state.selected.b); }
+  /** 声线名保持原大小写，仅去除首尾空格；字节上限与本地服务一致，避免多字节名称误通过。 */
+  function vocalModeNameError(name) {
+    if (/[\u0000-\u001f\u007f]/.test(name)) return "模式名称不能包含控制字符。";
+    return new TextEncoder().encode(name).length > 80 ? "模式名称过长：UTF-8 编码后不能超过 80 字节。" : "";
+  }
 
   /** 所有动作共用禁用条件，定时刷新状态时也不会意外解锁正在运行的操作。 */
   function syncButtons() {
@@ -115,7 +115,16 @@
     $("use-selection-range").disabled = !selectionRange() || recording;
     $("parameter").disabled = changing || recording;
     $("parameter-delta").disabled = changing || recording;
+    const canExtendModes = connected && Boolean(selectionRange()) && resultData(state.selection)?.capabilities?.curves === true;
+    $("vocal-mode-name").disabled = !canExtendModes || changing || recording;
+    const modeName = $("vocal-mode-name").value.trim();
+    $("add-vocal-mode").disabled = $("vocal-mode-name").disabled || !modeName || Boolean(vocalModeNameError(modeName));
+    $("add-vocal-mode").title = canExtendModes ? "补充当前组的可选参数，不写入工程" : "请先连接新版桥接并读取有效选区";
     $("preview-change").disabled = !connected || recording || changing;
+    if (parameterEditor) {
+      parameterEditor.setBusy(changing || recording, connected);
+      $("preview-change").disabled ||= !parameterEditor.canPreview();
+    }
     $("apply-change").disabled = !connected || !editing || !state.preview || recording || changing;
     // 服务负责判断是否存在可恢复快照；刷新页面后仍允许请求恢复，避免隐藏有效的恢复能力。
     $("restore-change").disabled = !connected || !editing || recording || changing;
@@ -484,12 +493,14 @@
     const range = selectionRange();
     $("selection-time").textContent = range ? `${numberText(range.start)}–${numberText(range.start + range.duration)} 秒` : "—";
     $("context-details").textContent = printable({ 工程: state.project, 选区: state.selection });
+    parameterEditor?.setSelection(state.selection ? selection : null);
     syncButtons();
   }
 
   function invalidatePreview(message = "", broadcast = true) {
     state.preview = null;
     $("preview-result").hidden = true;
+    $("preview-curve-chart").replaceChildren();
     if (message) feedback("tuning-feedback", message);
     // 手动预览、重新读取选区等动作会使聊天中已确认的范围不再可靠。
     // 聊天自己的预览也会清空手动预览，但不回发事件，避免循环通知。
@@ -512,6 +523,7 @@
     state.busy.add("context");
     if (kind === "selection") {
       state.selection = null;
+      feedback("vocal-mode-feedback");
       invalidatePreview("正在重新读取选区，读取完成后请重新预览。");
       renderContext();
     } else syncButtons();
@@ -522,9 +534,11 @@
       renderContext();
       const empty = kind === "selection" && !selectionRange();
       feedback("context-feedback", empty ? "未读取到有效音符选区，请在 SynthV 中选中音符。" : kind === "project" ? "工程信息已读取。" : "选区信息已读取。", empty);
+      // 结束读取阶段时也结束调参区的等待提示，不能让已完成的请求看起来仍在进行。
+      if (kind === "selection") feedback("tuning-feedback", empty ? "没有有效选区，请先选中音符并重新读取。" : "选区已更新，请先生成预览。", empty);
       return data;
     } catch (error) {
-      if (kind === "selection") { state.selection = null; renderContext(); }
+      if (kind === "selection") { state.selection = null; renderContext(); feedback("tuning-feedback", "选区读取失败，请重新读取有效选区后再预览。", true); }
       feedback("context-feedback", errorMessage(error), true);
       if (propagateError) throw error;
       return null;
@@ -812,29 +826,58 @@
     $("select-" + slot).addEventListener("change", (event) => { state.selected[slot] = event.target.value; renderRecording(slot); clearComparison(); syncButtons(); });
     $("audio-" + slot).addEventListener("play", () => $("audio-" + (slot === "a" ? "b" : "a")).pause());
   }
-  $("parameter").addEventListener("change", () => {
-    const definition = parameterDefinitions[$("parameter").value];
-    const input = $("parameter-delta");
-    for (const key of ["step", "min", "max", "value"]) input[key] = definition[key];
-    $("delta-unit").textContent = definition.unit;
-    $("parameter-help").textContent = definition.hint;
-    invalidatePreview(); feedback("tuning-feedback", "");
+  // 草稿改变后同时废弃预览和旧成功提示，避免禁用按钮旁仍显示“预览已就绪”。
+  parameterEditor = window.SynthVCurves.createEditor({ onChange: () => invalidatePreview("草稿已更改，请重新预览。"), onValidityChange: syncButtons });
+  /** 用户明确补充声线名后提交原始选区快照，由服务校验组身份；不自行猜测声库模式。 */
+  async function addVocalMode() {
+    if ($("add-vocal-mode").disabled) return;
+    const name = $("vocal-mode-name").value.trim(), selection = state.selection;
+    await runBusy("context", "vocal-mode-feedback", async () => {
+      invalidatePreview("正在补充参数目录，完成后请重新预览。");
+      feedback("vocal-mode-feedback", "正在补充当前组的参数目录，不会写入工程…");
+      let updatedSelection;
+      try { updatedSelection = await api("/api/parameters/vocal-mode", { name, selection }); }
+      catch (error) {
+        // 超时可能发生在服务已更新目录之后，因此提示重新读取，不声称后端一定没有执行。
+        feedback("tuning-feedback", "参数目录更新未确认，请重新读取选区。", true); throw error;
+      }
+      state.selection = updatedSelection;
+      renderContext();
+      parameterEditor.selectParameter("vocalMode_" + name);
+      $("vocal-mode-name").value = "";
+      feedback("vocal-mode-feedback", `已将“${name}”补充到本组参数目录，仅本次桥接会话有效。请核对声库面板后再预览。`);
+    });
+  }
+  $("vocal-mode-name").addEventListener("input", () => {
+    const message = vocalModeNameError($("vocal-mode-name").value.trim());
+    feedback("vocal-mode-feedback", message, Boolean(message)); syncButtons();
   });
-  $("parameter-delta").addEventListener("input", () => invalidatePreview());
+  $("add-vocal-mode").addEventListener("click", addVocalMode);
+  $("vocal-mode-name").addEventListener("keydown", (event) => {
+    // 补充名称位于调参表单内，按回车只补充目录，不能意外提交参数预览。
+    if (event.key === "Enter" && !event.isComposing) { event.preventDefault(); addVocalMode(); }
+  });
   $("tuning-form").addEventListener("submit", (event) => {
     event.preventDefault();
     if (!$("tuning-form").reportValidity()) return;
     runBusy("tuning", "tuning-feedback", async () => {
-      invalidatePreview(); feedback("tuning-feedback", "正在读取当前选区并生成预览…");
-      const result = await api("/api/preview", { parameter: $("parameter").value, delta: Number($("parameter-delta").value) });
+      const payload = parameterEditor.getPayload();
+      invalidatePreview(); feedback("tuning-feedback", "正在读取当前选区并生成预览，尚未写入工程…");
+      const result = await api("/api/preview", payload);
       if (!result.previewId) throw new Error("服务未返回有效的修改预览，尚未改动工程。");
       state.preview = result;
-      const parameterName = $("parameter").selectedOptions[0].textContent.split(" · ")[0];
-      const amount = finite(result.delta) ? `${result.delta > 0 ? "+" : ""}${numberText(result.delta)} ${parameterDefinitions[$("parameter").value].unit}` : "";
+      const definition = parameterEditor.describe(payload.parameter);
+      const parameterName = result.label || definition?.label || payload.parameter;
+      const unit = result.unit || definition?.unit || "";
+      const amount = Array.isArray(payload.curve) ? `${payload.curve.length} 个草稿点` : finite(result.delta) ? `${result.delta > 0 ? "+" : ""}${numberText(result.delta)} ${unit}` : "";
       const scope = finite(result.startSeconds) && finite(result.endSeconds) ? ` · ${numberText(result.startSeconds)}–${numberText(result.endSeconds)} 秒` : "";
       const notes = finite(result.noteCount) ? ` · ${result.noteCount} 个音符` : "";
-      $("preview-summary").textContent = `${parameterName} ${amount}${scope}${notes}。${typeof result.summary === "string" ? result.summary : "预览已生成，尚未改动工程。"}`;
+      const representation = window.SynthVCurves.representation(result.representation, result.renderMode);
+      const counts = `${finite(result.beforePointCount) ? ` · 原有 ${result.beforePointCount} 点` : ""}${finite(result.pointCount) ? ` · 预览 ${result.pointCount} 点` : ""}${finite(result.pointReduction) ? ` · 精简减少 ${result.pointReduction} 点` : ""}`;
+      $("preview-summary").textContent = `${parameterName} ${amount}${scope}${notes} · ${representation}${counts}。${typeof result.summary === "string" ? result.summary : "预览已生成，尚未改动工程。"}`;
       $("preview-details").textContent = printable(result);
+      const chart = window.SynthVCurves.createPreview(result);
+      $("preview-curve-chart").replaceChildren(); if (chart) $("preview-curve-chart").append(chart);
       $("preview-result").hidden = false;
       feedback("tuning-feedback", state.status?.writeEnabled ? "预览已就绪，尚未改动工程。" : "预览已就绪。开启选区写入后才能应用。");
     });
@@ -895,6 +938,7 @@
     api, waitForJob, errorMessage, printable, refreshStatus, refreshRecordings,
     readSelection: () => readContext("selection", { propagateError: true }),
     getSelectionRange: () => selectionRange(),
+    getParameterDefinition: (parameter) => parameterEditor?.describe(parameter),
     setRecordingBusy: (busy) => { if (busy) state.busy.add("record"); else state.busy.delete("record"); syncButtons(); },
     getStatus: () => state.status,
     getManualBusy: () => ["record", "tuning", "mode", "assistant", "context"].some((key) => state.busy.has(key)),

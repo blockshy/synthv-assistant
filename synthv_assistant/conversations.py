@@ -11,7 +11,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +20,7 @@ from .config import DATA
 from .operations import OperationBusyError, OperationLock
 from .metadata import LibraryMetadata, MetadataError
 from .model_options import normalize_model_options, validate_for_config
+from .parameters import ParameterError, public_parameter_catalog, public_preview, validate_action
 
 
 def _default_platform_id() -> str:
@@ -35,7 +35,6 @@ MAX_CONVERSATIONS = 200
 MAX_TEXT_CHARS = 4_000
 MAX_REPLY_CHARS = 24_000
 REPLY_RESERVE_BYTES = 192 * 1024
-PARAMETER_LIMITS = {"breathiness": 0.3, "tension": 0.3, "loudness": 6, "gender": 0.3, "pitchDelta": 100}
 ACTION_STATES = {"proposed", "previewed", "applied", "unknown"}
 
 
@@ -91,33 +90,46 @@ def _safe_selection(selection: dict) -> dict:
     """仅向模型和页面提供音符、参数摘要及时间范围，排除项目路径、会话和组标识。"""
     note_fields = {"index", "pitch", "lyrics", "onset", "duration", "onsetSeconds", "durationSeconds"}
     result = {key: selection.get(key) for key in ("startSeconds", "endSeconds", "noteCount")}
+    if "groupPitchOffset" in selection:
+        result["groupPitchOffset"] = selection["groupPitchOffset"]
     result["notes"] = [{key: value for key, value in note.items() if key in note_fields}
                        for note in selection["notes"]]
-    result["parameters"] = {name: {key: value for key, value in definition.items()
-                                  if key in {"range", "defaultValue", "pointCount"}}
-                            for name, definition in selection.get("parameters", {}).items()
-                            if name in PARAMETER_LIMITS and isinstance(definition, dict)}
+    result["parameters"] = public_parameter_catalog(selection)
+    capabilities = selection.get("capabilities")
+    if isinstance(capabilities, dict):
+        result["capabilities"] = {key: capabilities[key] for key in ("curves", "nativePitch")
+                                  if isinstance(capabilities.get(key), bool)}
+    warnings = selection.get("capabilityWarnings")
+    if isinstance(warnings, list):
+        result["capabilityWarnings"] = [item for item in warnings[:16] if isinstance(item, str) and len(item) <= 1000]
     return result
 
 
 def _selection_identity(selection: dict, session: str) -> str:
     """参数单独绑定，避免应用气声后让同一乐句的张力提案无故失效。"""
     fields = ("projectFile", "groupUUID", "groupOffset", "notes", "startSeconds", "endSeconds", "noteCount")
-    return _fingerprint({**{key: selection.get(key) for key in fields}, "bridgeSession": session})
+    identity = {**{key: selection.get(key) for key in fields}, "bridgeSession": session}
+    # 缺少新字段的旧桥接维持原摘要格式；新桥接的声库身份与组移调均参与绑定。
+    identity.update({key: selection[key] for key in ("groupPitchOffset", "voiceFingerprint") if key in selection})
+    return _fingerprint(identity)
 
 
 def _parameter_identity(selection: dict, parameter: str) -> str:
     definition = selection.get("parameters", {}).get(parameter)
     if not isinstance(definition, dict):
         raise ConversationError("当前选区没有该参数的有效摘要，请重新读取后规划。")
-    # 预览之前只有点数摘要，不能识别点数不变的手工曲线编辑；实际 apply 仍由
-    # Lua 严格检查宿主预览时的完整曲线，绝不能把此摘要当成完整曲线指纹。
-    return _fingerprint({key: definition.get(key) for key in ("range", "defaultValue", "pointCount")})
+    # 新桥接提供完整参数 fingerprint，能识别点数不变的手工编辑；旧桥接仍只
+    # 有点数摘要，保留兼容，但 apply 始终必须由 Lua 检查真实曲线，不能以此替代。
+    identity = {key: definition.get(key) for key in ("range", "defaultValue", "pointCount")}
+    identity.update({key: definition[key] for key in
+                     ("fingerprint", "kind", "maxDelta", "modeName", "available") if key in definition})
+    return _fingerprint(identity)
 
 
 def _public_action(action: dict) -> dict:
     """只投影状态机的公开字段，私有指纹与会话不会进入前端响应。"""
-    fields = {"id", "parameter", "delta", "reason", "status", "preview", "result"}
+    fields = {"id", "parameter", "delta", "curve", "renderMode", "reason", "status", "preview", "result",
+              "label", "unit", "kind", "modeName"}
     return {key: value for key, value in action.items() if key in fields}
 
 
@@ -452,17 +464,23 @@ class ConversationManager:
         guards = {}
         if selection is None:
             return reply, guards
+        seen = set()
         for proposal in actions:
-            if not isinstance(proposal, dict) or set(proposal) != {"parameter", "delta", "reason"}:
-                raise ConversationError("模型动作格式无效。")
-            parameter, delta, reason = proposal["parameter"], proposal["delta"], proposal["reason"]
-            if (not isinstance(parameter, str) or parameter not in PARAMETER_LIMITS
-                    or isinstance(delta, bool) or not isinstance(delta, (int, float))
-                    or not -PARAMETER_LIMITS[parameter] <= delta <= PARAMETER_LIMITS[parameter]
-                    or not math.isfinite(delta) or delta == 0
-                    or not isinstance(reason, str) or not 1 <= len(reason) <= 2000):
-                raise ConversationError("模型动作超出允许范围。")
-            action = {"id": uuid.uuid4().hex, "parameter": parameter, "delta": delta, "reason": reason, "status": "proposed"}
+            try:
+                normalized = validate_action(proposal, selection)
+            except ParameterError as exc:
+                raise ConversationError(str(exc)) from None
+            parameter = normalized["parameter"]
+            if parameter in seen:
+                raise ConversationError("同一提案不能包含重复参数，请将分段变化合并为一条曲线。")
+            seen.add(parameter)
+            action = {"id": uuid.uuid4().hex, **normalized, "status": "proposed"}
+            # 展示标签来自捕获时的宿主目录，而非模型任意字段或之后切换的声库。
+            definition = selection.get("parameters", {}).get(parameter, {})
+            for key in ("label", "unit", "kind", "modeName"):
+                value = definition.get(key)
+                if isinstance(value, str) and len(value) <= 200:
+                    action[key] = value
             reply["actions"].append(action)
             guards[action["id"]] = {"selection": _selection_identity(selection, session), "session": session,
                                      "parameter": _parameter_identity(selection, parameter)}
@@ -487,6 +505,12 @@ class ConversationManager:
             raise ConversationError("桥接会话或目标选区已变化，请重新发送要求生成提案。")
         if _parameter_identity(selection, action["parameter"]) != guard.get("parameter"):
             raise ConversationError("目标参数摘要已变化，请重新生成该参数的调教提案。")
+        try:
+            # 能力可能在连接期间变化；即使所有点数未变，也不能应用已不可用的操作。
+            validate_action({key: action[key] for key in ("parameter", "delta", "curve", "renderMode", "reason")
+                             if key in action}, selection)
+        except ParameterError as exc:
+            raise ConversationError(str(exc)) from None
 
     def preview_action(self, action_id: str) -> dict:
         with self._lock():
@@ -509,17 +533,22 @@ class ConversationManager:
                     if changed:
                         self._save(other_document)
                 try:
-                    preview = self.service.preview(action["parameter"], action["delta"])
+                    if "curve" in action:
+                        preview = self.service.preview(action["parameter"], curve=action["curve"],
+                                                       render_mode=action.get("renderMode", "smooth"))
+                    elif action.get("renderMode", "smooth") != "smooth":
+                        preview = self.service.preview(action["parameter"], action["delta"], render_mode=action["renderMode"])
+                    else:
+                        # 不给旧增量补额外参数，保持现有 MCP、替身及桥接调用兼容。
+                        preview = self.service.preview(action["parameter"], action["delta"])
                     current, current_session = self._capture_selection()
                     self._check_guard(action, guard, current, current_session)
-                    if not isinstance(preview, dict) or not isinstance(preview.get("previewId"), str) or not preview["previewId"]:
-                        raise ConversationError("宿主没有返回有效预览。")
+                    preview = public_preview(preview)
                 except ConversationError:
                     raise
                 except Exception:
                     raise ConversationError("无法生成宿主预览，尚未修改工程；请检查桥接和当前选区。") from None
-                fields = {"previewId", "parameter", "delta", "noteCount", "startSeconds", "endSeconds", "summary", "pointCount"}
-                action["preview"] = {key: value for key, value in preview.items() if key in fields}
+                action["preview"] = preview
                 action["status"] = "previewed"
                 self._save(document)
                 return json.loads(_encoded(_public_action(action)))

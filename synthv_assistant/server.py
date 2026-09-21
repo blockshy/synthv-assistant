@@ -151,7 +151,7 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                     file, data = service.read_audio("upload", path[9:-4])
                 else:
                     # 静态资源使用显式白名单；共享 UI 模块和页面脚本遵循同源 CSP，不开放任意文件读取。
-                    name = {"/": "index.html", "/index.html": "index.html", "/ui.js": "ui.js", "/app.js": "app.js", "/chat.js": "chat.js", "/models.js": "models.js", "/layout.js": "layout.js", "/pages.js": "pages.js", "/style.css": "style.css"}.get(path)
+                    name = {"/": "index.html", "/index.html": "index.html", "/ui.js": "ui.js", "/curves.js": "curves.js", "/app.js": "app.js", "/chat.js": "chat.js", "/models.js": "models.js", "/layout.js": "layout.js", "/pages.js": "pages.js", "/style.css": "style.css"}.get(path)
                     if not name:
                         return self.response_json({"error": "页面不存在。"}, 404)
                     file = ROOT / "web" / name
@@ -263,8 +263,22 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                     return self.workbench_response(operation, path.split("/")[4])
                 elif path == "/api/write-mode":
                     result = service.write_mode(args.get("enabled"))
+                elif path == "/api/parameters/vocal-mode":
+                    # 仅用户界面提供此目录补充入口；模型/MCP没有自动注册权限。
+                    # 与所有 POST 共用会话令牌，业务层按原选区身份向宿主确认。
+                    return self.workbench_response(service.register_vocal_mode, args)
                 elif path == "/api/preview":
-                    result = service.preview(args.get("parameter"), args.get("delta"))
+                    # 精确校验动作入口的键，未知对象不能被静默忽略为另一个预览。
+                    # 完整数值及宿主能力校验统一留在 service/parameters，不能由网页绕过。
+                    from .parameters import validate_preview_payload
+                    validate_preview_payload(args)
+                    if "curve" in args:
+                        result = service.preview(args["parameter"], curve=args["curve"],
+                                                 render_mode=args.get("renderMode", "smooth"))
+                    elif "renderMode" in args:
+                        result = service.preview(args["parameter"], args["delta"], render_mode=args["renderMode"])
+                    else:
+                        result = service.preview(args["parameter"], args["delta"])
                 elif path == "/api/apply":
                     result = service.edit("apply", {"previewId": args.get("previewId")})
                 elif path == "/api/restore":

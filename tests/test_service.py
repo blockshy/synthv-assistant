@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 from synthv_assistant.bridge import BridgeError
 from synthv_assistant.service import AssistantService, finite_number
 from synthv_assistant.metadata import LibraryMetadata
+from synthv_assistant.operations import OperationLock
+from tests.test_parameters import modern_selection
 
 
 class ServiceTests(unittest.TestCase):
@@ -67,6 +69,74 @@ class ServiceTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 operation()
+        self.bridge.call.assert_not_called()
+
+    def test_legacy_preview_keeps_original_ipc_without_extra_catalog_read(self):
+        self.bridge.call.return_value = {"previewId": "legacy-preview", "parameter": "tension", "delta": 0.1}
+        result = self.service.preview("tension", 0.1)
+        self.assertEqual(result["previewId"], "legacy-preview")
+        self.bridge.call.assert_called_once_with("preview", {"parameter": "tension", "delta": 0.1})
+        self.bridge.call.reset_mock()
+        with self.assertRaises(ValueError):
+            self.service.preview("tension", 0.31)
+        self.bridge.call.assert_not_called()
+
+    def test_curve_preview_reads_capability_and_forwards_no_write(self):
+        selection = modern_selection()
+        curve = [[0, 0], [0.5, 25], [1, 0]]
+        self.bridge.call.side_effect = [selection, {"previewId": "curve-preview", "curve": curve,
+            "renderMode": "points", "curvePreview": [{"position": 0, "after": 0}], "projectFile": "private-path"}]
+        result = self.service.preview("pitchDelta", curve=curve, render_mode="points")
+        self.assertEqual(self.bridge.call.call_args_list[0].args[0], "get_selection")
+        self.assertEqual(self.bridge.call.call_args_list[1].args,
+                         ("preview", {"parameter": "pitchDelta", "curve": curve, "renderMode": "points"}))
+        self.assertIsNone(result["curvePreview"][0]["before"])
+        self.assertNotIn("projectFile", result)
+        self.assertNotIn("apply", [call.args[0] for call in self.bridge.call.call_args_list])
+
+    def test_unavailable_new_parameter_cannot_reach_host_preview(self):
+        self.bridge.call.return_value = {"parameters": {}, "capabilities": {"curves": True}}
+        with self.assertRaises(ValueError):
+            self.service.preview("vocalMode_Soft", 10)
+        self.assertEqual([call.args[0] for call in self.bridge.call.call_args_list], ["get_selection"])
+
+    def test_register_vocal_mode_uses_trimmed_original_name_and_only_expected_identity(self):
+        selection = {"projectFile": "", "groupUUID": "group-1", "groupOffset": 123,
+                     "groupPitchOffset": 12, "voiceFingerprint": "voice-1", "notes": [{"pitch": 60}],
+                     "parameters": {"private": "not-forwarded"}}
+        self.bridge.call.return_value = {"parameters": {"vocalMode_柔和": {"source": "user"}}}
+        result = self.service.register_vocal_mode({"name": "  柔和  ", "selection": selection})
+        self.assertIn("vocalMode_柔和", result["parameters"])
+        expected = {key: selection[key] for key in ("projectFile", "groupUUID", "groupOffset", "groupPitchOffset", "voiceFingerprint")}
+        self.bridge.call.assert_called_once_with("register_vocal_mode", {"name": "柔和", "expected": expected})
+
+    def test_register_vocal_mode_rejects_names_or_incomplete_identity_before_host(self):
+        selection = {"projectFile": "", "groupUUID": "group-1", "groupOffset": 0,
+                     "groupPitchOffset": 0, "voiceFingerprint": "voice-1"}
+        bad = [{"name": value, "selection": selection} for value in (None, "", "  ", "A\nB", "A\x00B", "\ud800", "柔" * 27)]
+        bad.extend(({"name": "Soft", "selection": {key: value for key, value in selection.items() if key != "voiceFingerprint"}},
+                    {"name": "Soft", "selection": {**selection, "groupOffset": True}},
+                    {"name": "Soft", "selection": {**selection, "groupPitchOffset": 10 ** 1000}},
+                    {"name": "Soft", "selection": {**selection, "voiceFingerprint": ""}},
+                    {"name": "Soft", "selection": selection, "code": "unsafe"}))
+        for payload in bad:
+            with self.assertRaises(ValueError):
+                self.service.register_vocal_mode(payload)
+        self.bridge.call.assert_not_called()
+        self.bridge.call.return_value = {"parameters": {}}
+        self.service.register_vocal_mode({"name": "柔" * 26, "selection": selection})
+        self.assertEqual(self.bridge.call.call_args.args[1]["name"], "柔" * 26)
+
+    def test_register_vocal_mode_respects_recording_and_cross_process_operation_lock(self):
+        payload = {"name": "Soft", "selection": {"projectFile": "", "groupUUID": "group-1", "groupOffset": 0,
+                   "groupPitchOffset": 0, "voiceFingerprint": "voice-1"}}
+        self.service.recording = True
+        with self.assertRaises(ValueError):
+            self.service.register_vocal_mode(payload)
+        self.service.recording = False
+        with OperationLock(self.directory / "operation.lock"):
+            with self.assertRaises(ValueError):
+                self.service.register_vocal_mode(payload)
         self.bridge.call.assert_not_called()
 
     def test_successful_recording_releases_recording_flag(self):

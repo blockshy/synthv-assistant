@@ -97,6 +97,9 @@ function group:getParameter(_) return host.curve end
 local ref={}
 function ref:getTarget() return group end
 function ref:getTimeOffset() return 0 end
+function ref:getPitchOffset() return host.pitchOffset or 0 end
+function ref:getVoice() return host.voice or {} end
+function ref:isMain() return true end
 function ref:isInstrumental() return false end
 local track={}
 function track:getNumGroups() return host.references end
@@ -111,6 +114,7 @@ local selection={}
 function selection:getSelectedNotes() return {note} end
 local editor={}
 function editor:getCurrentGroup() return ref end
+function editor:getCurrentTrack() return track end
 function editor:getSelection() return selection end
 SV={}
 function SV:getProject() return project end
@@ -133,10 +137,11 @@ class LuaBridgeTests(unittest.TestCase):
         self.lua.execute(STUB)
         root = Path(__file__).resolve().parents[1] / "synthv"
         parser = (root / "json.lua").read_text(encoding="utf-8")
+        pitch = (root / "pitch.lua").read_text(encoding="utf-8")
         bridge = (root / "bridge.lua").read_text(encoding="utf-8")
         # 同一代码块末尾暴露局部分发器，仅用于测试；生产文件本身不增加后门。
         self.dispatch, self.poll, self.session = self.lua.execute(
-            "local json=(function()\n" + parser + "\nend)()\n" + bridge + r'''
+            "local json=(function()\n" + parser + "\nend)()\nlocal NativePitch=(function()\n" + pitch + "\nend)()\n" + bridge + r'''
 return function(action,args)
   local ok,result=pcall(dispatch,action,args)
   return json.encode({ok=ok,result=ok and result or nil,error=not ok and tostring(result) or nil})
@@ -204,11 +209,128 @@ end, function() poll() end, function() return session end
 
     def test_cubic_boundary_drift_is_rejected_without_host_mutation(self):
         self.host.method = "Cubic"
+        # 非线性原曲线的区外切线依赖区内邻点；不能因为平直基线现已支持而删去此保护用例。
+        self.lua.execute("host.curve.points={{0,0.2},{500,-0.2},{2400,0.4},{3000,0}}")
         result = self.call("preview", parameter="tension", delta=0.1)
         self.assertFalse(result["ok"])
         self.assertIn("选区以外", result["error"])
         self.assertEqual(self.host.mutations, 0)
         self.assertEqual(self.host.undos, 0)
+
+    def test_default_smooth_mode_removes_redundant_points_without_changing_target(self):
+        """相同增量优先保留转折，密集点模式仍可显式选择，两个预览均不写宿主。"""
+        smooth = self.call("preview", parameter="tension", delta=0.1)["result"]
+        dense = self.call("preview", parameter="tension", delta=0.1, renderMode="points")["result"]
+        self.assertLess(smooth["pointCount"], dense["pointCount"] / 2)
+        self.assertEqual(smooth["representation"], "automation-simplified")
+        self.assertGreater(smooth["pointReduction"], 0)
+        self.assertAlmostEqual(smooth["curvePreview"][48]["after"], 0.1)
+        self.assertEqual(self.host.mutations, 0)
+
+    def test_cubic_flat_baseline_has_zero_external_drift(self):
+        """成对边缘锚点允许三次曲线中的平直片段生成稀疏预览，并守住选区外基线。"""
+        self.host.method = "Cubic"
+        preview = self.call("preview", parameter="tension", delta=0.1)
+        self.assertTrue(preview["ok"], preview.get("error"))
+        self.enable()
+        self.assertTrue(self.call("apply", previewId=preview["result"]["previewId"])["ok"])
+        for position in (0, 500, 999, 2001, 2500, 3000):
+            self.assertAlmostEqual(self.host.curve.get(self.host.curve, position), 0, places=7)
+
+    def test_cubic_float32_existing_curve_at_real_blick_scale_stays_sparse(self):
+        """真实量级的时间单位和非零已有曲线不能让小幅均匀调整退化为密集点。"""
+        # 旧替身将 1000 blick 当作一秒，会把“一 blick”误当作毫秒，无法覆盖
+        # 真实宿主中极短锚点间距与 float32 数值量化共同出现的场景。
+        # 本例仅替换时间轴与音符范围；仍运行生产桥接和已有的 Hermite 插值替身，
+        # 不把替身描述为 SynthV 私有插值算法的精确复刻。
+        self.lua.execute('''
+local scale=700000000
+local axis=SV:getProject():getTimeAxis()
+function axis:getSecondsFromBlick(b) return b/scale end
+function axis:getBlickFromSeconds(s) return s*scale end
+local note=SV:getMainEditor():getSelection():getSelectedNotes()[1]
+function note:getOnset() return scale end
+function note:getDuration() return 4.5*scale end
+host.method="Cubic"; host.quantize=true; host.curve.points={}
+for index=0,225 do
+  -- 位置按宿主整数 blick 保存，避免浮点乘法制造几乎重合的额外采样点。
+  local position=math.floor(scale*(1+index*.02)+.5)
+  local phase=math.max(0,math.min(1,(index*.02-.02)/4.46))
+  local value=.1234567+.04*math.sin(math.pi*phase)^2
+  -- 原曲线和后续候选都经过 float32；不能只量化新控制点而留下理想化基线。
+  value=string.unpack("f",string.pack("f",value))
+  host.curve.points[#host.curve.points+1]={position,value}
+end
+''')
+        before = self.call("get_selection")["result"]["parameters"]["tension"]["fingerprint"]
+        for parameter in ("breathiness", "tension"):
+            with self.subTest(parameter=parameter):
+                smooth_response = self.call("preview", parameter=parameter, delta=0.05)
+                dense_response = self.call("preview", parameter=parameter, delta=0.05, renderMode="points")
+                self.assertTrue(smooth_response["ok"], smooth_response.get("error"))
+                self.assertTrue(dense_response["ok"], dense_response.get("error"))
+                smooth, dense = smooth_response["result"], dense_response["result"]
+                self.assertEqual(smooth["beforePointCount"], 226)
+                self.assertEqual((smooth["startSeconds"], smooth["endSeconds"]), (1, 5.5))
+                self.assertEqual(smooth["representation"], "automation-simplified")
+                # 比较实际返回的两种表示，不绑定实现恰好选择的 21 个控制点。
+                self.assertLess(smooth["pointCount"], dense["pointCount"] / 3)
+                self.assertEqual(smooth["pointReduction"], dense["pointCount"] - smooth["pointCount"])
+                self.assertEqual(len(smooth["curvePreview"]), 97)
+                for row in smooth["curvePreview"]:
+                    self.assertGreater(row["before"], 0.1)
+                    elapsed = 4.5 * row["position"]
+                    envelope = max(0, min(1, elapsed / 0.08, (4.5 - elapsed) / 0.08))
+                    # 校验返回采样相对非零原基线的实际改变量，而非只检查点数减少。
+                    self.assertAlmostEqual(row["after"] - row["before"], 0.05 * envelope, delta=0.002)
+        after = self.call("get_selection")["result"]["parameters"]["tension"]["fingerprint"]
+        self.assertEqual(before, after)
+        self.assertEqual(self.host.mutations, 0)
+        self.assertEqual(self.host.undos, 0)
+
+    def test_curve_offsets_follow_ordered_user_shape(self):
+        """不同时间点的调整量形成同一个预览，而非把整段错误地平移成末点值。"""
+        preview = self.call("preview", parameter="tension", curve=[[0, 0], [0.25, 0.1], [0.75, -0.1], [1, 0]])
+        self.assertTrue(preview["ok"], preview.get("error"))
+        view = preview["result"]["curvePreview"]
+        self.assertAlmostEqual(view[24]["after"], 0.1)
+        self.assertAlmostEqual(view[72]["after"], -0.1)
+        self.assertEqual(self.host.mutations, 0)
+
+    def test_curve_shape_and_unknown_fields_are_rejected_before_writes(self):
+        for arguments in (
+            {"curve": [[0, 0], [0.5, 0.1], [0.5, 0], [1, 0]]},
+            {"curve": [[0.1, 0.1], [1, 0]]},
+            {"curve": [[0, 0.1], [1, 0.4]]},
+            {"curve": [[0, True], [1, 0]]},
+            {"curve": [[0, 0.1], [1, 0]], "delta": 0.1},
+            {"delta": 0.1, "script": "arbitrary"},
+            {"delta": 0.1, "renderMode": "unknown"},
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertFalse(self.call("preview", parameter="tension", **arguments)["ok"])
+        self.assertEqual(self.host.mutations, 0)
+
+    def test_vocal_modes_are_discovered_and_voice_changes_expire_preview(self):
+        """只接受当前宿主目录中的模式，切换声线默认配置后即使点数未变也必须重做预览。"""
+        self.lua.execute('host.voice={vocalModeParams={Airy={pitch=20,timbre=30,pronunciation=40}}}')
+        selection = self.call("get_selection")["result"]
+        self.assertEqual(selection["parameters"]["vocalMode_Airy"]["kind"], "vocalMode")
+        self.assertNotIn("vocalMode_Cute", selection["parameters"])
+        self.assertFalse(self.call("preview", parameter="vocalMode_Cute", delta=10)["ok"])
+        preview = self.call("preview", parameter="vocalMode_Airy", delta=0.1)
+        self.assertTrue(preview["ok"], preview.get("error"))
+        self.enable()
+        self.lua.execute('host.voice.vocalModeParams.Airy.timbre=31')
+        self.assertFalse(self.call("apply", previewId=preview["result"]["previewId"])["ok"])
+        self.assertEqual(self.host.mutations, 0)
+
+    def test_parameter_fingerprint_detects_same_count_edits_and_is_numeric_stable(self):
+        before = self.call("get_selection")["result"]["parameters"]["tension"]["fingerprint"]
+        self.host.readFloats = True
+        self.assertEqual(before, self.call("get_selection")["result"]["parameters"]["tension"]["fingerprint"])
+        self.lua.execute('host.curve.points[1][2]=0.05')
+        self.assertNotEqual(before, self.call("get_selection")["result"]["parameters"]["tension"]["fingerprint"])
 
     def test_unsupported_interpolation_and_excessive_curve_are_rejected(self):
         self.host.method = "unverified-method"
@@ -295,6 +417,50 @@ end
         self.assertTrue(response["ok"])
         self.assertTrue(self.host.finished)
         self.assertEqual(self.host.queued or 0, 0)
+
+    def test_user_mode_registration_only_expands_current_session_catalog(self):
+        # 注册遗漏名称不能修改声音、创建撤销记录或自动开启工程写入。
+        before = self.call("get_selection")["result"]
+        expected = {key: before[key] for key in
+                    ("projectFile", "groupUUID", "groupOffset", "groupPitchOffset", "voiceFingerprint")}
+        preview = self.preview_id()
+        result = self.call("register_vocal_mode", name="Cute", expected=expected)
+        self.assertTrue(result["ok"], result.get("error"))
+        item = result["result"]["parameters"]["vocalMode_Cute"]
+        self.assertEqual(item["source"], "user")
+        self.assertEqual(self.host.mutations, 0)
+        self.assertEqual(self.host.undos, 0)
+        self.enable()
+        self.assertFalse(self.call("apply", previewId=preview)["ok"])
+        self.assertTrue(self.call("preview", parameter="vocalMode_Cute", delta=0.1)["ok"])
+        # 声线设置改变后，之前的手动声明不自动套用到新上下文。
+        self.lua.execute("host.voice={paramTension=0.2}")
+        self.assertNotIn("vocalMode_Cute", self.call("get_selection")["result"]["parameters"])
+        self.assertFalse(self.call("register_vocal_mode", name="Cute", expected=expected)["ok"])
+
+    def test_user_mode_registration_rejects_missing_stale_or_invalid_context(self):
+        before = self.call("get_selection")["result"]
+        expected = {key: before[key] for key in
+                    ("projectFile", "groupUUID", "groupOffset", "groupPitchOffset", "voiceFingerprint")}
+        for name in ("", " Cute", "Cute ", "Bad\nName", "x" * 81):
+            with self.subTest(name=name):
+                self.assertFalse(self.call("register_vocal_mode", name=name, expected=expected)["ok"])
+        for context in ({}, {**expected, "groupOffset": 1}, {**expected, "voiceFingerprint": "stale"}):
+            self.assertFalse(self.call("register_vocal_mode", name="Cute", expected=context)["ok"])
+        self.assertEqual(self.host.mutations, 0)
+        self.assertNotIn("vocalMode_Cute", self.call("get_selection")["result"]["parameters"])
+
+    def test_cubic_large_mode_fade_remains_sparse_and_does_not_overshoot(self):
+        # 声线百分点的较大斜率能复现淡入转折过冲；不得靠退回均匀密集点掩盖。
+        self.lua.execute('''
+host.method="Cubic"; host.voice={vocalModeParams={Airy={pitch=0,timbre=0,pronunciation=0}}}
+function host.curve:getDefinition() return {range={-150,150},defaultValue=0} end
+''')
+        result = self.call("preview", parameter="vocalMode_Airy", delta=10)
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertLess(result["result"]["pointCount"], 30)
+        self.assertEqual(self.host.mutations, 0)
+        self.assertTrue(all(-0.15 <= row["after"] <= 10.15 for row in result["result"]["curvePreview"]))
 
 
 if __name__ == "__main__":

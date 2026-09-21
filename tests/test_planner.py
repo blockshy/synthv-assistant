@@ -12,6 +12,7 @@ from urllib import error
 import wave
 
 from synthv_assistant import planner
+from tests.test_parameters import modern_selection
 
 
 class PlannerTests(unittest.TestCase):
@@ -131,6 +132,7 @@ class PlannerTests(unittest.TestCase):
             self.call()
 
     def test_all_parameter_limits_allow_boundary_and_reject_overshoot(self):
+        self.selection.update(modern_selection())
         for parameter, limit in planner.PARAMETER_LIMITS.items():
             for delta in (-limit, limit):
                 with self.subTest(parameter=parameter, delta=delta):
@@ -138,6 +140,58 @@ class PlannerTests(unittest.TestCase):
                     self.assertEqual(self.call()["actions"][0]["delta"], delta)
             with self.subTest(parameter=parameter), self.assertRaises(planner.PlannerError):
                 self.respond({"text": "测试", "actions": [{"parameter": parameter, "delta": limit + 0.000001, "reason": "测试"}]})
+                self.call()
+
+    def test_dynamic_mode_and_piecewise_curve_are_bound_to_current_catalog(self):
+        """模型只能使用本次真实目录；音高分段仍是一条有限参数动作。"""
+        self.selection.update(modern_selection())
+        actions = [{"parameter": "vocalMode_Soft", "delta": 20, "reason": "增加柔和模式。"},
+                   {"parameter": "pitchDelta", "curve": [[0, 0], [0.4, -25], [0.8, 15], [1, 0]],
+                    "renderMode": "points", "reason": "在选区内表达分段偏移。"}]
+        self.respond({"text": "根据选区结构建议这些变化，仍需试听。", "actions": actions})
+        result = self.call()
+        self.assertEqual(result["actions"][1]["curve"], actions[1]["curve"])
+        self.assertEqual(result["actions"][1]["renderMode"], "points")
+        self.assertNotIn("delta", result["actions"][1])
+        del self.selection["parameters"]["vocalMode_Soft"]
+        with self.assertRaises(planner.PlannerError):
+            self.call()
+
+    def test_filtered_disabled_legacy_parameter_is_rejected_during_planning(self):
+        """走会话实际使用的安全投影，覆盖禁用条目被过滤后的模型校验路径。"""
+        from synthv_assistant.conversations import _safe_selection
+        self.selection.update(modern_selection())
+        self.selection["parameters"]["tension"]["available"] = False
+        public = _safe_selection(self.selection)
+        self.assertNotIn("tension", public["parameters"])
+        with self.assertRaisesRegex(planner.PlannerError, "当前可用目录"):
+            self.call(selection=public)
+        # 仍允许没有 capabilities 的旧选区使用原来的五参数增量协议。
+        self.assertEqual(self.call(selection={"noteCount": 1, "notes": [{"pitch": 60}]})["actions"][0]["delta"], -0.1)
+
+    def test_native_pitch_uses_absolute_midi_without_claiming_audio_was_heard(self):
+        self.selection.update(modern_selection())
+        self.respond({"text": "可以逐点绘制选区内的有限趋势，依据仅为音符结构。",
+                      "actions": [{"parameter": "pitchCurve", "curve": [[0, 60], [1, 64]], "reason": "按工程音高规划。"}]})
+        result = self.call()
+        self.assertEqual(result["actions"][0]["renderMode"], "smooth")
+        self.assertIn("未提供音频", result["text"])
+        self.assertIn("非零 pitchDelta 会拒绝预览", result["actions"][0]["reason"])
+        for text in ("我已经听过音高效果。", "我可以自动选中末音。"):
+            self.respond({"text": text, "actions": []})
+            with self.assertRaises(planner.PlannerError):
+                self.call()
+
+    def test_new_curves_require_capability_and_reject_hidden_commands_or_duplicate_parameters(self):
+        curve_action = {"parameter": "tension", "curve": [[0, 0], [1, 0.1]], "reason": "平滑变化。"}
+        self.respond({"text": "建议有限变化。", "actions": [curve_action]})
+        with self.assertRaises(planner.PlannerError):
+            self.call()
+        self.selection.update(modern_selection())
+        for actions in ([{**curve_action, "code": "unsafe"}], [curve_action, curve_action],
+                        [{**curve_action, "delta": 0.1}], [{**curve_action, "curve": [[0, 0], [1, True]]}]):
+            self.respond({"text": "建议有限变化。", "actions": actions})
+            with self.assertRaises(planner.PlannerError):
                 self.call()
 
     def test_invalid_values_and_duplicate_parameters_are_rejected(self):
