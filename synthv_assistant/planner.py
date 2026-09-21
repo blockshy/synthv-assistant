@@ -323,13 +323,14 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
             report("等待模型响应")
             if on_progress is None:
                 return _send_json(url, body, headers, config["timeoutSeconds"])
-            from .streaming import send_stream_json, StreamingError
+            from .streaming import send_stream_json, StreamingError, StreamingTimeoutError
             if config["provider"] == "gemini":
                 url = url.removesuffix(":generateContent") + ":streamGenerateContent?alt=sse"
             try:
                 return send_stream_json(url, body, headers, config["timeoutSeconds"], config["provider"], progress)
-            except StreamingError as exc:
-                # 专用异常只含本地固定提示，可直接解释 SSE 不兼容等问题；
+            except (StreamingError, StreamingTimeoutError) as exc:
+                # 专用异常只含本地固定提示，可直接解释 SSE 不兼容、首次输出/
+                # 空闲/总时限等问题；持续生成的内容不再被统一的请求总时限截断。
                 # 普通网络异常仍走下方脱敏处理，绝不回显供应商原始错误正文。
                 raise PlannerError(str(exc)) from None
 

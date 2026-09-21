@@ -117,3 +117,40 @@ class ModelOptionsTests(unittest.TestCase):
                 planner.plan_tuning("讨论调教", None, [], [], [], on_progress=lambda _value: None)
         outbound.assert_called_once()
         fallback.assert_not_called()
+
+    def test_stream_timeout_preserves_public_stage_without_retry_or_plan(self):
+        """规划层保留流式层的安全超时原因，避免再次退化成含糊的通用超时提示。
+
+        首次输出、后续空闲、连接阶段和总时限都应原样说明；已有真实摘要可继续
+        显示，但不能因超时而返回未完成提案，也不能回退到另一个付费模型请求。
+        """
+        from synthv_assistant.streaming import StreamingTimeoutError
+
+        messages = [
+            "AI 在 60 秒内未返回正文或思考摘要，等待首次输出超时。",
+            "AI 已连续 60 秒没有新的正文或思考摘要，等待超时。",
+            "等待 AI 服务建立连接或返回响应头超时（60 秒）。",
+            "AI 流式请求达到 30 分钟总上限，已停止等待。",
+        ]
+        for provider in ("openai", "gemini"):
+            config = {**self.config, "provider": provider,
+                      "model": "gpt-6-astra" if provider == "openai" else "gemini-3.8-flash"}
+            for message in messages:
+                with self.subTest(provider=provider, message=message):
+                    expected = message + "本次未自动重试，也未修改工程。"
+                    updates = []
+
+                    def timeout_stream(_url, _body, _headers, _timeout, _provider, callback):
+                        callback({"reasoningDelta": "已有的可见摘要", "textDelta": ""})
+                        raise StreamingTimeoutError(expected)
+
+                    with patch("synthv_assistant.planner.get_audio_configuration_snapshot", return_value=config), \
+                         patch("synthv_assistant.streaming.send_stream_json", side_effect=timeout_stream) as outbound, \
+                         patch("synthv_assistant.planner._send_json") as fallback:
+                        with self.assertRaises(planner.PlannerError) as raised:
+                            planner.plan_tuning("讨论调教", None, [], [], [], on_progress=updates.append)
+                    self.assertEqual(str(raised.exception), expected)
+                    self.assertTrue(any(item["reasoning"] == "已有的可见摘要" for item in updates))
+                    self.assertTrue(all(item["text"] == "" for item in updates))
+                    outbound.assert_called_once()
+                    fallback.assert_not_called()

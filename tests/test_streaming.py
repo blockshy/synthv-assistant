@@ -23,6 +23,24 @@ def gemini_event(parts, finish=None, **extra):
     return {"candidates": [{"index": 0, "content": {"parts": parts}, "finishReason": finish, **extra}]}
 
 
+class VirtualClock:
+    """每次网络读取推进指定时间，离线验证长请求而无需真实等待。
+
+    单调时钟读取本身不推进时间，避免把实现增加一次时间检查误当成超时。
+    未指定的后续读取耗时为零，便于独立表达首包、后续停顿及 EOF 的时序。
+    """
+
+    def __init__(self, delays):
+        self.started = self.now = 100.0
+        self.delays = iter(delays)
+
+    def __call__(self):
+        return self.now
+
+    def on_read(self):
+        self.now += next(self.delays, 0)
+
+
 class FakeResponse:
     """read1 按预设网络分段返回，模拟 UTF-8/CRLF 在任意字节位置断开。"""
 
@@ -189,16 +207,196 @@ class StreamingTests(unittest.TestCase):
         self.assertTrue(self.response.closed)
         self.opener.open.assert_called_once()
 
-    def test_total_deadline_does_not_restart_for_each_chunk(self):
-        clock = [100.0]
-        def on_read():
-            clock[0] += 0.6
-        with patch.object(streaming.time, "monotonic", side_effect=lambda: clock[0]):
-            with self.assertRaises(TimeoutError):
-                self.call([b":ping\n\n", sse(openai_event({"content": "late"}, "stop"))], timeout=1, on_read=on_read)
+    def test_first_output_deadline_does_not_restart_for_heartbeat(self):
+        """心跳只能证明连接存活，迟到的有效正文不能使已超时的请求复活。"""
+        clock = VirtualClock([0.6, 0.6])
+        with patch.object(streaming.time, "monotonic", side_effect=clock):
+            with self.assertRaisesRegex(streaming.StreamingTimeoutError, "等待首次输出超时"):
+                self.call([b":ping\n\n", sse(openai_event({"content": "late"}, "stop"))],
+                          timeout=1, on_read=clock.on_read)
         timeouts = [call.args[0] for call in self.response.socket.settimeout.call_args_list]
         self.assertGreater(timeouts[0], timeouts[-1])
         self.assertEqual(self.progress, [])
+        self.assertTrue(self.response.closed)
+        self.opener.open.assert_called_once()
+
+    def test_continuous_body_or_reasoning_can_run_beyond_ten_minutes(self):
+        """两种供应商的有效正文或可见摘要均续期，不能再被 60/180 秒总时限截断。"""
+        cases = [("openai", "text", 60), ("openai", "reasoning", 180),
+                 ("gemini", "text", 180), ("gemini", "reasoning", 60)]
+        for provider, channel, timeout in cases:
+            with self.subTest(provider=provider, channel=channel, timeout=timeout):
+                clock = VirtualClock([45] * 18)
+                if provider == "openai":
+                    field = "content" if channel == "text" else "reasoning_content"
+                    chunks = [sse(openai_event({field: "继续"})) for _ in range(16)]
+                    chunks.append(sse(openai_event({"content": "complete"}, "stop")))
+                else:
+                    chunks = [sse(gemini_event([{"text": "继续", "thought": channel == "reasoning"}]))
+                              for _ in range(16)]
+                    chunks.append(sse(gemini_event([{"text": "complete"}], "STOP")))
+                with patch.object(streaming.time, "monotonic", side_effect=clock):
+                    result = self.call(chunks, provider=provider, timeout=timeout, on_read=clock.on_read)
+                self.assertGreater(clock.now - clock.started, 600)
+                expected_text = "继续" * 16 + "complete" if channel == "text" else "complete"
+                expected_reasoning = "继续" * 16 if channel == "reasoning" else ""
+                if provider == "openai":
+                    message = result["choices"][0]["message"]
+                    self.assertEqual(message["content"], expected_text)
+                    self.assertEqual(message.get("reasoning_content", ""), expected_reasoning)
+                else:
+                    parts = result["candidates"][0]["content"]["parts"]
+                    self.assertEqual(parts[0]["text"], expected_text)
+                    self.assertEqual(parts[1]["text"] if len(parts) > 1 else "", expected_reasoning)
+                self.assertEqual("".join(item["textDelta"] for item in self.progress), expected_text)
+                self.assertEqual("".join(item["reasoningDelta"] for item in self.progress), expected_reasoning)
+
+    def test_reasoning_beyond_display_limit_still_renews_without_exposing_secrets(self):
+        """摘要达到显示上限后仍可能持续推理；续期必须早于截断与跨帧凭据脱敏。"""
+        secret = "private-test-key-5678"
+        for provider in ("openai", "gemini"):
+            with self.subTest(provider=provider):
+                clock = VirtualClock([45] * 18)
+                # 每帧小于 read1 的分段大小，确保模拟的是完整、有效的模型事件。
+                thoughts = ["a" * 1000] * 13 + ["private-test-", "key-5678", "仍在推理"]
+                if provider == "openai":
+                    chunks = [sse(openai_event({"reasoning_content": text})) for text in thoughts]
+                    chunks.append(sse(openai_event({"content": "complete"}, "stop")))
+                else:
+                    chunks = [sse(gemini_event([{"text": text, "thought": True}])) for text in thoughts]
+                    chunks.append(sse(gemini_event([{"text": "complete"}], "STOP")))
+                with patch.object(streaming.time, "monotonic", side_effect=clock):
+                    result = self.call(chunks, provider=provider, timeout=60, on_read=clock.on_read,
+                                       headers={"Authorization": "Bearer " + secret})
+                self.assertGreater(clock.now - clock.started, 600)
+                visible = "".join(item["reasoningDelta"] for item in self.progress)
+                self.assertEqual(visible, "a" * 12_000)
+                self.assertEqual("".join(item["textDelta"] for item in self.progress), "complete")
+                self.assertNotIn(secret, json.dumps(result))
+                self.assertNotIn("private-test-", json.dumps(self.progress))
+
+    def test_secret_prefix_buffering_does_not_prevent_activity_renewal(self):
+        """尚未显示的密钥前缀也属于实际收到的文本，等待脱敏不能引发误超时。"""
+        secret = "private-test-key-5678"
+        clock = VirtualClock([0.6] * 5)
+        chunks = [sse(openai_event({"reasoning": text}))
+                  for text in ("private-", "test-", "key-5678")]
+        chunks.append(sse(openai_event({"content": "answer"}, "stop")))
+        with patch.object(streaming.time, "monotonic", side_effect=clock):
+            result = self.call(chunks, timeout=1, on_read=clock.on_read,
+                               headers={"Authorization": "Bearer " + secret})
+        self.assertEqual(result["choices"][0]["message"]["reasoning_content"], "[已隐藏密钥]")
+        self.assertNotIn(secret, json.dumps(self.progress))
+        self.assertNotIn("private-", json.dumps(self.progress))
+
+    def test_metadata_empty_deltas_and_hidden_reasoning_do_not_renew(self):
+        """非正文元数据、空片段、隐藏内容及其他候选不能冒充可见的有效输出。"""
+        cases = [
+            ("openai", b":ping\n\n"),
+            ("openai", b"event: heartbeat\nid: 1\nretry: 1000\n\n"),
+            ("openai", sse({"choices": [], "usage": {"total_tokens": 10}})),
+            ("openai", sse(openai_event({"role": "assistant"}))),
+            ("openai", sse(openai_event({"content": "", "reasoning_content": ""}))),
+            ("openai", sse(openai_event({"reasoning_details": [{"type": "reasoning.encrypted", "data": "secret"}]}))),
+            ("openai", sse(openai_event({"content": "其他候选"}, index=1))),
+            ("gemini", sse({"usageMetadata": {"totalTokenCount": 10}})),
+            ("gemini", sse(gemini_event([{"text": ""}, {"thought": True, "text": ""}]))),
+            ("gemini", sse(gemini_event([{"thoughtSignature": "opaque-signature"}]))),
+        ]
+        for provider, frame in cases:
+            with self.subTest(provider=provider, frame=frame[:50]):
+                clock = VirtualClock([0.6, 0.6])
+                with patch.object(streaming.time, "monotonic", side_effect=clock):
+                    with self.assertRaisesRegex(streaming.StreamingTimeoutError, "等待首次输出超时"):
+                        self.call([frame, frame], provider=provider, timeout=1, on_read=clock.on_read)
+                self.assertEqual(self.progress, [])
+                self.assertTrue(self.response.closed)
+                self.opener.open.assert_called_once()
+
+    def test_incomplete_sse_event_does_not_extend_wait(self):
+        """即使字节持续到达，也必须等完整 SSE 事件解析出文本后才视作有效活动。"""
+        frame = sse(openai_event({"content": "未完成的事件"}))
+        clock = VirtualClock([0.4, 0.4, 0.4])
+        with patch.object(streaming.time, "monotonic", side_effect=clock):
+            with self.assertRaisesRegex(streaming.StreamingTimeoutError, "等待首次输出超时"):
+                self.call([frame[:20], frame[20:-2], frame[-2:]], timeout=1, on_read=clock.on_read)
+        self.assertEqual(self.progress, [])
+        self.assertTrue(self.response.closed)
+        self.opener.open.assert_called_once()
+
+    def test_stall_after_output_reports_idle_timeout_and_keeps_received_summary(self):
+        """已有摘要后的停顿应报告连续空闲时间，且不丢弃已交付的进度或自动重试。"""
+        clock = VirtualClock([0.6, 0.6, 0.6])
+        with patch.object(streaming.time, "monotonic", side_effect=clock):
+            with self.assertRaisesRegex(streaming.StreamingTimeoutError, "已连续 1 秒没有新的正文或思考摘要"):
+                self.call([sse(openai_event({"reasoning": "已收到的摘要"})), b":ping\n\n",
+                           sse(openai_event({"content": "late"}, "stop"))], timeout=1, on_read=clock.on_read)
+        self.assertEqual("".join(item["reasoningDelta"] for item in self.progress), "已收到的摘要")
+        self.assertEqual("".join(item["textDelta"] for item in self.progress), "")
+        self.assertTrue(self.response.closed)
+        self.opener.open.assert_called_once()
+
+    def test_thirty_minute_total_cap_is_not_extended_by_continuous_output(self):
+        """有效输出可延长空闲窗口，但固定总上限仍关闭连接，不能无限续期或重试。"""
+        clock = VirtualClock([100] * 18)
+        frames = [sse(openai_event({"reasoning": "继续"})) for _ in range(18)]
+        with patch.object(streaming.time, "monotonic", side_effect=clock):
+            with self.assertRaisesRegex(streaming.StreamingTimeoutError, "30 分钟总上限"):
+                self.call(frames, timeout=180, on_read=clock.on_read)
+        self.assertEqual(clock.now - clock.started, 1800)
+        self.assertEqual("".join(item["reasoningDelta"] for item in self.progress), "继续" * 17)
+        self.assertTrue(self.response.closed)
+        self.opener.open.assert_called_once()
+
+    def test_socket_timeout_reports_first_output_or_idle_stage_without_network_details(self):
+        """底层 read1 的超时也映射为固定中文，不显示 URL、凭据或异常原文。"""
+        for after_output in (False, True):
+            with self.subTest(after_output=after_output):
+                reads = [0]
+
+                def timeout_on_read():
+                    reads[0] += 1
+                    if not after_output or reads[0] > 1:
+                        raise TimeoutError("https://mock.invalid/private?api_key=fake-secret-token")
+
+                expected = "已连续" if after_output else "等待首次输出超时"
+                with self.assertRaisesRegex(streaming.StreamingTimeoutError, expected) as raised:
+                    self.call([sse(openai_event({"reasoning": "摘要"}))], on_read=timeout_on_read)
+                self.assertNotIn("fake-secret-token", str(raised.exception))
+                self.assertNotIn("mock.invalid", str(raised.exception))
+                self.assertTrue(self.response.closed)
+                self.opener.open.assert_called_once()
+
+    def test_connection_timeouts_include_safe_stage_and_do_not_retry(self):
+        """urllib 可直接抛出或包装 socket 超时；两种路径均说明连接阶段且只发送一次。"""
+        for failure in (TimeoutError("fake-secret-token"), error.URLError(TimeoutError("fake-secret-token"))):
+            with self.subTest(failure=type(failure).__name__):
+                opener = Mock()
+                opener.open.side_effect = failure
+                with patch.object(streaming.request, "build_opener", return_value=opener):
+                    with self.assertRaisesRegex(streaming.StreamingTimeoutError, "建立连接或返回响应头超时") as raised:
+                        streaming.send_stream_json("https://mock.invalid", {}, {}, 60, "openai", None)
+                self.assertNotIn("fake-secret-token", str(raised.exception))
+                self.assertIn("60 秒", str(raised.exception))
+                opener.open.assert_called_once()
+
+    def test_late_headers_close_response_and_report_connection_stage(self):
+        """多阶段建连迟到但未抛 socket 超时时，仍关闭响应并说明连接阶段。"""
+        clock = VirtualClock([])
+        response = FakeResponse([sse(openai_event({"content": "late"}, "stop"))])
+        opener = Mock()
+
+        def late_response(*_args, **_kwargs):
+            clock.now += 61
+            return response
+
+        opener.open.side_effect = late_response
+        with patch.object(streaming.time, "monotonic", side_effect=clock), \
+             patch.object(streaming.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(streaming.StreamingTimeoutError, "建立连接或返回响应头超时"):
+                streaming.send_stream_json("https://mock.invalid", {}, {}, 60, "openai", None)
+        self.assertTrue(response.closed)
+        opener.open.assert_called_once()
 
     def test_truncated_stream_and_wrong_content_type_do_not_fallback(self):
         cases = [([sse(openai_event({"content": "partial"})), sse("[DONE]")], "text/event-stream"),

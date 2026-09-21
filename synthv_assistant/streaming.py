@@ -11,7 +11,7 @@ import json
 import math
 import time
 from typing import Callable
-from urllib import request
+from urllib import error, request
 from urllib.parse import urlsplit
 
 from .review import MAX_REQUEST_BYTES, _NoRedirect
@@ -20,42 +20,86 @@ from .review import MAX_REQUEST_BYTES, _NoRedirect
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_REASONING_CHARACTERS = 12_000
 READ_SIZE = 4096
+# 空闲计时可随有效输出续期；另设较长、独立的总上限，防止异常服务永久占用任务。
+MAX_STREAM_SECONDS = 30 * 60
 ProgressCallback = Callable[[dict[str, str]], None]
-__all__ = ["StreamingError", "send_stream_json"]
+__all__ = ["StreamingError", "StreamingTimeoutError", "send_stream_json"]
 
 
 class StreamingError(ValueError):
     """可安全展示的固定中文流式错误，不携带供应商响应、认证头或完整 URL。"""
 
 
-def _remaining(deadline: float) -> float:
-    """使用单调时钟约束整次请求，而非每收到一段就重新开始计时。"""
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError("AI 流式请求已超过总时限。")
-    return remaining
+class StreamingTimeoutError(TimeoutError):
+    """只包含本地计时阶段与固定提示，不附带网络异常或供应商返回的原文。"""
 
 
-def _read_chunk(response, deadline: float, size: int) -> bytes:
-    """优先 read1 及时返回已收到的字节，并将剩余总预算设置为 socket 超时。
+class _StreamDeadline:
+    """分别约束首次输出、后续输出空闲时间以及整次请求的最长生命周期。
+
+    平台 timeoutSeconds 是等待有效输出的窗口，不是整个推理过程的长度。
+    只有已解析、类型正确的正文/可见思考摘要续期；SSE 心跳、空事件和半截
+    数据不会让服务永久占用连接。续期发生在显示截断和密钥脱敏之前，避免
+    摘要达到显示上限或暂存凭据前缀时，将仍然活跃的模型误判为超时。
+    """
+
+    def __init__(self, idle_seconds: float):
+        self.idle_seconds = idle_seconds
+        started = time.monotonic()
+        self.idle_deadline = started + idle_seconds
+        self.total_deadline = started + MAX_STREAM_SECONDS
+        self.received_output = False
+
+    def timeout_error(self, *, connecting: bool = False) -> StreamingTimeoutError:
+        """对底层 socket 超时也使用同一阶段判定，并优先说明已触达的总上限。"""
+        if time.monotonic() >= self.total_deadline:
+            message = f"AI 流式请求达到 {MAX_STREAM_SECONDS / 60:g} 分钟总上限，已停止等待。"
+        elif connecting:
+            message = f"等待 AI 服务建立连接或返回响应头超时（{self.idle_seconds:g} 秒）。"
+        elif self.received_output:
+            message = f"AI 已连续 {self.idle_seconds:g} 秒没有新的正文或思考摘要，等待超时。"
+        else:
+            message = f"AI 在 {self.idle_seconds:g} 秒内未返回正文或思考摘要，等待首次输出超时。"
+        return StreamingTimeoutError(message + "本次未自动重试，也未修改工程。")
+
+    def remaining(self, *, connecting: bool = False) -> float:
+        """每次阻塞读取前后核对单调时钟，迟到的数据不能复活已过期请求。"""
+        remaining = min(self.idle_deadline, self.total_deadline) - time.monotonic()
+        if remaining <= 0:
+            raise self.timeout_error(connecting=connecting)
+        return remaining
+
+    def activity(self):
+        """仅由协议解析后的有效文本调用；总上限从不随内容续期。"""
+        self.remaining()
+        self.received_output = True
+        self.idle_deadline = time.monotonic() + self.idle_seconds
+
+
+def _read_chunk(response, deadline: _StreamDeadline, size: int) -> bytes:
+    """优先 read1 及时返回数据，socket 等待不得超过空闲与总预算的较小值。
 
     urllib 的正常 HTTPS 响应在 fp.raw._sock 保存底层 socket；已读到 EOF 时
-    fp 可为空。外部注入的文件型响应没有 socket 时仍在读取前后检查总预算。
+    fp 可为空。外部注入的文件型响应没有 socket 时仍在读取前后检查预算。
     """
-    remaining = _remaining(deadline)
+    remaining = deadline.remaining()
     raw = getattr(getattr(response, "fp", None), "raw", None)
     connection = getattr(raw, "_sock", None)
     if connection is not None:
         connection.settimeout(remaining)
     reader = getattr(response, "read1", None) or response.read
-    data = reader(size)
-    _remaining(deadline)
+    try:
+        data = reader(size)
+    except TimeoutError:
+        # 不继续读取已超时的缓冲流，也不重新发送可能已计费的模型请求。
+        raise deadline.timeout_error() from None
+    deadline.remaining()
     if not isinstance(data, bytes):
         raise StreamingError("AI 流式响应不是有效的字节数据。")
     return data
 
 
-def _sse_events(response, deadline: float):
+def _sse_events(response, deadline: _StreamDeadline):
     """增量解码 UTF-8 和 SSE，支持跨网络分段的汉字、CRLF 与多行 data。
 
     上限统计原始字节，包含注释和心跳，避免服务持续发送无用数据绕过限制。
@@ -173,8 +217,9 @@ class _TextChannel:
 class _Progress:
     """正文与思考分通道累计；思考达到上限后继续读取正文，不猜测省略部分。"""
 
-    def __init__(self, headers: dict, callback: ProgressCallback | None):
+    def __init__(self, headers: dict, callback: ProgressCallback | None, deadline: _StreamDeadline):
         self.callback = callback
+        self.deadline = deadline
         self.reasoning_length = 0
         secrets = _secrets(headers)
         self.text = _TextChannel(secrets, lambda text: self._emit("textDelta", text))
@@ -192,10 +237,14 @@ class _Progress:
         if text is not None:
             if not isinstance(text, str):
                 raise StreamingError("AI 流式正文格式无效。")
+            if text:
+                self.deadline.activity()
             self.text.append(text)
         if reasoning is not None:
             if not isinstance(reasoning, str):
                 raise StreamingError("AI 思考摘要格式无效。")
+            if reasoning:
+                self.deadline.activity()
             accepted = reasoning[:max(0, MAX_REASONING_CHARACTERS - self.reasoning_length)]
             self.reasoning_length += len(accepted)
             self.reasoning.append(accepted)
@@ -396,6 +445,7 @@ def send_stream_json(url: str, body: dict, headers: dict, timeout: float, provid
 
     Gemini 的 streamGenerateContent URL 和 includeThoughts 由调用层按配置构造。
     本模块只为 OpenAI 请求增加 stream:true，不改变调用者持有的请求对象。
+    timeout 约束首次有效输出及相邻有效输出间隔；持续输出可跨越该时间窗口。
     """
     if provider not in {"openai", "gemini"} or not isinstance(body, dict) or not isinstance(headers, dict):
         raise StreamingError("AI 流式请求配置无效。")
@@ -410,13 +460,25 @@ def send_stream_json(url: str, body: dict, headers: dict, timeout: float, provid
         raise StreamingError("完整模型请求超过本地大小限制。")
     outbound = request.Request(url, data=encoded, headers={"Content-Type": "application/json", "Accept": "text/event-stream", **headers}, method="POST")
     opener = request.build_opener(_NoRedirect())
-    deadline = time.monotonic() + timeout
-    progress = _Progress(headers, on_progress)
-    with opener.open(outbound, timeout=_remaining(deadline)) as response:
+    deadline = _StreamDeadline(timeout)
+    progress = _Progress(headers, on_progress, deadline)
+    try:
+        response = opener.open(outbound, timeout=deadline.remaining())
+    except TimeoutError:
+        raise deadline.timeout_error(connecting=True) from None
+    except error.URLError as exc:
+        # urllib 会将建立连接阶段的 socket 超时包装在 URLError.reason 中。
+        if isinstance(exc.reason, TimeoutError):
+            raise deadline.timeout_error(connecting=True) from None
+        raise
+    with response:
+        # DNS、代理或多阶段连接可能令 open 总耗时超过单次 socket 等待。
+        # 在响应上下文内补查，既报告正确阶段，也保证迟到的响应被关闭。
+        deadline.remaining(connecting=True)
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type and content_type != "text/event-stream":
             raise StreamingError("AI 服务未返回 SSE 流式响应，本次未自动回退或重试。")
         events = _sse_events(response, deadline)
         result = _openai(events, progress) if provider == "openai" else _gemini(events, progress)
-        _remaining(deadline)
+        deadline.remaining()
         return result

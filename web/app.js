@@ -687,11 +687,15 @@
     }
   }
 
-  /** 轮询后台长任务，明确区分运行、成功、失败；不把提交成功当作录音已完成。 */
+  /**
+   * 轮询同一个后台任务，由服务端的成功或失败状态结束等待。
+   * 模型可能持续输出超过十分钟，浏览器不能再用固定总时限把活跃任务判成失败。
+   * 服务端负责无输出超时和流式请求总上限；单次本地 HTTP 请求仍受 api() 保护。
+   * 连接中断或状态异常直接报错，不重发创建任务的请求，避免重复计费或重复录音。
+   */
   async function waitForJob(jobId, onProgress) {
     if (!jobId) throw new Error("服务未返回任务编号，无法确认操作结果。");
-    const started = Date.now();
-    while (Date.now() - started < 10 * 60 * 1000) {
+    while (true) {
       const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
       if (job.state === "done") return job.result;
       if (job.state === "error") throw new Error(errorMessage(job.error));
@@ -699,7 +703,6 @@
       if (onProgress) onProgress(job);
       await new Promise((resolve) => setTimeout(resolve, 850));
     }
-    throw new Error("任务仍未返回结果。请检查本地服务，确认完成状态后再继续。");
   }
 
   async function record(slot) {
