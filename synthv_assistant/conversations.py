@@ -17,7 +17,8 @@ import re
 import uuid
 
 from .config import DATA
-from .operations import OperationBusyError, OperationLock
+from .bridge import BridgeError
+from .operations import BUSY_MESSAGE, OperationBusyError, OperationLock
 from .metadata import LibraryMetadata, MetadataError
 from .model_options import normalize_model_options, validate_for_config
 from .parameters import ParameterError, public_parameter_catalog, public_preview, validate_action
@@ -546,6 +547,20 @@ class ConversationManager:
                     preview = public_preview(preview)
                 except ConversationError:
                     raise
+                except BridgeError as error:
+                    # 宿主拒绝可能与边界、已有音高或插值能力有关，不能一律误报
+                    # 为桥接/选区故障。只公开桥接白名单常量，保留未知异常的隐私边界。
+                    message = error.public_message
+                    if message is None:
+                        message = "无法生成宿主预览，尚未修改工程；请检查桥接和当前选区。"
+                    else:
+                        message = "未生成预览，尚未修改工程：" + message
+                    raise ConversationError(message) from None
+                except ParameterError as error:
+                    # 参数契约异常只含本地固定中文提示，不含宿主返回的任意字符串。
+                    raise ConversationError("未生成预览，尚未修改工程：" + str(error)) from None
+                except OperationBusyError:
+                    raise ConversationError(BUSY_MESSAGE) from None
                 except Exception:
                     raise ConversationError("无法生成宿主预览，尚未修改工程；请检查桥接和当前选区。") from None
                 action["preview"] = preview

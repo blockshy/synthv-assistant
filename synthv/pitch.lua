@@ -399,14 +399,25 @@ function M.preview(args, ctx)
       end
       kept[#kept+1]=entry
     else
-      if #row.points<2 then fail("现有原生音高曲线不足两个点，无法确认安全范围。") end
-      local first,last=math.huge,-math.huge
-      for _,point in ipairs(row.points) do
-        first=math.min(first,row.position+point[1]); last=math.max(last,row.position+point[1])
+      -- SynthV 的绘制工具允许留下单节点甚至空的连续曲线；它们不等同于
+      -- PitchControlPoint 引导点，不能套用新建候选至少两个节点的输入约束。
+      -- 空曲线没有可替换的时间范围，因此保留完整克隆及脚本元数据。
+      if #row.points==0 then kept[#kept+1]=entry
+      else
+        local first,last=math.huge,-math.huge
+        for _,point in ipairs(row.points) do
+          -- 内部节点可以使用负偏移；实际覆盖位置由锚点和节点偏移相加得到，
+          -- 不能只看曲线锚点。单节点自然形成首尾相同的零长度范围。
+          local position=row.position+point[1]
+          if not finite(position) or math.abs(position)>MAX_SAFE then
+            fail("现有原生音高曲线的实际时间位置无效，已拒绝预览。")
+          end
+          first=math.min(first,position); last=math.max(last,position)
+        end
+        if last<ctx.begin or first>ctx.finish then kept[#kept+1]=entry
+        elseif first>=ctx.begin and last<=ctx.finish then replaced=replaced+1
+        else fail("已有原生音高曲线跨越选区边界，已拒绝预览；请扩大选区或手动处理。") end
       end
-      if last<ctx.begin or first>ctx.finish then kept[#kept+1]=entry
-      elseif first>=ctx.begin and last<=ctx.finish then replaced=replaced+1
-      else fail("已有原生音高曲线跨越选区边界，已拒绝预览；请扩大选区或手动处理。") end
     end
   end
   local points,previous={},nil

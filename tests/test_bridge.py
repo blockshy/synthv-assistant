@@ -44,6 +44,30 @@ class BridgeTests(unittest.TestCase):
                 self.client.call("apply", {"previewId": "old-preview"})
         self.assertFalse((self.directory / "client.lock").exists())
 
+    def test_preview_rejection_exposes_only_a_fixed_public_message(self):
+        """旧协议的 Lua 位置前缀留在本地，公开提示只取自代码白名单。"""
+        message = "已有原生音高曲线跨越选区边界，已拒绝预览；请扩大选区或手动处理。"
+        for raw in (message, "C:/private-project/bridge.lua:409: " + message):
+            with self.subTest(raw=raw), self.respond({"ok": False, "error": raw}):
+                with self.assertRaises(BridgeError) as raised:
+                    self.client.call("preview", {"parameter": "pitchCurve"})
+                self.assertEqual(str(raised.exception), raw)
+                self.assertEqual(raised.exception.public_message, message)
+
+    def test_public_preview_error_compatibility_never_exposes_arbitrary_response(self):
+        """动态宿主异常、尾随秘密和伪造 publicMessage 字段均不能公开。"""
+        message = "候选曲线会影响选区以外的插值，已拒绝预览；请扩大选区或手动调整边界。"
+        suffix = " 未写入；可缩短选区或选择控制点模式。"
+        self.assertEqual(BridgeError("private.lua:485: private.lua:304: " + message + suffix).public_message,
+                         message)
+        for raw in ("private-api-key", message + " private-api-key", {"secret": "private-api-key"},
+                    "x" * 16_385 + message):
+            with self.subTest(raw_type=type(raw).__name__), self.respond({
+                    "ok": False, "error": raw, "publicMessage": "private-api-key"}):
+                with self.assertRaises(BridgeError) as raised:
+                    self.client.call("preview")
+                self.assertIsNone(raised.exception.public_message)
+
     def test_existing_client_lock_blocks_second_client_without_removing_lock(self):
         lock = self.directory / "client.lock"
         lock.write_text("another-client", encoding="utf-8")

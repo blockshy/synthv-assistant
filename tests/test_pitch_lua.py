@@ -297,6 +297,54 @@ class NativePitchLuaTests(unittest.TestCase):
                 self.lua.globals().host.addFixture("curve", position, 60, self.lua.table_from(points, recursive=True))
                 self.rejects_preview("跨越选区边界")
 
+    def test_single_node_curve_uses_actual_position_and_round_trips(self):
+        """宿主允许绘制后只剩一个节点；覆盖选区内节点，完整保留区外对象。"""
+        for position, relative, replaced in [
+            (1500, -100, 1), (2500, -1000, 1), (500, 1000, 1),
+            (1500, -500, 1), (1500, 500, 1),
+            (1500, -501, 0), (1500, 501, 0),
+        ]:
+            with self.subTest(position=position, relative=relative):
+                self.host.controls = self.lua.table()
+                self.host.mutations = 0
+                self.host.addFixture("curve", position, 60,
+                                     self.lua.table_from([[relative, 0]], recursive=True),
+                                     self.lua.table_from({"owner": "single-node-fixture"}))
+                original = self.native.snapshot(self.group)
+                proposal = self.preview()
+                self.assertEqual(proposal["public"]["replacedControlCount"], replaced)
+                self.assertEqual(proposal["after"]["pointCount"], 4 - replaced)
+                self.assertEqual(self.host.mutations, 0)
+                self.assertTrue(self.native.same(self.group, original))
+                # 写入和恢复只发生在隔离替身中，核验单节点的偏移与元数据不丢失。
+                self.native.write(self.group, proposal["after"])
+                if not replaced:
+                    kept = [item for item in self.host.controls.values()
+                            if item["metadata"]["owner"] == "single-node-fixture"]
+                    self.assertEqual(len(kept), 1)
+                    self.assertEqual(kept[0]["points"][1][1], relative)
+                self.native.write(self.group, proposal["before"])
+                self.assertTrue(self.native.same(self.group, original))
+
+    def test_empty_curve_is_preserved_with_metadata(self):
+        """空连续曲线没有有效覆盖区间，不能阻挡预览，也不能擅自清理。"""
+        self.lua.execute('host.addFixture("curve",1500,60,{},{owner="empty-fixture"})')
+        original = self.native.snapshot(self.group)
+        proposal = self.preview()
+        self.assertEqual(proposal["public"]["replacedControlCount"], 0)
+        self.assertEqual(len(proposal["after"]["controls"]), 2)
+        self.assertEqual(self.host.mutations, 0)
+        self.native.write(self.group, proposal["after"])
+        self.assertEqual(self.host.controls[2]["metadata"]["owner"], "empty-fixture")
+        self.assertEqual(len(self.host.controls[2]["points"]), 0)
+        self.native.write(self.group, proposal["before"])
+        self.assertTrue(self.native.same(self.group, original))
+
+    def test_existing_curve_time_sum_must_remain_safe(self):
+        """锚点和偏移各自合法时，相加溢出安全整数范围仍须拒绝。"""
+        self.lua.execute('host.addFixture("curve",9007199254740991,60,{{1000,0}},{})')
+        self.rejects_preview("实际时间位置无效")
+
     def test_existing_native_guidance_point_inside_is_conservatively_rejected(self):
         self.lua.execute('host.addFixture("point",1500,60,nil,{keep=true})')
         self.rejects_preview("移除它可能影响邻近音高")

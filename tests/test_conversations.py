@@ -15,7 +15,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from synthv_assistant.conversations import ConversationError, ConversationManager, MAX_FILE_BYTES
-from synthv_assistant.operations import OperationLock
+from synthv_assistant.bridge import BridgeError
+from synthv_assistant.operations import BUSY_MESSAGE, OperationBusyError, OperationLock
+from synthv_assistant.parameters import ParameterError
 from synthv_assistant.planner import PlannerError
 from tests.test_parameters import modern_selection
 
@@ -137,6 +139,49 @@ class ConversationTests(unittest.TestCase):
         saved = self.read_saved()["messages"][-1]["actions"][0]
         self.assertEqual(saved["status"], "proposed")
         self.assertNotIn("preview", saved)
+
+    def test_host_preview_rejection_reports_safe_cause_without_enabling_confirmation(self):
+        """原生音高拒绝说明必须显示真实限制，而不是误报为选区或连接异常。"""
+        action = self.proposed()
+        message = "现有原生音高曲线不足两个点，无法确认安全范围。"
+        self.service.preview.side_effect = BridgeError("C:/private-song/bridge.lua:402: " + message)
+        with self.assertRaises(ConversationError) as raised:
+            self.manager.preview_action(action["id"])
+        self.assertIn(message, str(raised.exception))
+        self.assertIn("尚未修改工程", str(raised.exception))
+        self.assertNotIn("private-song", str(raised.exception))
+        saved = self.read_saved()["messages"][-1]["actions"][0]
+        self.assertEqual(saved["status"], "proposed")
+        self.assertNotIn("preview", saved)
+        self.service.edit.assert_not_called()
+        self.service.write_mode.assert_not_called()
+
+    def test_unknown_preview_failure_remains_private_and_clears_old_confirmation(self):
+        """重试预览失败后旧确认入口也失效，未知异常和敏感原文不能进入会话。"""
+        action = self.proposed()
+        self.manager.preview_action(action["id"])
+        for error in (BridgeError("private-path private-api-key"), RuntimeError("private-api-key")):
+            self.service.preview.side_effect = error
+            with self.subTest(error=type(error).__name__), self.assertRaises(ConversationError) as raised:
+                self.manager.preview_action(action["id"])
+            self.assertIn("无法生成宿主预览", str(raised.exception))
+            self.assertNotIn("private", str(raised.exception))
+            saved = self.read_saved()["messages"][-1]["actions"][0]
+            self.assertEqual(saved["status"], "proposed")
+            self.assertNotIn("preview", saved)
+        self.service.edit.assert_not_called()
+
+    def test_preview_validation_and_operation_busy_keep_actionable_fixed_messages(self):
+        """本地契约错误和锁竞争不应再被泛化成桥接连接失败。"""
+        action = self.proposed()
+        for error, expected in ((ParameterError("宿主预览的控制点无效。"), "宿主预览的控制点无效。"),
+                                (OperationBusyError("private-key"), BUSY_MESSAGE)):
+            self.service.preview.side_effect = error
+            with self.subTest(error=type(error).__name__), self.assertRaises(ConversationError) as raised:
+                self.manager.preview_action(action["id"])
+            self.assertIn(expected, str(raised.exception))
+            self.assertNotIn("private-key", str(raised.exception))
+        self.service.edit.assert_not_called()
 
     def test_second_validation_rejects_mocked_duplicate_or_unknown_curve_fields(self):
         self.selection.update(modern_selection())
