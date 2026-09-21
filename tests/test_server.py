@@ -56,6 +56,27 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(status, 403)
         self.service.status.assert_not_called()
 
+    def test_cached_catalog_and_drawing_preference_routes_require_token(self):
+        """目录只读端点不能误走联网刷新；绘制偏好作为独立字段进入会话任务。"""
+        self.service.cached_platform_models.return_value = {"models": [], "cacheHit": False}
+        self.service.update_conversation_render_mode.return_value = {"renderMode": "points"}
+        route = "/api/conversations/" + "a" * 32
+        for method, path, body in (("GET", "/api/model-platforms/default/models", {}),
+                                   ("POST", route + "/render-mode", {"renderMode": "points"})):
+            self.assertEqual(self.request(method, path, body=body)[0], 403)
+            self.assertEqual(self.request(method, path, body=body, headers={"X-SV-Token": "test-token"})[0], 200)
+        self.service.list_platform_models.assert_not_called()
+        self.service.cached_platform_models.assert_called_once_with("default")
+        self.service.submit.return_value = "job"
+        self.request("POST", route + "/messages", headers={"X-SV-Token": "test-token"},
+                     body={"text": "规划", "renderMode": "points"})
+        self.assertEqual(self.service.submit.call_args.args[-2:], (None, "points"))
+        self.service.submit.reset_mock()
+        for invalid in (None, True, "other"):
+            self.assertEqual(self.request("POST", route + "/messages", headers={"X-SV-Token": "test-token"},
+                body={"text": "规划", "renderMode": invalid})[0], 400)
+        self.service.submit.assert_not_called()
+
     def test_mutating_request_requires_current_token(self):
         for headers in ({}, {"X-SV-Token": "old-token"}):
             with self.subTest(headers=headers):

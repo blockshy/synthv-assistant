@@ -16,7 +16,8 @@ from urllib import error
 from .review import _load_audio, _send_json
 from .settings import get_audio_configuration_snapshot
 from .model_options import normalize_model_options, validate_for_config, apply_reasoning
-from .parameters import PARAMETER_LIMITS, ParameterError, supports_curves, validate_action
+from .parameters import PARAMETER_LIMITS, ParameterError, supports_curves, validate_action, normalize_render_mode
+from .pitch_shapes import compile_pitch_shape, validate_note_alignment
 
 
 MAX_RESPONSE_CHARACTERS = 24_000
@@ -24,6 +25,7 @@ SYSTEM_INSTRUCTION = """你是 Synthesizer V 调教咨询与参数计划助手�
 你的输出必须只有一个严格 JSON 对象，顶层恰好含 text 和 actions：
 {"text":"中文解释、依据及局限","actions":[{"parameter":"tension","delta":-0.1,"reason":"中文调整原因"}]}
 actions 可为空，最多五项，参数不重复。每项只含 parameter、reason，以及 delta 或 curve 二选一；
+原生 pitchCurve 还可使用下述 pitchShape 代替 curve，这三个字段互斥。
 可选 renderMode 只能为 smooth 或 points，默认 smooth，优先使用精简平滑表示。
 旧桥接只支持 breathiness/tension/gender 的单次增量绝对值不超过 0.3、loudness 6 dB、
 pitchDelta 100 cents。delta 必须是有限非零 JSON 数字，不能是字符串或布尔值。
@@ -40,6 +42,15 @@ pitchCurve 与 pitchDelta 不同：仅当 capabilities.nativePitch=true 且本�
 pitchCurve.kind=pitch、available=true 时可用；value 是工程绝对 MIDI 半音 0..127，
 还须落在本次全部音符 pitch 加 groupPitchOffset 后的最低至最高音上下各 2 半音范围内。
 只支持 curve 和 renderMode=smooth，不支持 delta 或 points。不要把 cents 当 MIDI；
+原生音高优先使用 pitchShape：{"curve":[[0,-12],[0.15,6],[0.35,0],[0.8,0],[1,-8]],"transitionMs":40}。
+pitchShape.curve 是每个音符重复采用的相对 cents 包络，2至8点，位置严格递增且首尾0/1，
+偏移限制在-50至50 cents，transitionMs可省略、默认40，范围5至120毫秒。
+本地依据每个音符的真实秒坐标和组移调生成音高，再叠加包络，保持短音符、跳音和旋律。
+不是整句相对第一音符，也不是把整句拉成一条直线。最终原生曲线最多64点，
+音符较多时减少包络点或建议缩小选区，不能省略音符。没有时值资料或音符重叠时不使用它。
+直接提供绝对 curve 时，每个音符主体25/50/75%处必须距离其乐谱音高不超过75 cents，
+不能跨越短音符忽略它的音高。这些规则用于保持旋律，不能用音高曲线代替音符改谱。
+会话选择控制点模式时不能使用 pitchCurve/pitchShape，音高调整使用 pitchDelta。
 这会按绝对 MIDI 音高覆盖当前连续选区；已有跨界曲线、区内引导点或非零 pitchDelta 时
 宿主会拒绝预览，不会自动覆盖冲突资料。应保守使用并在预览中说明限制。
 声库模式目录只包含宿主 getVoice 实际返回的当前组/轨道模式，可能不完整；未列出的模式不可猜测。
@@ -182,7 +193,7 @@ def _unsupported_claim(value: str, has_audio: bool, has_curves: bool = False) ->
 
 
 def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
-                selection: dict | None = None) -> dict:
+                selection: dict | None = None, render_mode="smooth") -> dict:
     """只接受完整 JSON 或完整外层 json 围栏，不从散文、工具调用中猜测计划。"""
     if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_RESPONSE_CHARACTERS:
         raise PlannerError("模型没有返回有效的调教计划，请调整需求后重试。")
@@ -213,7 +224,22 @@ def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
     checked, seen = [], set()
     for action in actions:
         try:
+            # 模型只能提供有界音乐描述；相对包络在本机展开后，继续复用既有
+            # absolute-MIDI 契约、宿主快照和人工确认，不增加任何执行权限。
+            if isinstance(action, dict) and "pitchShape" in action:
+                if (set(action) - {"parameter", "reason", "renderMode", "pitchShape"}
+                        or action.get("parameter") != "pitchCurve" or render_mode != "smooth"):
+                    raise ParameterError("相对音符包络仅适用于绘制模式的原生音高，不能与其它曲线或增量混用。")
+                action = {**action, "curve": compile_pitch_shape(action["pitchShape"], selection)}
+                del action["pitchShape"]
+            if isinstance(action, dict):
+                # 先验证模型字段本身，不能用覆盖偏好掩盖非法 renderMode 值。
+                if "renderMode" in action:
+                    normalize_render_mode(action["renderMode"])
+                action = {**action, "renderMode": render_mode}
             normalized = validate_action(action, selection, reason_limit=1000)
+            if normalized["parameter"] == "pitchCurve":
+                validate_note_alignment(normalized["curve"], selection)
         except ParameterError as exc:
             raise PlannerError(str(exc)) from None
         parameter, reason = normalized["parameter"], normalized["reason"]
@@ -263,13 +289,16 @@ def _gemini_text(response: dict) -> str:
 
 
 def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[Path], audio_context: list[dict],
-                model_options=None, on_progress=None) -> dict:
+                model_options=None, on_progress=None, render_mode="smooth") -> dict:
     """生成文本咨询或音频辅助调教计划；不预览、不写参数、不调用宿主。
 
     路径白名单及选区去敏由调用层负责。此函数每次只读取一次设置快照；保存新
     设置不会更换正在运行请求的地址或凭据。网络调用仅一次，任何失败不自动重试。
     """
     try:
+        mode = normalize_render_mode(render_mode)
+        system_instruction = SYSTEM_INSTRUCTION + ("\n本次会话绘制模式为 points（控制点模式）。所有动作采用 points，音高只能采用 pitchDelta。"
+            if mode == "points" else "\n本次会话绘制模式为 smooth（绘制模式）。所有动作采用 smooth，原生音高优先按音符包络生成。")
         options = normalize_model_options(model_options)
         if model_options is None:
             # 旧 MCP/直接调用继续采用默认设置，不在读取时迁移凭据文件。
@@ -340,7 +369,7 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
         files = _load_audio(audio_paths) if audio_paths else []
         if config["provider"] == "openai":
             body = {"model": config["model"], "messages": [
-                {"role": "system", "content": SYSTEM_INSTRUCTION}, {"role": "user", "content": prompt}]}
+                {"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]}
             if files:
                 parts = [{"type": "text", "text": prompt}]
                 for index, data in enumerate(files):
@@ -358,14 +387,14 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
             for index, data in enumerate(files):
                 parts.extend([{"text": "音频 " + ("A" if index == 0 else "B")},
                               {"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(data).decode("ascii")}}])
-            body = {"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+            body = {"systemInstruction": {"parts": [{"text": system_instruction}]},
                     "contents": [{"role": "user", "parts": parts}], "generationConfig": {"maxOutputTokens": 4096}}
             response = send(config["base"] + "/models/" + config["model"] + ":generateContent", body,
                             {"x-goog-api-key": config["key"]})
             raw = _gemini_text(response)
         report("正在校验调教建议")
         plan = _parse_plan(raw, has_selection=_has_selection(selection), has_audio=bool(files), key=config["key"],
-                           selection=selection)
+                           selection=selection, render_mode=mode)
         return {**plan, "provider": config["provider"], "model": config["model"], "inputMode": "audio" if files else "text",
                 "platformId": options["platformId"], "reasoningEffort": options["reasoningEffort"],
                 "reasoningSummary": safe_reasoning()}

@@ -21,7 +21,7 @@ from .capture import CaptureError, find_capture_executable, prepare_capture
 from .config import DATA, RECORDINGS, ensure_directories
 from .operations import exclusive_operation, operation_busy
 from .metadata import LibraryMetadata, validate_identity
-from .parameters import LEGACY_PARAMETERS, finite, public_preview, validate_change
+from .parameters import LEGACY_PARAMETERS, finite, public_preview, validate_change, selection_preview_notes
 
 
 def finite_number(value, name: str, low: float, high: float) -> float:
@@ -87,6 +87,10 @@ class AssistantService:
     def update_conversation_model_options(self, identifier, payload):
         return self.conversations().update_model_options(identifier, payload)
 
+    def update_conversation_render_mode(self, identifier, payload):
+        """只保存本会话的绘制偏好，不修改已有动作或宿主参数。"""
+        return self.conversations().update_render_mode(identifier, payload)
+
     def list_model_platforms(self):
         from .platforms import list_model_platforms
         return list_model_platforms()
@@ -107,6 +111,11 @@ class AssistantService:
     def list_platform_models(self, identifier):
         from .model_catalog import list_platform_models
         return list_platform_models(identifier)
+
+    def cached_platform_models(self, identifier):
+        """平台切换只读本机目录缓存；显式刷新才访问模型供应商。"""
+        from .model_catalog import get_cached_platform_models
+        return get_cached_platform_models(identifier)
 
     def model_capabilities(self, payload):
         """能力查询只读取脱敏平台信息；选择框刷新不产生外部请求。"""
@@ -162,10 +171,12 @@ class AssistantService:
         from .assets import restore_asset
         return restore_asset(kind, identifier)
 
-    def send_message(self, identifier, text, include_selection, attachments, model_options=None, on_progress=None):
+    def send_message(self, identifier, text, include_selection, attachments, model_options=None, render_mode=None, on_progress=None):
         """只生成待预览建议；发送自然语言不能直接写入 SynthV 工程。"""
+        # 未提供模式的旧 MCP 调用保留原签名，实际默认值仍由会话持久层决定。
+        extra = {"render_mode": render_mode} if render_mode is not None else {}
         return self.conversations().send_message(identifier, text, include_selection, attachments,
-                                                 model_options=model_options, on_progress=on_progress)
+                                                 model_options=model_options, on_progress=on_progress, **extra)
 
     def preview_action(self, identifier):
         return self.conversations().preview_action(identifier)
@@ -313,7 +324,10 @@ class AssistantService:
             if curve is not None or render_mode != "smooth" or parameter not in LEGACY_PARAMETERS:
                 selection = self.get_selection()
             args = validate_change(parameter, delta, curve=curve, render_mode=render_mode, selection=selection)
-            return public_preview(self.bridge.call("preview", args))
+            preview = self.bridge.call("preview", args)
+            if selection is not None:
+                preview = {**preview, "notes": selection_preview_notes(selection)}
+            return public_preview(preview)
 
     @exclusive_operation(lambda _service: DATA / "operation.lock")
     def edit(self, action: str, args: dict | None = None) -> dict:

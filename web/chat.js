@@ -15,7 +15,7 @@
     conversationRequest: 0, conversationListRequest: 0, actionBusy: "", activePreview: "", actionErrors: new Map(),
     attachments: [], assets: [], libraryDraft: new Set(), libraryLoading: false,
     uploading: false, libraryOpener: null, libraryRequest: 0,
-    metadataBusy: false, assetBusy: "", assetEditor: null, assetDelete: "", assetDeleteMode: "trash",
+    metadataBusy: false, renderModeSaving: false, assetBusy: "", assetEditor: null, assetDelete: "", assetDeleteMode: "trash",
     status: bridge.getStatus(), manualBusy: bridge.getManualBusy(), settingsSaving: false,
     modelState: window.SynthVModels?.getState(),
     jobProgress: { startedAt: 0, elapsedSeconds: 0, stage: "", text: "", reasoning: "", reasoningAvailable: false, receivedCharacters: 0 },
@@ -78,7 +78,7 @@
 
   /** 状态只影响可用动作，不重绘正文，避免轮询打断阅读或正在播放的附件。 */
   function syncControls() {
-    const interactionBusy = state.loading || state.sending || state.metadataBusy || Boolean(state.actionBusy);
+    const interactionBusy = state.loading || state.sending || state.metadataBusy || state.renderModeSaving || Boolean(state.actionBusy);
     const busy = interactionBusy || Boolean(state.modelState?.busy);
     const configured = Boolean(state.modelState?.configured);
     const modelValid = state.modelState?.valid !== false;
@@ -89,6 +89,7 @@
     $("refresh-conversations").disabled = state.loading || state.metadataBusy;
     $("chat-input").disabled = state.sending;
     $("include-selection").disabled = state.sending;
+    $("chat-render-mode").disabled = busy;
     $("attach-audio").disabled = state.sending;
     $("send-message").disabled = busy || state.settingsSaving || !configured || !modelValid || audioUnsupported || !$("chat-input").value.trim() || ($("include-selection").checked && (!connected || state.manualBusy));
     $("send-message").querySelector("span").textContent = state.sending ? "等待中" : "发送";
@@ -114,7 +115,7 @@
     $("send-scope").classList.toggle("visually-hidden", !scopeProblem);
     $("send-scope").classList.toggle("scope-warning", Boolean(scopeProblem));
     $("chat-subtitle").textContent = !configured ? "配置并选择本会话的平台；文字咨询无需附加音频。" : "先讨论与预览，再由你确认每一次工程修改。";
-    document.querySelectorAll(".conversation-item").forEach((button) => { button.disabled = state.sending || state.metadataBusy || state.modelState?.busy || Boolean(state.actionBusy); });
+    document.querySelectorAll(".conversation-item").forEach((button) => { button.disabled = state.sending || state.metadataBusy || state.renderModeSaving || state.modelState?.busy || Boolean(state.actionBusy); });
     document.querySelectorAll("[data-action-preview]").forEach((button) => {
       button.disabled = busy || state.manualBusy || !connected;
     });
@@ -159,13 +160,14 @@
     if (!conversation?.id || !Array.isArray(conversation.messages)) throw new Error("本地服务未返回完整会话，请刷新列表后重新打开。");
     state.conversation = conversation;
     window.SynthVModels?.setConversation(conversation, { preserveDraft: preserveModelDraft });
+    if (!preserveModelDraft) $("chat-render-mode").value = conversation.renderMode === "points" ? "points" : "smooth";
     rememberConversation(conversation.id);
     $("chat-title").textContent = conversation.title || "新的调教会话";
     renderHistory(scroll); renderConversations();
   }
 
   async function openConversation(id, { navigate = true } = {}) {
-    if (state.sending || state.actionBusy || state.metadataBusy) return;
+    if (state.sending || state.actionBusy || state.metadataBusy || state.renderModeSaving) return;
     if (navigate && !window.SynthVPages.go("chat")) return;
     $("conversation-editor").hidden = true; $("conversation-delete-confirm").hidden = true;
     $("edit-conversation").setAttribute("aria-expanded", "false");
@@ -182,7 +184,7 @@
   }
 
   async function newConversation() {
-    if (state.sending || state.loading || state.actionBusy || state.metadataBusy) return;
+    if (state.sending || state.loading || state.actionBusy || state.metadataBusy || state.renderModeSaving) return;
     if (!window.SynthVPages.go("chat")) return;
     $("conversation-editor").hidden = true; $("conversation-delete-confirm").hidden = true;
     $("edit-conversation").setAttribute("aria-expanded", "false");
@@ -290,9 +292,9 @@
       card.append(details("完整预览明细", preview));
     }
     if (action.result) card.append(details("查看真实执行结果", action.result));
-    if (action.status === "proposed" || action.status === "previewed") {
+    if (["proposed", "previewed", "applied"].includes(action.status)) {
       const controls = element("div", "action-controls");
-      const previewButton = element("button", "button button-secondary", action.status === "previewed" ? "重新预览当前选区" : "预览当前选区");
+      const previewButton = element("button", "button button-secondary", action.status === "applied" ? "撤销后重新预览" : action.status === "previewed" ? "重新预览当前选区" : "预览当前选区");
       previewButton.type = "button"; previewButton.dataset.actionPreview = action.id;
       previewButton.addEventListener("click", () => executeAction(action.id, "preview"));
       controls.append(previewButton);
@@ -301,7 +303,7 @@
         apply.addEventListener("click", () => executeAction(action.id, "apply")); controls.append(apply);
       }
       card.append(controls);
-      const explanation = action.status === "proposed" ? "先读取当前选区生成预览；这一步不会修改工程。" : state.activePreview !== action.id ? "此预览目前不可应用。请重新预览，核对当前选区。" : !state.status?.writeEnabled ? "预览尚未写入工程。开启选区写入后，再确认应用。" : "请核对数值和范围，点击“确认应用”才会修改工程。";
+      const explanation = action.status === "applied" ? "撤销或恢复此项修改后，可重新预览。服务会核对选区和原曲线是否完整恢复，通过后仍需再次确认应用。" : action.status === "proposed" ? "先读取当前选区生成预览；这一步不会修改工程。" : state.activePreview !== action.id ? "此预览目前不可应用。请重新预览，核对当前选区。" : !state.status?.writeEnabled ? "预览尚未写入工程。开启选区写入后，再确认应用。" : "请核对数值和范围，点击“确认应用”才会修改工程。";
       card.append(element("p", "action-help", explanation));
     } else if (action.status === "unknown") {
       card.append(element("p", "action-help warning", "执行结果尚不能确认。请检查 SynthV 当前工程与服务记录，勿重复提交同一修改。"));
@@ -398,7 +400,7 @@
       } else if (role === "assistant" || role === "error") article.append(element("p", "message-context", "本条回复未提供可展示的思考摘要。"));
       if (role === "user") {
         const count = Array.isArray(message.attachments) ? message.attachments.length : 0;
-        article.append(element("p", "message-context", `${count ? `已发送 ${count} 段所选音频` : "未发送音频"}${message.selection ? " · 含选区上下文" : " · 无选区上下文"}`));
+        article.append(element("p", "message-context", `${count ? `已发送 ${count} 段所选音频` : "未发送音频"}${message.selection ? " · 含选区上下文" : " · 无选区上下文"}${message.renderMode ? ` · ${message.renderMode === "points" ? "控制点模式" : "绘制模式"}` : ""}`));
       } else if (message.inputMode) {
         article.append(element("p", "message-context", message.inputMode === "audio" ? "本次请求包含音频附件；回复内容由模型返回。" : "文字与工程信息回复；本次未传入音频。"));
       }
@@ -439,8 +441,9 @@
   async function executeAction(id, operation) {
     if (state.actionBusy || state.sending || state.manualBusy) return;
     const action = findAction(id);
-    if (!action || !["proposed", "previewed"].includes(action.status)) return;
-    if (operation === "apply" && (state.activePreview !== id || !state.status?.writeEnabled)) return;
+    if (!action || !["proposed", "previewed", "applied"].includes(action.status)) return;
+    // 已应用的提案只能向后端申请“撤销后重新预览”；旧预览不能直接恢复应用资格。
+    if (operation === "apply" && (action.status !== "previewed" || state.activePreview !== id || !state.status?.writeEnabled)) return;
     state.actionBusy = id; state.activePreview = ""; state.actionErrors.delete(id);
     bridge.clearManualPreview(); bridge.setAssistantBusy(true);
     renderHistory(); feedback("chat-feedback", operation === "preview" ? "正在读取当前选区并生成预览，不会修改工程…" : "正在应用你已确认的单项修改…");
@@ -467,7 +470,7 @@
     feedback("chat-feedback", "正在恢复最近一次修改…");
     try {
       const result = await bridge.api("/api/restore", {});
-      feedback("chat-feedback", typeof result.summary === "string" ? result.summary : "恢复请求已完成，请查看返回结果。");
+      feedback("chat-feedback", `${typeof result.summary === "string" ? result.summary : "恢复请求已完成，请查看返回结果。"}如需再次应用，请在原建议卡点击“撤销后重新预览”。`);
       const box = element("div", "chat-operation-result");
       box.append(element("strong", "", "恢复结果"), details("查看服务实际返回", result)); $("chat-history").append(box);
       $("chat-history").scrollTop = $("chat-history").scrollHeight;
@@ -494,7 +497,7 @@
     if (!text) return;
     if (text.length > 4000) { feedback("chat-feedback", "每条消息最多 4000 个字符，请缩短后再发送。", true); return; }
     const payload = { text, includeSelection: $("include-selection").checked, attachments: state.attachments.map(({ kind, id }) => ({ kind, id })),
-      modelOptions: window.SynthVModels.snapshot() };
+      modelOptions: window.SynthVModels.snapshot(), renderMode: $("chat-render-mode").value };
     state.sending = true; state.activePreview = ""; syncControls();
     feedback("chat-feedback");
     startJobProgress();
@@ -502,6 +505,7 @@
       if (!state.conversation) setConversation(await bridge.api("/api/conversations", {}), true, true);
       const id = state.conversation.id;
       await window.SynthVModels.ensureSaved();
+      await persistRenderMode(payload.renderMode);
       const job = await bridge.api(`/api/conversations/${encodeURIComponent(id)}/messages`, payload);
       state.jobProgress.stage = "queued"; renderJobProgress();
       try { setConversation(await bridge.api(`/api/conversations/${encodeURIComponent(id)}`)); }
@@ -749,6 +753,28 @@
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); if (!$("send-message").disabled) $("chat-form").requestSubmit(); }
   });
   $("include-selection").addEventListener("change", syncControls);
+  /** 会话模式单独持久化；只影响后续请求，不重写已生成提案或恢复旧预览资格。 */
+  async function persistRenderMode(renderMode) {
+    const conversation = state.conversation;
+    if (conversation && conversation.renderMode !== renderMode) {
+      const result = await bridge.api(`/api/conversations/${encodeURIComponent(conversation.id)}/render-mode`, { renderMode });
+      if (result.renderMode !== renderMode) throw new Error("服务未确认绘制模式已保存，请重试。");
+      if (state.conversation?.id === conversation.id) state.conversation.renderMode = renderMode;
+    }
+    try { localStorage.setItem("synthvChatRenderMode", renderMode); } catch { /* 偏好存储受限不影响发送。 */ }
+  }
+  // 浏览器只记住非秘密的新草稿偏好；打开已有会话后优先使用该会话保存的模式。
+  try { $("chat-render-mode").value = localStorage.getItem("synthvChatRenderMode") === "points" ? "points" : "smooth"; }
+  catch { $("chat-render-mode").value = "smooth"; }
+  $("chat-render-mode").addEventListener("change", async () => {
+    if (state.renderModeSaving) return;
+    const previous = state.conversation?.renderMode === "points" ? "points" : "smooth";
+    const renderMode = $("chat-render-mode").value;
+    state.renderModeSaving = true; syncControls();
+    try { await persistRenderMode(renderMode); }
+    catch (error) { $("chat-render-mode").value = previous; feedback("chat-feedback", bridge.errorMessage(error), true); }
+    finally { state.renderModeSaving = false; syncControls(); }
+  });
   $("new-conversation").addEventListener("click", newConversation);
   $("refresh-conversations").addEventListener("click", refreshConversations);
   $("star-conversation").addEventListener("click", () => updateConversationMetadata({ starred: !state.conversation?.starred }));
@@ -855,7 +881,7 @@
     if (event.detail?.id === state.conversation?.id) state.conversation.modelOptions = event.detail.modelOptions;
   });
   window.addEventListener("synthv:preview-invalidated", () => { if (state.activePreview) { state.activePreview = ""; renderHistory(); } });
-  window.addEventListener("synthv:restored", (event) => { state.activePreview = ""; renderHistory(); feedback("chat-feedback", event.detail.summary || "手动工具已返回恢复结果，请查看右侧操作信息。"); });
+  window.addEventListener("synthv:restored", (event) => { state.activePreview = ""; renderHistory(); feedback("chat-feedback", `${event.detail.summary || "手动工具已返回恢复结果，请查看右侧操作信息。"}如需再次应用，请先在原建议卡重新预览。`); });
   window.addEventListener("synthv:recordings", () => { if (window.SynthVPages.current === "library" && !state.uploading) loadLibrary(); });
 
   window.addEventListener("synthv:assets-changed", async (event) => {

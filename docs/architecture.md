@@ -38,7 +38,7 @@ flowchart LR
 | `synthv_assistant/planner.py` | 真实文字/音频模型请求、结构化参数提案、数值白名单与错误脱敏 |
 | `synthv_assistant/streaming.py` | 有界 SSE 解析、跨事件凭据脱敏、实际回复和可见摘要聚合，不自动回退重试 |
 | `synthv_assistant/platforms.py` | 默认平台兼容入口、命名平台 DPAPI 注册表与平台快照 |
-| `synthv_assistant/model_catalog.py` | 用户主动刷新时读取供应商模型目录，限制分页、数量、大小与超时 |
+| `synthv_assistant/model_catalog.py` | 用户主动刷新供应商目录；持久缓存按连接身份隔离，本地读取不联网 |
 | `synthv_assistant/model_options.py` | 会话级平台/模型/推理选择校验及供应商参数映射；未知能力明确标注 |
 | `synthv_assistant/assets.py` | 本地 WAV/MP3 导入、受控 FFmpeg 转换、附件 ID 白名单及发送大小限制 |
 | `synthv_assistant/metadata.py` | 每项资源独立存储名称、备注、星标和删除标记；资源锁保护在途音频请求 |
@@ -74,6 +74,8 @@ flowchart LR
 3. 用户逐项确认应用。服务再次核对上下文；明确得知只读时拒绝写入并保留预览，不自动开启编辑。
 4. 真正调用 `service.edit()` **之前**先原子保存 `unknown`。只有宿主确认写后验证成功，才能保存 `applied`。超时、进程中断或写后保存失败时，磁盘记录仍阻止再次应用同一提案。
 
+已验证成功的 `applied` 可在参数完整撤销后请求新预览：要求仍为原桥接 session、选区及参数定义，宿主报告可用曲线能力和完整指纹，且参数身份与提案生成前完全相同。先原子退回 `proposed` 并删除旧 `result`、`preview`，再走正常预览流程；新预览前后都再次检查身份。失败可重试只读预览，但不能直接重放旧应用。`unknown` 和旧桥接点数摘要仍不能用此路径解锁。
+
 选区身份与各参数指纹分开：应用气声后，张力提案在其他条件未变化时仍可继续逐项预览。新桥接将声库设置指纹和组音高偏移绑定到选区身份，将完整控制点、插值方式与参数定义形成的指纹绑定到目标参数；点数不变的手工改线也会使相应提案失效。原生音高使用独立完整快照，并核对关联的 pitchDelta。旧桥接没有这些新增字段时仍兼容五参数增量，其早期检查只能依赖范围、默认值和点数；所有版本的实际应用仍由 Lua 核对预览时的完整宿主状态。新预览会把其他会话的旧 `previewed` 提案退回 `proposed`，因为 Lua 只保留最近一次预览。
 
 模型请求使用每会话独立文件锁，等待模型时不持有工程操作锁；短时保存和提案状态转换由 `assistant.lock` 跨进程串行化。会话 JSON 使用同目录临时文件、`fsync` 和原子替换，不能让同时打开的 HTTP/MCP 进程覆盖彼此的新状态。模型失败持久化为错误消息，保留安全的认证/限流提示，意外异常不回显供应商正文或密钥。
@@ -86,7 +88,11 @@ flowchart LR
 
 会话 JSON 的 `modelOptions` 只保存 `platformId`、`model`、`reasoningEffort` 三个公开选择，不保存密钥或根地址。模型留空沿用平台默认模型，`reasoningEffort=default` 不额外指定强度。保存选项与发送请求使用同一会话锁；请求开始时重新读取所选平台的一份完整快照，并按当时模型校验推理档位，避免旧页面参数被直接发出。平台更新不会半途替换请求的地址、凭据或默认模型。旧 MCP 与不指定会话选项的直接规划调用仍走默认设置入口。
 
+绘制偏好使用独立的会话字段 `renderMode=smooth|points`，旧会话缺失时默认 smooth；通过 `POST /api/conversations/{id}/render-mode` 保存，发送时可携带本次模式快照。该字段不进入平台配置，也不会让修改偏好重解释已有提案。规划器要求动作符合本次模式，points 的音高动作必须使用 pitchDelta。
+
 `web/models.js` 管理会话选择、模型候选与本地能力提示。仅显式点击刷新目录才触发供应商 `GET /models`；本地平台列表、模型能力查询和保存操作不产生外部请求。OpenAI 使用 Bearer 认证，Gemini 使用 `x-goog-api-key`，目录请求不携带会话或音频。后端最多读取 5 页、500 个模型，每页响应不超过 2 MB，请求超时不超过 30 秒；不跟随重定向或响应中的任意下一页 URL。Gemini 只列出支持 `generateContent` 的条目，并去掉 `models/` 前缀。
+
+目录成功后原子写入 `data/model-catalogs/{platformId}.json`，读取上限 512 KiB。平台 ID、协议、地址与凭据摘要经过当前用户 DPAPI 加密，缓存不含地址、密钥或身份摘要明文；目录标签、时间和分页元数据为普通本机数据。GET 缓存接口每次读取当前配置并核对身份，坏缓存、解密失败、配置变化均返回未命中，不联网。七天后仅标记陈旧，仍复用；POST 显式刷新才访问供应商。刷新失败不覆盖旧缓存，缓存写失败不把成功获取误报为网络失败。前端按平台、配置代次及请求序号检查异步结果，旧缓存读取不能覆盖较新的手动刷新，也不能改写模型输入草稿。
 
 模型列表不等于完整能力声明。本地规则仅识别已知系列，对未知兼容模型标注未验证；目录刷新失败时仍允许手动输入模型 ID。已知不支持音频的模型在加载和外发附件前被拒绝；未知音频能力需由使用者核对。OpenAI 的非默认档位使用 `reasoning_effort`，Gemini 按系列使用 `thinkingLevel` 或 `thinkingBudget`；不支持的档位会拒绝，不会自动改成较低档位或换模型。
 
@@ -108,6 +114,8 @@ Lua 脚本只接受预定义动作，包括工程/选区读取、参数预览、
 
 模型动作继续接受旧结构 `{parameter, delta, reason}`，新增 `{parameter, curve, reason}`；两者可附带 `renderMode`，不能同时给出 delta 和 curve，也不接受未知字段。`curve` 是 2～64 个 `[position,value]`，position 为连续选区内的时间比例，严格递增且首尾为 0、1。通用参数、`vocalMode_Name` 和 `pitchDelta` 的 value 均为偏移，整条偏移曲线不能全零。`smooth` 为默认精简表示，`points` 为显式控制点表示；HTTP 使用 `renderMode`，MCP 使用 `render_mode`。HTTP/MCP 在自动类型转换前拒绝布尔数值、数字字符串和字符串伪装的曲线。
 
+AI 原生音高另可用 `pitchShape` 代替 delta/curve，由规划器在白名单校验前编译。`pitch_shapes.py` 接收每音符重复的 2～8 点相对音分包络（±50）及 5～120 毫秒过渡（默认 40），按真实起止秒数与组移调构造绝对 MIDI 曲线；节点上限仍为 64，不能靠删除短音符满足限制。AI 直接绝对曲线在每个音符内部 25%、50%、75% 位置按乐谱基准校验。编译结果才进入后续持久提案与宿主预览，不把高层包络直接传给 Lua；控制点模式不接受原生音高包络。
+
 通用单次偏移上限为 breathiness/tension/gender 各 0.3、loudness 6 dB、pitchDelta 100 音分、toneShift 200 音分、vibratoEnv 0.3；宿主 `maxDelta` 更小时采用较小值。声线模式上限为 30 个百分点，而且 `vocalMode_Name` 必须在本次目录中满足 `kind=vocalMode`、`modeName=Name`。目录来自当前组与轨道主组实际返回的设置，不能当作声库全部模式的枚举，也不能预设某个声库一定有 Cute 等名称。
 
 用户可在 SynthV 声线面板核对名称后，通过 `POST /api/parameters/vocal-mode` 提交 `{name,selection}` 临时补充目录。名称去首尾空白、保留原名，UTF-8 不超过 80 字节且不含控制字符；selection 必须带当前工程、组、时间偏移、音高偏移和声库指纹。服务只转发这些身份字段作为 expected，由宿主再次核对，避免过期页面作用于另一个声库；注册与录音/编辑共用操作锁，但不修改工程、不自动开启写入、不保存永久配置。补充项只保存在当前桥接会话中，标为 `source=user`；宿主返回项标为 `source=host`。用户声明并不是完整 API 枚举，模型不能注册或猜测名称，只能使用本次返回的目录。
@@ -119,6 +127,8 @@ Lua 脚本只接受预定义动作，包括工程/选区读取、参数预览、
 通用自动化默认按垂直误差精简点数，并保护边缘和全部区外点；密集点模式为显式选项。原生音高以绝对MIDI曲线表示，转换组时间与音高偏移后创建独立宿主对象，未应用时不附加到工程。跨界原生曲线、区内引导点及非零pitchDelta会拒绝。两类参数使用相同的预览编号、应用/回滚/恢复流程；完整原生快照包含对象类型、次序、锚点、内部点及可读脚本元数据。
 
 公开预览包含表示方式、单位、标签、修改前后点数、精简点数和能力提示。`curvePreview` 最多 256 个 `{position,before,after}` 样本，来自宿主候选曲线读取；原生音高没有可靠取得修改前生成音高时，before 为 null，不能填零或用音符基准伪造实际基线。图形是有界采样展示，不代表已应用或已听到音频。
+
+公开预览中的 `notes` 由当前真实选区投影为有界音符叠层，使用乐谱音高加组移调。它用于核对时间及旋律结构，不是演唱基频，不能替代缺失的 before 曲线；不附带工程路径、组标识或声库指纹。
 
 ### 预览、应用与恢复
 
@@ -179,9 +189,11 @@ Lua 打包时写入本机 IPC 绝对路径。移动项目或更改 `SYNTHV_ASSIS
 | `GET /api/model-platforms`、`GET /api/model-platforms/{id}` | 持令牌读取公开平台列表或表单，不访问供应商 |
 | `POST /api/model-platforms` | 创建或编辑平台；默认平台使用原设置 revision，其余使用注册表 revision |
 | `POST /api/model-platforms/default-selection` | 以 `{id,revision}` 设置新会话默认平台；不改已有会话与 A/B 听评配置 |
+| `GET /api/model-platforms/{id}/models` | 持令牌仅读取当前连接身份的本地目录缓存；未命中或过期不自动联网 |
 | `POST /api/model-platforms/{id}/models` | 用户显式刷新模型目录；请求体为空对象，后端向供应商发送 GET |
 | `POST /api/model-capabilities` | 按平台和模型查询本地能力规则，不联网 |
 | `POST /api/conversations/{id}/model-options` | 保存本会话的平台、模型及推理强度，所有新增 POST 均要求令牌 |
+| `POST /api/conversations/{id}/render-mode` | 保存独立的会话绘制模式，旧提案保持原表示方式 |
 | `GET /api/conversations`、`GET /api/conversations/{id}` | 带会话令牌读取持久会话列表或消息 |
 | `POST /api/conversations` | 新建本地会话 |
 | `POST /api/conversations/{id}/metadata`、`POST /api/conversations/{id}/delete` | 更新名称、备注、星标，或将会话移入回收站 |
@@ -189,7 +201,7 @@ Lua 打包时写入本机 IPC 绝对路径。移动项目或更改 `SYNTHV_ASSIS
 | `GET /api/trash`、`POST /api/trash/{kind}/{id}/restore` | 查看回收站并恢复；以上管理接口均要求会话令牌 |
 | `POST /api/conversations/{id}/purge`、`POST /api/assets/{kind}/{id}/purge` | 使用 `{confirm:true}` 直接永久删除会话或音频 |
 | `POST /api/trash/{kind}/{id}/purge` | 确认后永久删除回收站条目，或重试清理中断的永久删除 |
-| `POST /api/conversations/{id}/messages` | 提交文字、可选选区、本次附件和可选 `modelOptions`，返回后台任务编号 |
+| `POST /api/conversations/{id}/messages` | 提交文字、可选选区、本次附件、可选 `modelOptions` 和 `renderMode`，返回后台任务编号 |
 | `POST /api/assistant/actions/{id}/preview`、`POST /api/assistant/actions/{id}/apply` | 对已保存提案生成宿主预览或显式确认应用 |
 | `GET /api/uploads`、`POST /api/uploads` | 带会话令牌列出或导入本地音频素材 |
 | `GET /uploads/{id}.wav` | 播放校验完成的本地上传音频 |

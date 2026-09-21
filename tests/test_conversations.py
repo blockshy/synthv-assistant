@@ -78,6 +78,37 @@ class ConversationTests(unittest.TestCase):
     def read_saved(self):
         return json.loads((self.directory / "conversations" / (self.identifier + ".json")).read_text(encoding="utf-8"))
 
+    def test_drawing_preference_persists_without_rewriting_existing_proposals(self):
+        """新请求绑定模式快照；历史动作不会因用户切换偏好而变成另一种表示。"""
+        action = self.proposed()
+        changed = self.manager.update_render_mode(self.identifier, {"renderMode": "points"})
+        self.assertEqual(changed["renderMode"], "points")
+        self.assertEqual(changed["messages"][-1]["actions"][0], action)
+        result = self.send(include_selection=False)
+        self.assertEqual(self.planner.call_args.kwargs["render_mode"], "points")
+        self.assertEqual(result["messages"][-2]["renderMode"], "points")
+        self.assertEqual(self.manager.get_conversation(self.identifier)["renderMode"], "points")
+        for invalid in ({"renderMode": None}, {"renderMode": True}, {"renderMode": "points", "extra": 1}):
+            with self.assertRaises(ValueError):
+                self.manager.update_render_mode(self.identifier, invalid)
+        self.assertEqual(self.manager.get_conversation(self.identifier)["renderMode"], "points")
+
+    def test_conversation_preview_contains_sanitized_score_notes(self):
+        action = self.proposed()
+        result = self.manager.preview_action(action["id"])
+        self.assertEqual(result["preview"]["notes"], [
+            {"startPosition": 0, "endPosition": 1, "pitch": 60}])
+
+    def test_unknown_persisted_status_does_not_gain_preview_permission(self):
+        """扩大 applied 的恢复入口不应使任意损坏状态自动获得重新执行权限。"""
+        action = self.proposed()
+        document = self.read_saved()
+        document["messages"][-1]["actions"][0]["status"] = "corrupt-state"
+        self.manager._save(document)
+        with self.assertRaisesRegex(ConversationError, "保护信息缺失"):
+            self.manager.preview_action(action["id"])
+        self.service.preview.assert_not_called()
+
     def test_curve_plan_preview_and_confirm_preserve_shape_and_private_guards(self):
         """曲线仅在预览后获得确认入口；声库、指纹不进入模型和公开消息。"""
         self.selection.update(modern_selection())
@@ -272,6 +303,163 @@ class ConversationTests(unittest.TestCase):
         with self.assertRaises(ConversationError):
             self.manager.apply_action(action["id"])
         self.service.edit.assert_called_once()
+
+    def prepare_applied_fingerprinted_action(self):
+        """仅在宿主替身中模拟写入，返回完整原态供原生撤销/网页恢复测试使用。"""
+        self.selection["capabilities"] = {"curves": True, "nativePitch": False}
+        original = self.selection["parameters"]["breathiness"]
+        original.update(kind="automation", available=True, fingerprint="0123456789abcdef:96")
+        original = copy.deepcopy(original)
+        action = self.proposed()
+        self.manager.preview_action(action["id"])
+
+        def verified_write(_command, _args):
+            # 改值但不改点数，证明重试权限来自完整指纹，而不是点数碰巧相同。
+            self.selection["parameters"]["breathiness"]["fingerprint"] = "fedcba9876543210:96"
+            return {"verified": True, "parameter": "breathiness", "undoRecords": 1}
+
+        self.service.edit.side_effect = verified_write
+        self.assertEqual(self.manager.apply_action(action["id"])["status"], "applied")
+        return action, original
+
+    def test_verified_undo_allows_new_preview_and_separate_reconfirmation(self):
+        """已应用提案必须回到完整原态，并重新取得凭据，才能再次由用户确认。"""
+        action, original = self.prepare_applied_fingerprinted_action()
+        self.selection["parameters"]["breathiness"] = original
+        with self.assertRaises(ConversationError):
+            self.manager.apply_action(action["id"])
+        first_preview = self.read_saved()["messages"][-1]["actions"][0]["preview"]["previewId"]
+        host_preview = self.service.preview.side_effect
+
+        def inspect_new_preview(*args, **kwargs):
+            saved = self.read_saved()["messages"][-1]["actions"][0]
+            self.assertEqual(saved["status"], "proposed")
+            self.assertNotIn("preview", saved)
+            self.assertNotIn("result", saved)
+            return host_preview(*args, **kwargs)
+
+        self.service.preview.side_effect = inspect_new_preview
+        restarted = ConversationManager(self.service)
+        second = restarted.preview_action(action["id"])
+        self.assertEqual(second["status"], "previewed")
+        self.assertNotEqual(second["preview"]["previewId"], first_preview)
+        self.assertNotIn("result", second)
+        self.assertEqual(self.service.edit.call_count, 1)
+        self.assertEqual(restarted.apply_action(action["id"])["status"], "applied")
+        self.assertEqual(self.service.edit.call_count, 2)
+        self.service.edit.assert_called_with("apply", {"previewId": second["preview"]["previewId"]})
+        self.service.write_mode.assert_not_called()
+
+    def test_applied_action_without_undo_or_with_different_edit_remains_locked(self):
+        """未撤销以及其他同点数修改都不能被当成已经恢复；失败不清除应用记录。"""
+        action, _original = self.prepare_applied_fingerprinted_action()
+        for fingerprint in ("fedcba9876543210:96", "aaaaaaaaaaaaaaaa:96"):
+            self.selection["parameters"]["breathiness"]["fingerprint"] = fingerprint
+            with self.subTest(fingerprint=fingerprint), self.assertRaisesRegex(ConversationError, "尚未恢复"):
+                self.manager.preview_action(action["id"])
+            saved = self.read_saved()["messages"][-1]["actions"][0]
+            self.assertEqual(saved["status"], "applied")
+            self.assertTrue(saved["result"]["verified"])
+        self.assertEqual(self.service.preview.call_count, 1)
+        self.assertEqual(self.service.edit.call_count, 1)
+
+    def test_repreview_after_undo_still_binds_original_selection_and_session(self):
+        action, original = self.prepare_applied_fingerprinted_action()
+        self.selection["parameters"]["breathiness"] = original
+        self.selection["notes"][0]["pitch"] = 61
+        with self.assertRaisesRegex(ConversationError, "选区"):
+            self.manager.preview_action(action["id"])
+        self.selection["notes"][0]["pitch"] = 60
+        self.service.bridge.status.return_value["session"] = "new-session"
+        with self.assertRaisesRegex(ConversationError, "会话"):
+            self.manager.preview_action(action["id"])
+        self.assertEqual(self.read_saved()["messages"][-1]["actions"][0]["status"], "applied")
+        self.assertEqual(self.service.preview.call_count, 1)
+
+    def test_legacy_applied_action_cannot_replay_from_point_count_or_later_upgrade(self):
+        """旧摘要不能证明撤销，升级后当前新增的指纹也不能补造旧提案的原指纹。"""
+        action = self.proposed()
+        self.manager.preview_action(action["id"])
+        self.manager.apply_action(action["id"])
+        with self.assertRaisesRegex(ConversationError, "完整参数指纹"):
+            self.manager.preview_action(action["id"])
+        self.selection["capabilities"] = {"curves": True}
+        self.selection["parameters"]["breathiness"].update(available=True, fingerprint="0123456789abcdef:96")
+        with self.assertRaisesRegex(ConversationError, "尚未恢复"):
+            self.manager.preview_action(action["id"])
+        self.assertEqual(self.read_saved()["messages"][-1]["actions"][0]["status"], "applied")
+        self.assertEqual(self.service.preview.call_count, 1)
+
+    def test_repreview_requires_valid_complete_fingerprint_and_available_capability(self):
+        action, original = self.prepare_applied_fingerprinted_action()
+        for fingerprint in (None, "", "unavailable", "oversized:5000", "not-a-full-fingerprint", True):
+            self.selection["parameters"]["breathiness"] = {**original, "fingerprint": fingerprint}
+            with self.subTest(fingerprint=fingerprint), self.assertRaisesRegex(ConversationError, "完整参数指纹"):
+                self.manager.preview_action(action["id"])
+        self.selection["parameters"]["breathiness"] = {**original, "available": False}
+        with self.assertRaisesRegex(ConversationError, "完整参数指纹"):
+            self.manager.preview_action(action["id"])
+        self.selection["parameters"]["breathiness"] = original
+        self.selection["capabilities"]["curves"] = False
+        with self.assertRaisesRegex(ConversationError, "完整参数指纹"):
+            self.manager.preview_action(action["id"])
+        self.assertEqual(self.service.preview.call_count, 1)
+
+    def test_failed_repreview_after_undo_discards_old_confirmation_and_is_retryable(self):
+        action, original = self.prepare_applied_fingerprinted_action()
+        self.selection["parameters"]["breathiness"] = original
+        host_preview = self.service.preview.side_effect
+        self.service.preview.side_effect = RuntimeError("private-host-error")
+        with self.assertRaisesRegex(ConversationError, "无法生成宿主预览"):
+            self.manager.preview_action(action["id"])
+        saved = self.read_saved()["messages"][-1]["actions"][0]
+        self.assertEqual(saved["status"], "proposed")
+        self.assertNotIn("preview", saved)
+        self.assertNotIn("result", saved)
+        with self.assertRaises(ConversationError):
+            self.manager.apply_action(action["id"])
+        self.service.preview.side_effect = host_preview
+        self.assertEqual(self.manager.preview_action(action["id"])["status"], "previewed")
+        self.assertEqual(self.service.edit.call_count, 1)
+
+    def test_repreview_detects_manual_edit_during_preview_without_reusing_old_credentials(self):
+        action, original = self.prepare_applied_fingerprinted_action()
+        self.selection["parameters"]["breathiness"] = original
+        host_preview = self.service.preview.side_effect
+
+        def preview_with_manual_edit(*args, **kwargs):
+            result = host_preview(*args, **kwargs)
+            self.selection["parameters"]["breathiness"]["fingerprint"] = "aaaaaaaaaaaaaaaa:96"
+            return result
+
+        self.service.preview.side_effect = preview_with_manual_edit
+        with self.assertRaisesRegex(ConversationError, "尚未恢复"):
+            self.manager.preview_action(action["id"])
+        saved = self.read_saved()["messages"][-1]["actions"][0]
+        self.assertEqual(saved["status"], "proposed")
+        self.assertNotIn("preview", saved)
+        self.assertNotIn("result", saved)
+        self.assertEqual(self.service.edit.call_count, 1)
+
+    def test_repreview_save_failure_leaves_applied_and_does_not_contact_host(self):
+        action, original = self.prepare_applied_fingerprinted_action()
+        self.selection["parameters"]["breathiness"] = original
+        with patch.object(self.manager, "_save", side_effect=ConversationError("磁盘不可写")):
+            with self.assertRaisesRegex(ConversationError, "磁盘"):
+                self.manager.preview_action(action["id"])
+        self.assertEqual(self.read_saved()["messages"][-1]["actions"][0]["status"], "applied")
+        self.assertEqual(self.service.preview.call_count, 1)
+
+    def test_unknown_action_cannot_repreview_even_when_original_fingerprint_returns(self):
+        action, original = self.prepare_applied_fingerprinted_action()
+        self.selection["parameters"]["breathiness"] = original
+        self.manager.preview_action(action["id"])
+        self.service.edit.side_effect = TimeoutError("unknown-host-outcome")
+        self.assertEqual(self.manager.apply_action(action["id"])["status"], "unknown")
+        with self.assertRaisesRegex(ConversationError, "结果未知"):
+            ConversationManager(self.service).preview_action(action["id"])
+        self.assertEqual(self.service.preview.call_count, 2)
+        self.assertEqual(self.service.edit.call_count, 2)
 
     def test_timeout_stays_unknown_after_restart_and_cannot_be_replayed(self):
         action = self.proposed()

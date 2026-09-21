@@ -3,7 +3,7 @@
 /**
  * 会话级模型选择：平台目录、手动模型 ID、能力提示和推理强度。
  * 平台与能力请求只访问本机；只有用户点击“刷新模型列表”才调用供应商目录。
- * 此模块不读取密钥，也不把选择存入浏览器存储；已有会话由本机后端持久化。
+ * 此模块不读取密钥，也不把选择存入浏览器存储；目录缓存与会话选项由本机后端持久化。
  */
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -15,6 +15,7 @@
     capabilityRequest: 0, capabilityTimer: null, catalogLoading: false, catalogs: new Map(),
     dirty: false, saving: false, savePromise: null, interactionBusy: false, initializing: true,
     platformGenerations: new Map(), feedback: "", feedbackError: false, feedbackTimer: null,
+    catalogRequests: new Map(), catalogMetadata: new Map(), refreshingPlatforms: new Set(),
   };
   function options(value = {}) {
     return { platformId: typeof value.platformId === "string" && value.platformId ? value.platformId : "default",
@@ -61,7 +62,9 @@
     const audioNote = audio === "supported" ? "规则表标记支持音频输入。" : audio === "unsupported" ? "此模型不支持音频输入，请仅发送文字。" : "音频能力未知，附加音频前请确认平台支持。";
     $("chat-model-capability").textContent = state.capabilityLoading ? "正在读取本机能力规则…" : `${typeof note === "string" ? note : "默认推理不额外传参。"} ${audioNote} 模型 ID 可手动填写。`;
     // 技术能力说明移到悬停及辅助描述中；仅在实际阻止发送时由会话模块给出简短提示。
-    $("chat-model").title = `可选择或填写模型 ID。${audioNote}`;
+    const catalog = state.catalogMetadata.get(state.options.platformId);
+    const cacheNote = catalog?.cachedAt ? `已缓存模型目录${catalog.stale ? "（超过 7 天，可主动刷新）" : ""}。` : "首次使用可点击刷新获取模型列表。";
+    $("chat-model").title = `可选择或填写模型 ID。${cacheNote}${audioNote}`;
     $("chat-model").setAttribute("aria-describedby", "chat-model-capability");
     $("chat-reasoning-label").title = state.capabilities?.reasoning?.supported === null ? "兼容平台能力未知；非默认强度需要平台支持，失败不会自动降级。" : "默认选项不额外指定推理参数。";
   }
@@ -103,6 +106,12 @@
       if (request !== state.listRequest) return;
       // 后端公开响应已脱敏；前端仍仅保存显示与能力判断需要的字段。
       state.platforms = (Array.isArray(result.items) ? result.items : []).map((item) => ({ id: item.id, name: item.name, model: item.model, provider: item.provider, configured: Boolean(item.configured) }));
+      // 停用或删除的平台不继续展示内存中的旧目录；重新启用后由本机身份校验决定复用。
+      for (const id of state.catalogs.keys()) {
+        if (!state.platforms.some((item) => item.id === id && item.configured)) {
+          state.catalogs.delete(id); state.catalogMetadata.delete(id);
+        }
+      }
       state.defaultPlatformId = typeof result.defaultPlatformId === "string" ? result.defaultPlatformId : "default";
       // 尚未建立会话且用户没有主动修改选择时，使用设置中的新会话默认平台。
       // 已有会话和明确编辑过的草稿保持原选择，不因全局偏好改变而切换供应商。
@@ -112,9 +121,37 @@
       }
       renderPlatforms(); renderCatalog();
       if (state.feedbackError) feedback();
-      await loadCapabilities();
+      await Promise.all([loadCapabilities(), loadCachedCatalog()]);
     } catch (error) { if (request === state.listRequest) feedback(bridge.errorMessage(error), true); }
     finally { if (request === state.listRequest) { state.listLoading = false; publish(); } }
+  }
+
+  /**
+   * 切换会话、平台或重新打开页面时仅读取本机持久化缓存，不触发供应商请求。
+   * 每个平台单独维护响应序号；主动刷新或配置变更会使旧读取失效，避免迟到的
+   * 空缓存响应覆盖刚取得的目录。模型输入草稿不受目录加载和响应顺序影响。
+   */
+  async function loadCachedCatalog() {
+    const platformId = state.options.platformId;
+    if (!selectedPlatform()?.configured || state.refreshingPlatforms.has(platformId)) return;
+    const generation = state.platformGenerations.get(platformId) || 0;
+    const request = (state.catalogRequests.get(platformId) || 0) + 1;
+    state.catalogRequests.set(platformId, request);
+    try {
+      const result = await bridge.api(`/api/model-platforms/${encodeURIComponent(platformId)}/models`);
+      if ((state.platformGenerations.get(platformId) || 0) !== generation || state.catalogRequests.get(platformId) !== request) return;
+      const models = (Array.isArray(result.models) ? result.models : []).filter((item) => typeof item.id === "string" && item.id);
+      state.catalogs.set(platformId, models);
+      state.catalogMetadata.set(platformId, { cachedAt: result.cachedAt, stale: Boolean(result.stale) });
+      if (platformId === state.options.platformId) { renderCatalog(); render(); }
+    } catch (error) {
+      if ((state.platformGenerations.get(platformId) || 0) !== generation || state.catalogRequests.get(platformId) !== request) return;
+      // 本地读取失败时不偷偷改为外网刷新；清理旧目录，保留手动输入和明确错误。
+      state.catalogs.delete(platformId); state.catalogMetadata.delete(platformId);
+      if (platformId === state.options.platformId) {
+        renderCatalog(); feedback(`暂不能读取模型缓存：${bridge.errorMessage(error)} 仍可手动填写模型 ID。`, true);
+      }
+    }
   }
 
   /** 能力查询走本机规则，既不访问模型供应商，也不更改选中的平台或模型。 */
@@ -157,6 +194,8 @@
     if (state.catalogLoading || !selectedPlatform()?.configured) return;
     const platformId = state.options.platformId;
     const generation = state.platformGenerations.get(platformId) || 0;
+    state.catalogRequests.set(platformId, (state.catalogRequests.get(platformId) || 0) + 1);
+    state.refreshingPlatforms.add(platformId);
     state.catalogLoading = true; render(); feedback("正在读取模型列表…");
     try {
       const result = await bridge.api(`/api/model-platforms/${encodeURIComponent(platformId)}/models`, {});
@@ -167,18 +206,26 @@
       }
       const models = (Array.isArray(result.models) ? result.models : []).filter((item) => typeof item.id === "string" && item.id);
       state.catalogs.set(platformId, models);
-      if (platformId === state.options.platformId) { renderCatalog(); state.catalogLoading = false; feedback(`已读取 ${models.length} 个模型。`); }
+      state.catalogMetadata.set(platformId, { cachedAt: result.cachedAt, stale: false });
+      if (platformId === state.options.platformId) {
+        renderCatalog(); state.catalogLoading = false;
+        feedback(result.cachePersisted === false ? `已读取 ${models.length} 个模型，但本地缓存保存失败；当前列表仍可使用。` : `已读取并缓存 ${models.length} 个模型。`, result.cachePersisted === false);
+      }
     } catch (error) {
       if (platformId === state.options.platformId && (state.platformGenerations.get(platformId) || 0) === generation) feedback(`模型列表读取失败：${bridge.errorMessage(error)} 仍可手动填写模型 ID。`, true);
     }
-    finally { state.catalogLoading = false; publish(); }
+    finally {
+      state.refreshingPlatforms.delete(platformId); state.catalogLoading = false; publish();
+      // 设置更新时可能已跳过正在刷新的平台；旧请求结束后只补读新身份的本地缓存。
+      if ((state.platformGenerations.get(platformId) || 0) !== generation && platformId === state.options.platformId) loadCachedCatalog();
+    }
   }
 
   $("chat-platform").addEventListener("change", () => {
     state.options = { platformId: $("chat-platform").value, model: "", reasoningEffort: "default" };
     state.dirty = true; $("chat-model").value = ""; renderCatalog(); renderReasoning();
     feedback();
-    loadCapabilities(); persist().catch(() => {});
+    loadCapabilities(); loadCachedCatalog(); persist().catch(() => {});
   });
   $("chat-model").addEventListener("input", () => {
     state.options.model = $("chat-model").value.trim(); state.dirty = true;
@@ -197,6 +244,7 @@
       const id = event.detail.platform.id;
       state.platformGenerations.set(id, (state.platformGenerations.get(id) || 0) + 1);
       state.catalogs.delete(id);
+      state.catalogMetadata.delete(id);
       if (id === state.options.platformId) renderCatalog();
     }
     loadPlatforms();
@@ -220,7 +268,7 @@
         state.options = conversation ? options(conversation.modelOptions) : { ...DEFAULTS, platformId: state.defaultPlatformId }; state.dirty = false;
         $("chat-model").value = state.options.model;
       } else state.dirty = true;
-      renderPlatforms(); renderCatalog(); renderReasoning(); loadCapabilities(); publish();
+      renderPlatforms(); renderCatalog(); renderReasoning(); loadCapabilities(); loadCachedCatalog(); publish();
     },
   });
   loadPlatforms();

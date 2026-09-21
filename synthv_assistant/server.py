@@ -109,6 +109,9 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                         return
                     if path == "/api/model-platforms":
                         return self.settings_response(service.list_model_platforms)
+                    match = re.fullmatch(r"/api/model-platforms/(default|[0-9a-f]{32})/models", path)
+                    if match:
+                        return self.settings_response(service.cached_platform_models, match[1])
                     match = re.fullmatch(r"/api/model-platforms/(default|[0-9a-f]{32})", path)
                     if match:
                         return self.settings_response(service.get_model_platform, match[1])
@@ -229,6 +232,8 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                     return self.workbench_response(service.update_conversation_metadata, path.split("/")[3], args)
                 elif re.fullmatch(r"/api/conversations/[0-9a-f]{32}/model-options", path):
                     return self.workbench_response(service.update_conversation_model_options, path.split("/")[3], args)
+                elif re.fullmatch(r"/api/conversations/[0-9a-f]{32}/render-mode", path):
+                    return self.workbench_response(service.update_conversation_render_mode, path.split("/")[3], args)
                 elif re.fullmatch(r"/api/conversations/[0-9a-f]{32}/delete", path):
                     if args:
                         raise ValueError("移入回收站不接受额外字段。")
@@ -256,6 +261,10 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                     # 排队只返回任务编号；纯文字和音频请求都通过同一有界任务入口。
                     identifier = path.split("/")[3]
                     optional = [args["modelOptions"]] if "modelOptions" in args else []
+                    if "renderMode" in args:
+                        # 入队前验证，非法模式不能被 null 回退成默认，也不能触发付费请求。
+                        from .parameters import normalize_render_mode
+                        optional = [args.get("modelOptions"), normalize_render_mode(args["renderMode"])]
                     result = {"jobId": service.submit(service.send_message, identifier, args.get("text"),
                                                       args.get("includeSelection", True), args.get("attachments", []), *optional)}
                 elif re.fullmatch(r"/api/assistant/actions/[0-9a-f]{32}/(?:preview|apply)", path):

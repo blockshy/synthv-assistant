@@ -18,6 +18,13 @@ MAX_CURVE_POINTS = 64
 MAX_PREVIEW_POINTS = 256
 
 
+def normalize_render_mode(value="smooth") -> str:
+    """统一会话绘制偏好；仅接受明确的枚举，不能把 null 或布尔值当默认值。"""
+    if not isinstance(value, str) or value not in {"smooth", "points"}:
+        raise ParameterError("请选择绘制模式或控制点模式。")
+    return value
+
+
 class ParameterError(ValueError):
     """固定中文验证错误，绝不把模型原文、工程路径或密钥拼进异常。"""
 
@@ -236,6 +243,34 @@ def public_parameter_catalog(selection: dict) -> dict:
     return result
 
 
+def selection_preview_notes(selection: dict | None) -> list[dict]:
+    """提取不含歌词、文件路径或指纹的音符参考，时间使用宿主已换算的秒。
+
+    旧桥接可能没有音符秒坐标，此时省略参考层，不能以等宽方块冒充实际时值。
+    音符矩形只表示乐谱音高，绝不当作修改前的实际合成音高测量。
+    """
+    if not isinstance(selection, dict):
+        return []
+    start, end = selection.get("startSeconds"), selection.get("endSeconds")
+    notes, offset = selection.get("notes"), selection.get("groupPitchOffset", 0)
+    if (not finite(start, -1e9, 1e9) or not finite(end, -1e9, 1e9) or end <= start
+            or not finite(offset, -127, 127) or not isinstance(notes, list) or not 1 <= len(notes) <= 128):
+        return []
+    result = []
+    for note in notes:
+        if not isinstance(note, dict):
+            return []
+        onset, duration, pitch = note.get("onsetSeconds"), note.get("durationSeconds"), note.get("pitch")
+        if (not finite(onset, start - 1e-6, end) or not finite(duration, 0, end - start + 1e-6)
+                or duration <= 0 or onset + duration > end + 1e-6 or not finite(pitch, 0, 127)
+                or not 0 <= pitch + offset <= 127):
+            return []
+        result.append({"startPosition": max(0.0, (onset - start) / (end - start)),
+                       "endPosition": min(1.0, (onset + duration - start) / (end - start)),
+                       "pitch": float(pitch + offset)})
+    return sorted(result, key=lambda note: note["startPosition"])
+
+
 def public_preview(preview: object) -> dict:
     """公开宿主预览的有限字段；图形只接收最多 256 个数值样本。
 
@@ -245,6 +280,15 @@ def public_preview(preview: object) -> dict:
     if not isinstance(preview, dict) or not isinstance(preview.get("previewId"), str) or not 1 <= len(preview["previewId"]) <= 128:
         raise ParameterError("宿主没有返回有效的预览编号。")
     result = {"previewId": preview["previewId"]}
+    if "notes" in preview:
+        notes = preview["notes"]
+        if (not isinstance(notes, list) or len(notes) > 128 or any(
+                not isinstance(note, dict) or set(note) != {"startPosition", "endPosition", "pitch"}
+                or not finite(note.get("startPosition"), 0, 1) or not finite(note.get("endPosition"), 0, 1)
+                or note["startPosition"] >= note["endPosition"] or not finite(note.get("pitch"), 0, 127)
+                for note in notes)):
+            raise ParameterError("预览的音符参考资料无效。")
+        result["notes"] = [dict(note) for note in notes]
     for name in ("parameter", "renderMode", "representation", "unit", "label", "summary"):
         if name in preview:
             value = preview[name]

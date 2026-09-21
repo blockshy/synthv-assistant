@@ -151,7 +151,8 @@ class PlannerTests(unittest.TestCase):
         self.respond({"text": "根据选区结构建议这些变化，仍需试听。", "actions": actions})
         result = self.call()
         self.assertEqual(result["actions"][1]["curve"], actions[1]["curve"])
-        self.assertEqual(result["actions"][1]["renderMode"], "points")
+        # 会话当前默认绘制模式优先，模型自行写的 points 不能覆盖用户偏好。
+        self.assertEqual(result["actions"][1]["renderMode"], "smooth")
         self.assertNotIn("delta", result["actions"][1])
         del self.selection["parameters"]["vocalMode_Soft"]
         with self.assertRaises(planner.PlannerError):
@@ -171,8 +172,11 @@ class PlannerTests(unittest.TestCase):
 
     def test_native_pitch_uses_absolute_midi_without_claiming_audio_was_heard(self):
         self.selection.update(modern_selection())
+        self.selection["notes"] = [{"pitch": 48, "onsetSeconds": 1, "durationSeconds": 1},
+                                   {"pitch": 52, "onsetSeconds": 2, "durationSeconds": 1}]
         self.respond({"text": "可以逐点绘制选区内的有限趋势，依据仅为音符结构。",
-                      "actions": [{"parameter": "pitchCurve", "curve": [[0, 60], [1, 64]], "reason": "按工程音高规划。"}]})
+                      "actions": [{"parameter": "pitchCurve", "curve": [[0, 60], [0.49, 60], [0.51, 64], [1, 64]],
+                                   "reason": "按工程音高规划。"}]})
         result = self.call()
         self.assertEqual(result["actions"][0]["renderMode"], "smooth")
         self.assertIn("未提供音频", result["text"])
@@ -181,6 +185,38 @@ class PlannerTests(unittest.TestCase):
             self.respond({"text": text, "actions": []})
             with self.assertRaises(planner.PlannerError):
                 self.call()
+
+    def test_pitch_shape_compiles_before_action_validation_and_keeps_short_note(self):
+        """音符包络不能直接落入执行层；展开后每个短音符仍有正确的主体音高。"""
+        self.selection.update(modern_selection())
+        self.selection.update(startSeconds=1, endSeconds=3, notes=[
+            {"pitch": 48, "onsetSeconds": 1, "durationSeconds": 0.1},
+            {"pitch": 52, "onsetSeconds": 1.1, "durationSeconds": 1.9}])
+        self.respond({"text": "依据音符保持旋律，小幅调整起音和尾音。", "actions": [{
+            "parameter": "pitchCurve", "pitchShape": {"curve": [[0, -10], [0.3, 0], [1, -8]]}, "reason": "小幅变化。"}]})
+        action = self.call()["actions"][0]
+        self.assertNotIn("pitchShape", action)
+        self.assertGreater(len(action["curve"]), 4)
+        self.assertTrue(any(position < 0.05 and 59.5 <= value <= 60.5 for position, value in action["curve"]))
+        with self.assertRaises(planner.PlannerError):
+            self.call(render_mode="points")
+        self.respond({"text": "不合旋律的旧稀疏曲线。", "actions": [{
+            "parameter": "pitchCurve", "curve": [[0, 60], [1, 64]], "reason": "跨度内变化。"}]})
+        with self.assertRaises(planner.PlannerError):
+            self.call()
+
+    def test_conversation_render_mode_overrides_model_preference_without_changing_values(self):
+        self.selection.update(modern_selection())
+        self.respond({"text": "尝试有限偏移。", "actions": [{"parameter": "pitchDelta",
+            "curve": [[0, 0], [0.5, 20], [1, 0]], "renderMode": "smooth", "reason": "保留原音高轮廓。"}]})
+        self.assertEqual(self.call(render_mode="points")["actions"][0]["renderMode"], "points")
+        self.assertIn("本次会话绘制模式为 points", self.http.call_args.args[1]["messages"][0]["content"])
+        self.assertEqual(self.call(render_mode="smooth")["actions"][0]["renderMode"], "smooth")
+        for invalid in (None, True, "unknown"):
+            self.http.reset_mock()
+            with self.assertRaises(planner.PlannerError):
+                self.call(render_mode=invalid)
+            self.http.assert_not_called()
 
     def test_new_curves_require_capability_and_reject_hidden_commands_or_duplicate_parameters(self):
         curve_action = {"parameter": "tension", "curve": [[0, 0], [1, 0.1]], "reason": "平滑变化。"}

@@ -58,7 +58,7 @@
           <p id="chat-model-feedback" class="inline-feedback" role="status" aria-live="polite" hidden></p><p id="chat-model-capability" hidden></p>
           <div id="composer-attachments" class="composer-attachments" aria-label="本次消息的音频附件"></div>
           <label class="visually-hidden" for="chat-input">消息或调教目标</label><textarea id="chat-input" rows="3" maxlength="4000" placeholder="描述你的调教想法…" title="Enter 发送，Shift+Enter 换行" aria-describedby="send-scope"></textarea>
-          <div class="composer-controls"><div class="composer-options"><button id="attach-audio" class="icon-button" type="button" aria-controls="audio-library-dialog" data-ui-icon="plus" aria-label="选择音频附件" title="选择音频附件"></button><label class="selection-context-toggle"><input id="include-selection" type="checkbox" checked><span>附带当前选区</span></label></div><button id="send-message" class="send-message" type="submit" disabled><span>发送</span><span class="send-icon" aria-hidden="true" data-ui-icon="arrow-up"></span></button></div>
+          <div class="composer-controls"><div class="composer-options"><button id="attach-audio" class="icon-button" type="button" aria-controls="audio-library-dialog" data-ui-icon="plus" aria-label="选择音频附件" title="选择音频附件"></button><label class="selection-context-toggle"><input id="include-selection" type="checkbox" checked><span>附带当前选区</span></label><label class="composer-render-mode" for="chat-render-mode"><span class="visually-hidden">本次调教的曲线模式</span><select id="chat-render-mode" title="用于本次调教建议；先预览、再确认应用。原生音高使用绘制曲线，控制点模式使用音高偏移自动化。"><option value="smooth">绘制模式</option><option value="points">控制点模式</option></select></label></div><button id="send-message" class="send-message" type="submit" disabled><span>发送</span><span class="send-icon" aria-hidden="true" data-ui-icon="arrow-up"></span></button></div>
         </form>
         <div class="composer-caption"><span id="send-scope" hidden></span></div>
       </div>
@@ -143,7 +143,7 @@
                 <div class="curve-editor-heading"><h3 id="curve-editor-heading">曲线草稿</h3><span id="curve-point-count" class="small-badge">2 / 64 点</span></div>
                 <p id="curve-value-help" class="field-help"></p>
               <canvas id="curve-editor-canvas" class="curve-canvas curve-draft-canvas" role="img" aria-label="曲线草稿，可用指针绘制或通过下方数值点编辑；编辑草稿不会写入工程" aria-describedby="curve-draw-help"></canvas>
-                <p id="curve-draw-help" class="field-help">横轴为选区的 0%–100%。拖动画布绘制；键盘用户可编辑下方数值点。所有操作仅修改草稿。</p>
+                <p id="curve-draw-help" class="field-help">横轴显示选区时间，数值点仍使用 0–1 的位置比例。拖动画布绘制；键盘用户可编辑下方数值点。所有操作仅修改草稿。</p>
                 <label for="curve-points">数值点 · 每行“位置比例 值”<textarea id="curve-points" rows="5" maxlength="4096" spellcheck="false" aria-describedby="curve-points-help curve-editor-feedback">0 0.05&#10;1 0.05</textarea></label>
                 <p id="curve-points-help" class="field-help">2–64 点；位置范围 0–1，首尾必须是 0 和 1，位置严格递增。例如“0.5 0”表示选区中点。</p>
                 <button id="curve-reset" class="button button-quiet" type="button">重置曲线草稿</button>

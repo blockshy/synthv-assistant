@@ -4,7 +4,7 @@ import copy
 import unittest
 
 from synthv_assistant.parameters import (PARAMETER_LIMITS, ParameterError, public_parameter_catalog,
-                                         public_preview, validate_action, validate_change)
+                                         public_preview, validate_action, validate_change, selection_preview_notes)
 
 
 def modern_selection():
@@ -23,6 +23,23 @@ def modern_selection():
 class ParameterTests(unittest.TestCase):
     def setUp(self):
         self.selection = modern_selection()
+
+    def test_preview_notes_use_actual_seconds_and_transposition_without_private_fields(self):
+        """预览参考层只传乐谱时间及音高，不能泄漏歌词或把它伪装成 before 基频。"""
+        selection = {"startSeconds": 10, "endSeconds": 14, "groupPitchOffset": 12, "notes": [
+            {"pitch": 48, "onsetSeconds": 10, "durationSeconds": 0.5, "lyrics": "private"},
+            {"pitch": 52, "onsetSeconds": 12, "durationSeconds": 2}]}
+        notes = selection_preview_notes(selection)
+        self.assertEqual(notes, [{"startPosition": 0, "endPosition": 0.125, "pitch": 60},
+                                 {"startPosition": 0.5, "endPosition": 1, "pitch": 64}])
+        preview = public_preview({"previewId": "test", "notes": notes})
+        self.assertEqual(public_preview(preview), preview)
+        self.assertNotIn("before", preview)
+        self.assertEqual(selection_preview_notes(self.selection), [])
+        for invalid in ([{**notes[0], "lyrics": "private"}], [{**notes[0], "pitch": True}],
+                        [{**notes[0], "endPosition": 0}], [notes[0]] * 129):
+            with self.assertRaises(ParameterError):
+                public_preview({"previewId": "test", "notes": invalid})
 
     def test_legacy_delta_retains_original_shape_and_bounds(self):
         self.assertEqual(validate_change("tension", 0.1), {"parameter": "tension", "delta": 0.1})

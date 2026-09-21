@@ -3,6 +3,8 @@
 会话文件包含公开消息和私有动作指纹；只有字段白名单能够进入 HTTP 响应或
 模型上下文。动作必须经过 proposed → previewed → unknown → applied。
 unknown 在宿主写入前落盘，进程崩溃、超时或写后保存失败都不能触发重复应用。
+已确认 applied 的提案，仅在完整参数指纹证明撤销回到原状态后才能重新预览；
+重新应用仍需新的宿主预览及用户确认，不能直接复用旧 previewId。
 """
 
 from __future__ import annotations
@@ -21,7 +23,8 @@ from .bridge import BridgeError
 from .operations import BUSY_MESSAGE, OperationBusyError, OperationLock
 from .metadata import LibraryMetadata, MetadataError
 from .model_options import normalize_model_options, validate_for_config
-from .parameters import ParameterError, public_parameter_catalog, public_preview, validate_action
+from .parameters import (ParameterError, public_parameter_catalog, public_preview, validate_action,
+                         normalize_render_mode, selection_preview_notes)
 
 
 def _default_platform_id() -> str:
@@ -137,8 +140,9 @@ def _public_action(action: dict) -> dict:
 def _public_document(document: dict) -> dict:
     result = {key: document[key] for key in ("id", "title", "createdAt", "updatedAt")}
     result["modelOptions"] = normalize_model_options(document.get("modelOptions"))
+    result["renderMode"] = normalize_render_mode(document.get("renderMode", "smooth"))
     fields = {"id", "role", "text", "createdAt", "attachments", "inputMode", "provider", "model", "selection",
-              "platformId", "reasoningEffort", "reasoningSummary"}
+              "platformId", "reasoningEffort", "reasoningSummary", "renderMode"}
     result["messages"] = [{**{key: value for key, value in message.items() if key in fields},
                            "actions": [_public_action(action) for action in message.get("actions", [])]}
                           for message in document["messages"]]
@@ -272,7 +276,7 @@ class ConversationManager:
                 raise ConversationError("最多保留 200 个会话，请先整理会话存档。")
             now = _now()
             document = {"id": uuid.uuid4().hex, "title": title.strip(), "createdAt": now, "updatedAt": now,
-                        "messages": [], "_private": {"actions": {}},
+                        "messages": [], "_private": {"actions": {}}, "renderMode": "smooth",
                         "modelOptions": {"platformId": _default_platform_id(), "model": "",
                                          "reasoningEffort": "default"}}
             self._save(document)
@@ -299,6 +303,17 @@ class ConversationManager:
         with self._lock(_identifier(identifier)), self._lock():
             document = self._read(identifier)
             document["modelOptions"] = options
+            self._save(document)
+            return self._public(document)
+
+    def update_render_mode(self, identifier: str, payload: dict) -> dict:
+        """绘制模式属于当前会话；与发送共用锁，不能改变已开始规划的请求。"""
+        if not isinstance(payload, dict) or set(payload) != {"renderMode"}:
+            raise ConversationError("绘制设置只接受 renderMode 字段。")
+        mode = normalize_render_mode(payload["renderMode"])
+        with self._lock(_identifier(identifier)), self._lock():
+            document = self._read(identifier)
+            document["renderMode"] = mode
             self._save(document)
             return self._public(document)
 
@@ -367,7 +382,7 @@ class ConversationManager:
                 "attachments": [], "actions": [], **extra}
 
     def send_message(self, identifier: str, text: str, include_selection: bool, attachments: list,
-                     model_options=None, on_progress=None) -> dict:
+                     model_options=None, on_progress=None, render_mode=None) -> dict:
         identifier = _identifier(identifier)
         if not isinstance(text, str) or not 1 <= len(text.strip()) <= MAX_TEXT_CHARS:
             raise ConversationError("请输入 1 至 4000 个字符的调教要求。")
@@ -385,6 +400,8 @@ class ConversationManager:
         with self._lock(identifier), self.library.use_assets(attachments):
             # 本锁只阻止同一会话重复发送；模型等待期间其他会话和本地录音仍可进行。
             current = self._read(identifier)
+            # 模式是本次请求的快照；修改偏好不会重写历史提案的实际表示方式。
+            mode = normalize_render_mode(render_mode if render_mode is not None else current.get("renderMode", "smooth"))
             chosen = model_options if model_options is not None else current.get("modelOptions")
             options = normalize_model_options(chosen)
             if on_progress is not None:
@@ -406,6 +423,8 @@ class ConversationManager:
                 if not any(message["role"] == "user" for message in document["messages"]):
                     document["title"] = text[:40]
                 user = self._message("user", text, attachments=metadata)
+                document["renderMode"] = mode
+                user["renderMode"] = mode
                 if safe_selection is not None:
                     user["selection"] = safe_selection
                 document["messages"].append(user)
@@ -424,6 +443,8 @@ class ConversationManager:
 
             try:
                 extra = {}
+                if render_mode is not None or mode != "smooth":
+                    extra["render_mode"] = mode
                 if chosen is not None:
                     extra["model_options"] = options
                 if on_progress is not None:
@@ -501,10 +522,24 @@ class ConversationManager:
         raise ConversationError("调教提案不存在。")
 
     @staticmethod
-    def _check_guard(action: dict, guard: dict, selection: dict, session: str) -> None:
+    def _check_guard(action: dict, guard: dict, selection: dict, session: str, *, after_undo: bool = False) -> None:
         if session != guard.get("session") or _selection_identity(selection, session) != guard.get("selection"):
             raise ConversationError("桥接会话或目标选区已变化，请重新发送要求生成提案。")
+        if after_undo:
+            # 旧桥接只报告点数，无法分辨「已经撤销」与「同点数但不同数值」。
+            # 只有新桥接的完整曲线指纹可证明原状态；格式与 Lua fingerprint()
+            # 一致，为两个 32 位散列及序列化长度，拒绝 unavailable/oversized。
+            definition = selection.get("parameters", {}).get(action["parameter"], {})
+            capabilities = selection.get("capabilities", {})
+            fingerprint = definition.get("fingerprint") if isinstance(definition, dict) else None
+            if (not isinstance(capabilities, dict) or capabilities.get("curves") is not True
+                    or not isinstance(definition, dict) or definition.get("available") is not True
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{16}:[1-9][0-9]{0,11}", fingerprint) is None):
+                raise ConversationError("当前桥接缺少完整参数指纹，无法确认撤销结果；请更新桥接并重新生成提案。")
         if _parameter_identity(selection, action["parameter"]) != guard.get("parameter"):
+            if after_undo:
+                raise ConversationError("目标参数尚未恢复到本提案生成前的状态；请先撤销对应修改，再重新预览。若已继续编辑，请重新生成提案。")
             raise ConversationError("目标参数摘要已变化，请重新生成该参数的调教提案。")
         try:
             # 能力可能在连接期间变化；即使所有点数未变，也不能应用已不可用的操作。
@@ -518,10 +553,21 @@ class ConversationManager:
             documents, document, action, guard = self._find_action(action_id)
             with self._lock(document["id"]), self.service.operation_lock:
                 self.library.assert_available("conversation", document["id"])
-                if action["status"] not in {"proposed", "previewed"}:
-                    raise ConversationError("该提案已经应用或结果未知，不能重新预览或重复应用。")
+                if action["status"] == "unknown":
+                    raise ConversationError("该提案应用结果未知，不能重新预览或重复应用；请检查工程并重新生成提案。")
+                after_undo = action["status"] == "applied"
+                if after_undo and action.get("result", {}).get("verified") is not True:
+                    raise ConversationError("该提案缺少已确认的应用记录，不能重新执行；请检查工程并重新生成提案。")
                 selection, session = self._capture_selection()
-                self._check_guard(action, guard, selection, session)
+                self._check_guard(action, guard, selection, session, after_undo=after_undo)
+                if after_undo:
+                    # 宿主原生撤销和网页恢复都表现为完整原指纹重现。确认后先持久
+                    # 退回 proposed，并丢弃旧确认凭据；即使本次预览中断也只能重做
+                    # 只读预览。不能把 applied 直接解锁为可执行的旧 previewed。
+                    action["status"] = "proposed"
+                    action.pop("preview", None)
+                    action.pop("result", None)
+                    self._save(document)
                 # Lua 只保留最近一次预览；先清除所有旧确认入口，跨会话也不例外。
                 for other_document in documents:
                     changed = False
@@ -534,6 +580,11 @@ class ConversationManager:
                     if changed:
                         self._save(other_document)
                 try:
+                    if action["parameter"] == "pitchCurve":
+                        # 持久会话可能含旧版模型生成的粗略绝对音高，不能因为原指纹
+                        # 尚未变化就直接复用。重新逐音符核验后才允许请求只读预览。
+                        from .pitch_shapes import validate_note_alignment, validate_preview_note_alignment
+                        validate_note_alignment(action.get("curve"), selection)
                     if "curve" in action:
                         preview = self.service.preview(action["parameter"], curve=action["curve"],
                                                        render_mode=action.get("renderMode", "smooth"))
@@ -543,8 +594,12 @@ class ConversationManager:
                         # 不给旧增量补额外参数，保持现有 MCP、替身及桥接调用兼容。
                         preview = self.service.preview(action["parameter"], action["delta"])
                     current, current_session = self._capture_selection()
-                    self._check_guard(action, guard, current, current_session)
-                    preview = public_preview(preview)
+                    self._check_guard(action, guard, current, current_session, after_undo=after_undo)
+                    preview = public_preview({**preview, "notes": selection_preview_notes(current)})
+                    if action["parameter"] == "pitchCurve":
+                        # 原生宿主插值不保证等同于模型节点间的直线。仅比较宿主实际
+                        # 采样命中的音符主体，不重插值显示采样或虚构短音符测量结果。
+                        validate_preview_note_alignment(preview, current)
                 except ConversationError:
                     raise
                 except BridgeError as error:

@@ -6,25 +6,156 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import math
+import os
 import re
 import socket
 import time
+import uuid
+from datetime import datetime, timezone
 from urllib import error, request
 from urllib.parse import urlencode
 
+from .config import DATA
 from .platforms import get_model_platform_snapshot
 from .review import _NoRedirect
+from . import settings
 
 
 MAX_PAGES = 5
 MAX_MODELS = 500
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_REFRESH_SECONDS = 30.0
+MAX_CACHE_BYTES = 512 * 1024
+CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
 
 
 class ModelCatalogError(ValueError):
     """固定中文目录错误；不返回供应商响应体、认证头、密钥或完整请求地址。"""
+
+
+def _cache_path(identifier: str):
+    """缓存文件只采用已验证的平台编号，禁止输入影响本地保存目录。"""
+    if not isinstance(identifier, str) or not re.fullmatch(r"default|[0-9a-f]{32}", identifier):
+        raise ModelCatalogError("模型平台编号无效，请重新选择平台。")
+    return DATA / "model-catalogs" / (identifier + ".json")
+
+
+def _configuration_fingerprint(config: dict) -> str:
+    """只在内存中组合连接身份；保存前还需由当前用户 DPAPI 加密该摘要。
+
+    平台 ID、协议、地址或 API key 改变后，旧账户目录立即失效。名称、默认模型、
+    超时和其他平台的注册表版本不影响该目录，避免无关设置导致重复刷新。
+    """
+    identity = [config[name] for name in ("id", "provider", "base", "key")]
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _cache_result(config: dict, value: dict | None = None, *, unavailable: bool = False) -> dict:
+    """构造缓存公开视图；连接身份摘要和本地文件位置不进入 HTTP 响应。"""
+    if value is None:
+        return {"platformId": config["id"], "provider": config.get("provider"), "models": [],
+                "source": "none", "cacheHit": False, "cachedAt": None, "stale": False,
+                "ageSeconds": None, "pages": 0, "truncated": False,
+                "message": ("本地模型缓存不可用，可主动刷新或手动填写模型 ID。" if unavailable else
+                            "尚无当前平台配置的模型缓存，可主动刷新或手动填写模型 ID。")}
+    age = max(0, int(time.time() - value["savedAt"]))
+    stale = age >= CACHE_STALE_SECONDS
+    return {"platformId": config["id"], "provider": config["provider"], "models": value["models"],
+            "source": "cache", "cacheHit": True,
+            "cachedAt": datetime.fromtimestamp(value["savedAt"], timezone.utc).isoformat(),
+            "stale": stale, "ageSeconds": age, "pages": value["pages"], "truncated": value["truncated"],
+            "message": ("已复用本地模型目录；缓存超过 7 天，可按需主动刷新。" if stale else
+                        "已复用本地模型目录；刷新按钮可重新向供应商获取。")}
+
+
+def _save_cache(config: dict, result: dict) -> dict | None:
+    """原子保存已脱敏目录，失败不撤销本次成功获取，也不覆盖原缓存。
+
+    缓存只辅助选模型，不是账户设置；因此磁盘写入失败时仍允许使用本次目录。
+    请求使用的身份随缓存一起保存，配置更新期间返回的旧请求不能成为新配置缓存。
+    """
+    destination = _cache_path(config["id"])
+    temporary = destination.with_name("." + uuid.uuid4().hex + ".tmp")
+    try:
+        # 摘要本身也受 DPAPI 保护，避免缓存文件成为低熵兼容服务密钥的猜测验证器。
+        # 不提供明文回退；安全保存失败仅影响缓存，不影响已经获取的模型列表。
+        proof = settings._encrypt(_configuration_fingerprint(config).encode("ascii"))
+        value = {"version": 1, "platformId": config["id"], "configurationProof": base64.b64encode(proof).decode("ascii"),
+                 "savedAt": time.time(), "models": result["models"], "pages": result["pages"],
+                 "truncated": result["truncated"]}
+        raw = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if len(raw) > MAX_CACHE_BYTES:
+            return None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        return value
+    except (OSError, ValueError, TypeError):
+        return None
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def get_cached_platform_models(identifier: str) -> dict:
+    """只读本地目录；未命中、过期、损坏或配置变更都不会自动访问供应商。
+
+    超过七天仅作陈旧标记，仍可选择；是否刷新始终由用户决定。每次读取重新核对
+    连接身份，因此页面刷新、服务重启及不同会话可复用，改用其他账户不会混用目录。
+    """
+    config = get_model_platform_snapshot(identifier)
+    path = _cache_path(config["id"])
+    if (not config.get("configured") or config.get("invalid") or not config.get("key")
+            or config.get("provider") not in {"openai", "gemini"}):
+        return _cache_result(config)
+    try:
+        with path.open("rb") as source:
+            raw = source.read(MAX_CACHE_BYTES + 1)
+        if len(raw) > MAX_CACHE_BYTES:
+            raise ValueError
+        value = json.loads(raw)
+        required = {"version", "platformId", "configurationProof", "savedAt", "models", "pages", "truncated"}
+        if (not isinstance(value, dict) or set(value) != required or type(value["version"]) is not int
+                or value["version"] != 1 or value["platformId"] != config["id"]
+                or not isinstance(value["configurationProof"], str)
+                or len(value["configurationProof"]) > 8192):
+            return _cache_result(config)
+        fingerprint = settings._decrypt(base64.b64decode(value["configurationProof"], validate=True))
+        if fingerprint != _configuration_fingerprint(config).encode("ascii"):
+            return _cache_result(config)
+        if (type(value["savedAt"]) not in {int, float} or not math.isfinite(value["savedAt"])
+                or not 0 <= value["savedAt"] <= time.time() + 300
+                or type(value["pages"]) is not int or not 1 <= value["pages"] <= MAX_PAGES
+                or type(value["truncated"]) is not bool or not isinstance(value["models"], list)
+                or len(value["models"]) > MAX_MODELS):
+            raise ValueError
+        seen = set()
+        for item in value["models"]:
+            if not isinstance(item, dict) or set(item) != {"id", "label"}:
+                raise ValueError
+            # 缓存与供应商响应使用同一白名单，防止坏缓存插入任意 ID、控制符或密钥。
+            raw_item = ({"name": "models/" + str(item["id"]), "displayName": item["label"],
+                         "supportedGenerationMethods": ["generateContent"]} if config["provider"] == "gemini"
+                        else {"id": item["id"], "name": item["label"]})
+            checked = _model_entry(raw_item, config["provider"], config["key"])
+            if checked != item or item["id"] in seen:
+                raise ValueError
+            seen.add(item["id"])
+        return _cache_result(config, value)
+    except FileNotFoundError:
+        return _cache_result(config)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        return _cache_result(config, unavailable=True)
 
 
 def _get_json(url: str, headers: dict, timeout: float) -> dict:
@@ -135,8 +266,14 @@ def list_platform_models(identifier: str) -> dict:
                    "供应商未返回可选择的生成模型，请检查账户权限或手动填写模型 ID。")
         if truncated:
             message += " 已达到本地分页或数量限制，列表可能不完整。"
-        return {"platformId": config["id"], "models": models, "source": "api", "provider": provider,
-                "pages": pages, "truncated": truncated, "message": message}
+        result = {"platformId": config["id"], "models": models, "source": "api", "provider": provider,
+                  "pages": pages, "truncated": truncated, "message": message}
+        cached = _save_cache(config, result)
+        result.update(cachePersisted=cached is not None, stale=False,
+                      cachedAt=datetime.fromtimestamp(cached["savedAt"], timezone.utc).isoformat() if cached else None)
+        if cached is None:
+            result["message"] += " 本次目录已获取，但本地缓存未能保存；仍可使用当前列表。"
+        return result
     except ModelCatalogError:
         raise
     except error.HTTPError as exc:
