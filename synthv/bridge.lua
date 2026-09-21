@@ -376,6 +376,21 @@ local function preview(args)
   local endSec=axis:getSecondsFromBlick(finish+ref:getTimeOffset())
   if endSec<=startSec then error("选区持续时间必须大于零。") end
   if endSec-startSec>30 then error("一次最多调整30秒，请缩小选区。") end
+  -- 音符参考与候选曲线必须来自本次 preview 内同一次选区读取，不能依赖网页此前
+  -- 保存的选区。统一为按真实秒数排列的范围和含组移调的绝对 MIDI 音高；不公开
+  -- 歌词、音符索引、组名或工程路径。均匀增量与绘制曲线共享同一份图形数据。
+  local noteGuide={}
+  for _,note in ipairs(s.notes) do
+    local first=(note.onsetSeconds-startSec)/(endSec-startSec)
+    local last=(note.onsetSeconds+note.durationSeconds-startSec)/(endSec-startSec)
+    local pitch=note.pitch+s.groupPitchOffset
+    if not finite(first) or not finite(last) or first>=last or first < -0.000000001 or last > 1.000000001
+        or not finite(pitch) or pitch<0 or pitch>127 then
+      error("宿主无法将选中音符转换为有效的预览坐标。")
+    end
+    -- 首尾秒数的减法可能带来机器精度误差，仅消除边界处极小的浮点越界。
+    noteGuide[#noteGuide+1]={startPosition=math.max(0,first),endPosition=math.min(1,last),pitch=pitch}
+  end
   if name=="pitchCurve" then
     local native=NativePitch.preview(args,{group=group,ref=ref,axis=axis,selection=s,begin=begin,finish=finish,startSeconds=startSec,endSeconds=endSec})
     counter=counter+1; local id=session.."-"..counter
@@ -384,6 +399,7 @@ local function preview(args)
     result.previewId=id; result.parameter=name; result.renderMode="smooth"; result.representation="native-pitch-curve"
     result.label=descriptor.label; result.unit=descriptor.unit; result.noteCount=s.noteCount
     result.startSeconds=startSec; result.endSeconds=endSec; result.curve=args.curve; result.pointReduction=0
+    result.notes=noteGuide
     return result
   end
   local knots=checkedCurve(args,descriptor.maxDelta)
@@ -490,6 +506,21 @@ local function preview(args)
     local b=axis:getBlickFromSeconds(t)-ref:getTimeOffset()
     view[#view+1]={position=ratio,before=curve:get(b),after=candidate:get(b)}
   end
+  -- 图形中的节点必须来自候选克隆的真实读回结果，不能拿等距插值采样冒充控制点。
+  -- points 还保存着用于安全写入的整条参数曲线；公开预览只返回选区内的节点，
+  -- 不暴露区外素材。横坐标按实际秒数归一化，以匹配速度变化下的音符位置。
+  local controlPoints,previousPosition={},-1
+  for _,point in ipairs(points) do
+    if point[1]>=begin and point[1]<=finish then
+      local seconds=axis:getSecondsFromBlick(point[1]+ref:getTimeOffset())
+      local position=point[1]==begin and 0 or (point[1]==finish and 1 or (seconds-startSec)/(endSec-startSec))
+      if not finite(position) or position<0 or position>1 or position<=previousPosition then
+        error("宿主无法将真实控制点转换为有效的预览时间位置。")
+      end
+      controlPoints[#controlPoints+1]={position=position,value=point[2]}
+      previousPosition=position
+    end
+  end
   counter=counter+1; local id=session.."-"..counter
   -- 仅保留最近一次预览，避免长时间保留宿主对象及无界增长。
   previews={}
@@ -498,7 +529,7 @@ local function preview(args)
     summary="将在所选音符覆盖的连续时间段叠加参数曲线，边缘淡入淡出；尚未写入。",
     curve=knots,renderMode=renderMode,representation=renderMode=="smooth" and "automation-simplified" or "automation-points",
     label=descriptor.label,unit=descriptor.unit,beforePointCount=#original,pointCount=#points,
-    pointReduction=math.max(0,denseCount-#points),curvePreview=view,
+    pointReduction=math.max(0,denseCount-#points),curvePreview=view,controlPoints=controlPoints,notes=noteGuide,
     capabilityWarnings=clipped and {"部分目标值达到参数范围边界，预览已按宿主范围限制。"} or {}}
 end
 

@@ -216,6 +216,27 @@ class NativePitchLuaTests(unittest.TestCase):
         self.assertEqual(proposal["public"]["curvePreview"][49]["position"], 0.5)
         self.assertEqual(proposal["public"]["curvePreview"][49]["after"], 73)
 
+    def test_public_nodes_use_normalized_host_coordinates_and_ignore_external_controls(self):
+        """节点取宿主读回值，在变速和移调后仍按秒数与绝对 MIDI 对齐，区外控件不公开。"""
+        self.lua.execute('''
+host.timeOffset=5000; host.pitchOffset=12; host.variableTempo=true; host.quantize=true
+host.addFixture("point",500,55,nil,{private="保留的区外控件"})
+host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲线"})
+''')
+        inputs = [[0, 72.12345678], [0.5, 72.23456789], [1, 72.01234567]]
+        proposal = self.preview(self.request(inputs))
+        # 三条控件整体保留用于写入；显示节点仅来自当前选区中新建的一条曲线。
+        self.assertEqual(len(proposal["after"]["controls"]), 3)
+        row = proposal["after"]["controls"][2]["description"]
+        points = proposal["public"]["controlPoints"]
+        self.assertEqual(len(points), 3)
+        self.assertEqual(len(proposal["public"]["curvePreview"]), 97)
+        self.assertEqual([point["position"] for point in points.values()], [0, 0.5, 1])
+        for index, node in points.items():
+            self.assertEqual(node["value"], row["pitch"] + row["points"][index][2] + 12)
+        self.assertNotEqual(points[1]["value"], inputs[0][1])
+        self.assertEqual(self.host.mutations, 0)
+
     def test_public_preview_samples_actual_host_interpolation_and_each_interval(self):
         self.lua.execute('''
           host.nativeEvaluator=function(x,points)
@@ -707,6 +728,31 @@ class NativePitchBridgeTests(unittest.TestCase):
         enabled = self.call("write_mode", enabled=True, expectedProject="isolated-test.svp")
         self.assertTrue(enabled["ok"], enabled.get("error"))
         return result["result"]
+
+    def test_dispatch_native_preview_contains_notes_from_same_selection_with_transposition(self):
+        """原生曲线和音符参考在同一桥接预览中取得，实际秒数与移调语义保持一致。"""
+        self.lua.execute('''
+host.timeOffset=5000; host.pitchOffset=12; host.variableTempo=true
+local selected=SV:getMainEditor():getSelection()
+local function note(onset,pitch,index)
+  return {getOnset=function() return onset end,getDuration=function() return 500 end,
+    getPitch=function() return pitch end,getIndexInParent=function() return index end,
+    getLyrics=function() return "不得公开的歌词" end}
+end
+function selected:getSelectedNotes() return {note(1000,60,1),note(1500,64,2)} end
+''')
+        response = self.call("preview", parameter="pitchCurve", curve=[[0, 72], [0.5, 73], [1, 76]])
+        self.assertTrue(response["ok"], response.get("error"))
+        preview = response["result"]
+        notes = preview["notes"]
+        self.assertEqual([note["pitch"] for note in notes], [72, 76])
+        self.assertEqual(notes[0]["startPosition"], 0)
+        self.assertAlmostEqual(notes[0]["endPosition"], 2 / 3)
+        self.assertAlmostEqual(notes[1]["startPosition"], 2 / 3)
+        self.assertEqual(notes[1]["endPosition"], 1)
+        self.assertEqual(preview["controlPoints"][1], {"position": 0.5, "value": 73})
+        self.assertTrue(all(set(note) == {"startPosition", "endPosition", "pitch"} for note in notes))
+        self.assertEqual(self.host.mutations, 0)
 
     def test_dispatch_preview_apply_restore_preserve_original_and_consume_preview(self):
         self.lua.execute('host.addFixture("curve",1000,60,{{0,0},{1000,0}},{owner="fixture"})')

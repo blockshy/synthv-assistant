@@ -227,6 +227,84 @@ end, function() poll() end, function() return session end
         self.assertAlmostEqual(smooth["curvePreview"][48]["after"], 0.1)
         self.assertEqual(self.host.mutations, 0)
 
+    def test_preview_nodes_match_applied_points_without_external_points_or_resampling(self):
+        """真实节点与隔离宿主写后读回一一对应，变速、时间偏移和 float32 量化不改变契约。"""
+        self.lua.execute('''
+host.quantize=true
+local ref=SV:getMainEditor():getCurrentGroup()
+function ref:getTimeOffset() return 5000 end
+local axis=SV:getProject():getTimeAxis()
+function axis:getSecondsFromBlick(b)
+  if b<=6500 then return b/1000 end
+  return 6.5+(b-6500)/2000
+end
+function axis:getBlickFromSeconds(s)
+  if s<=6.5 then return s*1000 end
+  return 6500+(s-6.5)*2000
+end
+''')
+        self.enable()
+        for mode in ("smooth", "points"):
+            with self.subTest(mode=mode):
+                response = self.call("preview", parameter="tension", delta=0.100000001, renderMode=mode)
+                self.assertTrue(response["ok"], response.get("error"))
+                preview = response["result"]
+                nodes = preview["controlPoints"]
+                self.assertNotEqual(len(nodes), len(preview["curvePreview"]))
+                self.assertEqual(nodes[0]["position"], 0)
+                self.assertEqual(nodes[-1]["position"], 1)
+                self.assertTrue(self.call("apply", previewId=preview["previewId"])["ok"])
+                expected = []
+                for point in self.host.curve.points.values():
+                    blick, value = point[1], point[2]
+                    if 1000 <= blick <= 2000:
+                        absolute = blick + 5000
+                        seconds = absolute / 1000 if absolute <= 6500 else 6.5 + (absolute - 6500) / 2000
+                        expected.append({"position": (seconds - 6) / 0.75, "value": value})
+                self.assertEqual(len(nodes), len(expected))
+                for actual, target in zip(nodes, expected):
+                    # Lua JSON 编码以有限有效数字输出，允许序列化舍入，不允许坐标变换漂移。
+                    self.assertAlmostEqual(actual["position"], target["position"], places=13)
+                    self.assertAlmostEqual(actual["value"], target["value"], places=13)
+                # 完整写入快照另含两侧保护锚点和原区外节点，不能全部透传给图形。
+                self.assertEqual(preview["pointCount"] - len(nodes), 4)
+                self.assertTrue(self.call("restore")["ok"])
+
+    def test_uniform_preview_contains_live_pitched_notes_with_tempo_and_group_offsets(self):
+        """均匀增量也须自带本次宿主选区的音符坐标，不依赖调用者先读取选区。"""
+        self.lua.execute('''
+host.pitchOffset=12
+local ref=SV:getMainEditor():getCurrentGroup()
+function ref:getTimeOffset() return 5000 end
+local axis=SV:getProject():getTimeAxis()
+function axis:getSecondsFromBlick(b)
+  if b<=6500 then return b/1000 end
+  return 6.5+(b-6500)/2000
+end
+function axis:getBlickFromSeconds(s)
+  if s<=6.5 then return s*1000 end
+  return 6500+(s-6.5)*2000
+end
+local selected=SV:getMainEditor():getSelection()
+local function note(onset,pitch,index)
+  return {getOnset=function() return onset end,getDuration=function() return 500 end,
+    getPitch=function() return pitch end,getIndexInParent=function() return index end,
+    getLyrics=function() return "不得公开的歌词" end}
+end
+function selected:getSelectedNotes() return {note(1500,64,2),note(1000,60,1)} end
+''')
+        response = self.call("preview", parameter="tension", delta=0.1)
+        self.assertTrue(response["ok"], response.get("error"))
+        notes = response["result"]["notes"]
+        self.assertEqual(len(notes), 2)
+        self.assertEqual([note["pitch"] for note in notes], [72, 76])
+        self.assertEqual(notes[0]["startPosition"], 0)
+        self.assertAlmostEqual(notes[0]["endPosition"], 2 / 3)
+        self.assertAlmostEqual(notes[1]["startPosition"], 2 / 3)
+        self.assertEqual(notes[1]["endPosition"], 1)
+        self.assertTrue(all(set(note) == {"startPosition", "endPosition", "pitch"} for note in notes))
+        self.assertEqual(self.host.mutations, 0)
+
     def test_cubic_flat_baseline_has_zero_external_drift(self):
         """成对边缘锚点允许三次曲线中的平直片段生成稀疏预览，并守住选区外基线。"""
         self.host.method = "Cubic"

@@ -68,11 +68,12 @@ const drawings = [];
 function element(tag) {
   const element = {tag, children:[], dataset:{}, attrs:{}, isConnected:true,
     classList:{toggle(){}}, append(...items){this.children.push(...items);},
-    setAttribute(name,value){this.attrs[name]=value;}, getBoundingClientRect:()=>({width:480})};
+    setAttribute(name,value){this.attrs[name]=value;}, getAttribute(name){return this.attrs[name];}, getBoundingClientRect:()=>({width:480})};
   if (tag === 'canvas') {
-    const recording = {rects:[], texts:[], lines:[], path:[]}; drawings.push(recording);
+    const recording = {rects:[], notes:[], circles:[], texts:[], lines:[], path:[]}; drawings.push(recording);
     element.getContext = () => ({scale(){}, clearRect(){}, save(){}, restore(){}, rect(){}, clip(){},
-      setLineDash(){}, fillRect(...r){recording.rects.push(r);}, strokeRect(){},
+      setLineDash(){}, fillRect(...r){recording.rects.push(r);}, strokeRect(...r){recording.notes.push(r);},
+      arc(...circle){recording.circles.push(circle);},fill(){},
       fillText(text){recording.texts.push(text);}, beginPath(){recording.path=[];},
       moveTo(...p){recording.path.push(p);}, lineTo(...p){recording.path.push(p);},
       stroke(){recording.lines.push(recording.path.slice());}});
@@ -92,19 +93,31 @@ assert.match(figure.children[0].attrs['aria-label'],/2 个乐谱音符/);
 assert.match(figure.children[1].textContent,/未提供原曲线/);
 assert.match(figure.children[1].textContent,/不代表实际演唱音高/);
 const draw=drawings[0];
-assert.equal(draw.rects.length,2);
-assert.equal(draw.rects[0][0],54); // 原生 MIDI 轴留出音名和数值的空间。
-assert.equal(draw.rects[0][0]+draw.rects[0][2],draw.rects[1][0]);
-assert(draw.rects[0][1]>draw.rects[1][1]); // 高音符显示在低音符上方。
+assert.equal(draw.notes.length,2);
+assert.equal(draw.notes[0][0],64); // 键盘与曲线统一留出音名的空间。
+assert.equal(draw.notes[0][0]+draw.notes[0][2],draw.notes[1][0]);
+assert(draw.notes[0][1]>draw.notes[1][1]); // 高音符显示在低音符上方。
+assert(draw.texts.includes('C4') && draw.texts.includes('D4'));
 assert(draw.texts.includes('10 s') && draw.texts.includes('12 s'));
 assert(draw.lines.some(line=>line.length===0)); // 未知前值保持空路径，未补出零线。
 assert.equal(figure.children[2].children[1].children.length,2);
 const legacy = context.window.SynthVCurves.createPreview({...preview,notes:undefined});
-assert.equal(drawings[1].rects.length,0);
+assert.equal(drawings[1].notes.length,0);
 assert.match(legacy.children[1].textContent,/未提供音符位置/);
-const automation = context.window.SynthVCurves.createPreview({...preview,parameter:'pitchDelta',unit:'音分',curvePreview:[{position:0,before:0,after:10},{position:1,before:0,after:10}]});
-assert.match(automation.children[1].textContent,/单独显示在时间条/);
-assert(drawings[2].rects.every(rect=>rect[1]===20));
+const automation = context.window.SynthVCurves.createPreview({...preview,parameter:'pitchDelta',unit:'音分',renderMode:'points',
+  controlPoints:[{position:0,value:10},{position:.37,value:10},{position:1,value:10}],
+  curvePreview:[{position:0,before:0,after:10},{position:1,before:0,after:10}]});
+assert.match(automation.children[1].textContent,/共用时间轴/);
+assert(drawings[2].notes[0][1]>drawings[2].notes[1][1]); // pitchDelta 不能再把不同音高压成一行。
+assert.equal(drawings[2].circles.length,3); // 三个真实节点，不能画成两个显示采样点。
+assert.equal(drawings[2].circles[0][0],drawings[2].notes[0][0]);
+assert(Math.abs(drawings[2].circles[1][0]-(64+.37*(480-12-64)))<1e-9);
+assert(drawings[2].circles.every(circle=>circle[1]>drawings[2].notes[0][1]+drawings[2].notes[0][3]));
+const oldPoints = context.window.SynthVCurves.createPreview({...preview,parameter:'tension',renderMode:'points'});
+assert.equal(drawings[3].circles.length,0);
+assert.match(oldPoints.children[1].textContent,/未提供实际控制点/);
+const smooth = context.window.SynthVCurves.createPreview({...preview,controlPoints:[{position:.5,value:61}],renderMode:'smooth'});
+assert.equal(drawings[4].circles.length,0); // 绘制模式保持连续线条，不伪装成控制点模式。
 """)
 
 

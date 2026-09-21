@@ -68,6 +68,15 @@ class BridgeTests(unittest.TestCase):
                     self.client.call("preview")
                 self.assertIsNone(raised.exception.public_message)
 
+    def test_public_preview_coordinate_failures_keep_fixed_help_without_private_prefix(self):
+        """新增可视化坐标失败可明确提示，宿主路径及额外动态文本仍不得透传。"""
+        for message in ("宿主无法将真实控制点转换为有效的预览时间位置。",
+                        "宿主无法将原生音高节点转换为有效的预览时间位置。",
+                        "宿主无法将选中音符转换为有效的预览坐标。"):
+            with self.subTest(message=message):
+                self.assertEqual(BridgeError("private.lua:410: " + message).public_message, message)
+                self.assertIsNone(BridgeError(message + " private-project").public_message)
+
     def test_existing_client_lock_blocks_second_client_without_removing_lock(self):
         lock = self.directory / "client.lock"
         lock.write_text("another-client", encoding="utf-8")

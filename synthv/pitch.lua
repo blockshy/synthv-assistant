@@ -496,6 +496,22 @@ function M.preview(args, ctx)
     end
     previewRows[#previewRows+1]={position=fraction,after=sampledPitch(position)}
   end
+  -- 节点标记取自宿主规范化后的曲线描述，不能使用模型原始输入或 97 个插值采样。
+  -- 横坐标把曲线锚点、节点偏移和组时间偏移换算为实际秒数；纵坐标将锚点音高、
+  -- 节点相对音高与组移调相加一次，得到可与钢琴卷帘音符直接对齐的绝对 MIDI。
+  -- 仅公开此次新建曲线的节点；保留在选区外的原生控件不属于本次预览的可视范围。
+  local controlPoints,previousPosition={},-1
+  for _,point in ipairs(row.points) do
+    local groupPosition=row.position+point[1]
+    local seconds=invoke(ctx.axis,"getSecondsFromBlick",groupPosition+timeOffset)
+    local position=groupPosition==ctx.begin and 0 or (groupPosition==ctx.finish and 1
+      or (seconds-ctx.startSeconds)/(ctx.endSeconds-ctx.startSeconds))
+    if not finite(position) or position<0 or position>1 or position<=previousPosition then
+      fail("宿主无法将原生音高节点转换为有效的预览时间位置。")
+    end
+    controlPoints[#controlPoints+1]={position=position,value=row.pitch+point[2]+transpose}
+    previousPosition=position
+  end
   kept[#kept+1]=added
   -- Lua table.sort 非稳定；显式保留同锚点旧控件的相对顺序，写后再次核对宿主顺序。
   local indices={}; for index,entry in ipairs(kept) do indices[entry]=index end
@@ -508,7 +524,7 @@ function M.preview(args, ctx)
   return {before=before,after=after,public={parameter="pitchCurve",renderMode="smooth",noteCount=noteCount,
     startSeconds=ctx.startSeconds,endSeconds=ctx.endSeconds,beforePointCount=before.pointCount,
     pointCount=after.pointCount,controlCount=#after.controls,
-    replacedControlCount=replaced,pitchRange={low,high},curvePreview=previewRows,beforeAvailable=false,
+    replacedControlCount=replaced,pitchRange={low,high},curvePreview=previewRows,controlPoints=controlPoints,beforeAvailable=false,
     summary="将按绝对MIDI音高写入连续原生曲线，替换完全位于选区内的原生曲线；已采样核验宿主插值，未读取生成音高作为基线，尚未写入。"}}
 end
 

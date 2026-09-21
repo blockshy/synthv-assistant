@@ -167,6 +167,33 @@ class ParameterTests(unittest.TestCase):
             with self.subTest(fields=list(bad)), self.assertRaises(ParameterError):
                 public_preview({**copy.deepcopy(source), **bad})
 
+    def test_public_preview_keeps_real_nodes_separate_and_is_backward_compatible(self):
+        """真实节点保留自己的位置和单位；二次白名单过滤不丢点，也不为旧桥接补造节点。"""
+        legacy = {"previewId": "test", "curvePreview": [{"position": 0, "after": 60}]}
+        self.assertNotIn("controlPoints", public_preview(legacy))
+        source = {**legacy, "controlPoints": [{"position": 0.125, "value": 60.25},
+                                               {"position": 0.625, "value": 61.5}]}
+        public = public_preview(source)
+        self.assertEqual(public["controlPoints"], source["controlPoints"])
+        self.assertEqual(public_preview(public), public)
+        # 控制点和曲线采样采用不同上限，不能误用 256 点采样限制截掉真实节点。
+        boundary = [{"position": index / 3999, "value": 0.1} for index in range(4000)]
+        self.assertEqual(len(public_preview({**legacy, "controlPoints": boundary})["controlPoints"]), 4000)
+
+    def test_public_preview_rejects_invalid_real_nodes_without_partial_output(self):
+        """重复、倒序、越界、非有限值、未知字段及超量节点均整体拒绝。"""
+        invalid = [None, {}, [{"position": 0, "value": True}],
+                   [{"position": True, "value": 1}], [{"position": -0.1, "value": 1}],
+                   [{"position": 1.1, "value": 1}], [{"position": 0, "value": float("nan")}],
+                   [{"position": 0, "value": float("inf")}],
+                   [{"position": 0, "value": 1, "path": "private-path"}],
+                   [{"position": 0, "value": 1}, {"position": 0, "value": 2}],
+                   [{"position": 0.7, "value": 1}, {"position": 0.3, "value": 2}],
+                   [{"position": index / 4000, "value": 0} for index in range(4001)]]
+        for index, points in enumerate(invalid):
+            with self.subTest(case=index), self.assertRaises(ParameterError):
+                public_preview({"previewId": "test", "controlPoints": points})
+
 
 if __name__ == "__main__":
     unittest.main()

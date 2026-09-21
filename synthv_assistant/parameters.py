@@ -16,6 +16,7 @@ PARAMETER_LIMITS = {"breathiness": 0.3, "tension": 0.3, "gender": 0.3,
                     "vibratoEnv": 0.3}
 MAX_CURVE_POINTS = 64
 MAX_PREVIEW_POINTS = 256
+MAX_PREVIEW_CONTROL_POINTS = 4000
 
 
 def normalize_render_mode(value="smooth") -> str:
@@ -272,9 +273,11 @@ def selection_preview_notes(selection: dict | None) -> list[dict]:
 
 
 def public_preview(preview: object) -> dict:
-    """公开宿主预览的有限字段；图形只接收最多 256 个数值样本。
+    """公开宿主预览的有限字段；采样和真实控制点采用独立的数量限制。
 
     before 为 null 表示宿主没有可靠取得修改前的原生音高，不补造测量数据。
+    controlPoints 为可选字段，仅含选区内经过宿主读回的候选节点，最多 4000 个；
+    它与最多 256 个 curvePreview 插值样本不可混用，旧桥接缺省时不伪造节点。
     畸形曲线整体拒绝，防止界面显示看似有效的预览却确认了不同内容。
     """
     if not isinstance(preview, dict) or not isinstance(preview.get("previewId"), str) or not 1 <= len(preview["previewId"]) <= 128:
@@ -331,6 +334,22 @@ def public_preview(preview: object) -> dict:
             previous = float(sample["position"])
             checked.append({"position": previous, "before": sample.get("before"), "after": sample["after"]})
         result["curvePreview"] = checked
+    if "controlPoints" in preview:
+        # 单独白名单化真实候选节点，禁止透传原始宿主对象、脚本元数据或区外控制点。
+        # position 统一为选区实际秒数的比例；value 保留参数单位，原生音高为绝对 MIDI。
+        points = preview["controlPoints"]
+        if not isinstance(points, list) or len(points) > MAX_PREVIEW_CONTROL_POINTS:
+            raise ParameterError("宿主预览的真实控制点超过允许上限。")
+        checked_points = []
+        previous = -1.0
+        for point in points:
+            if (not isinstance(point, dict) or set(point) != {"position", "value"}
+                    or not finite(point["position"], 0, 1) or point["position"] <= previous
+                    or not finite(point["value"], -1_000_000, 1_000_000)):
+                raise ParameterError("宿主预览包含无效的真实控制点。")
+            previous = float(point["position"])
+            checked_points.append({"position": previous, "value": float(point["value"])})
+        result["controlPoints"] = checked_points
     if "capabilityWarnings" in preview:
         warnings = preview["capabilityWarnings"]
         if (not isinstance(warnings, list) or len(warnings) > 16

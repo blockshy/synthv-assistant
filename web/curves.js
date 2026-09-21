@@ -141,50 +141,96 @@
     return [...keep].sort((a, b) => a - b).map((index) => points[index]);
   }
 
-  /** 使用主题绘制实际采样；音符矩形是乐谱参考，不补作未提供的演唱音高基线。 */
+  /** 所有参数共用时间轴；乐谱始终采用 MIDI，非音高参数另设原生单位轨道。 */
+  function chartGeometry(width, range, notes, pitch) {
+    const hasNotes = notes.length > 0, split = hasNotes && !pitch;
+    const height = split ? 440 : hasNotes || pitch ? 320 : 180;
+    const left = hasNotes || pitch ? 64 : 46, right = Math.max(left + 1, width - 12);
+    let roll = null;
+    if (hasNotes || pitch) {
+      const values = notes.map((note) => note.pitch);
+      if (pitch) values.push(...range);
+      let low = Math.max(0, Math.floor(Math.min(...values)) - 1);
+      let high = Math.min(127, Math.ceil(Math.max(...values)) + 1);
+      // 至少展示八个半音行，避免小音程选区里的音符块被拉成半张图。
+      if (high - low < 7) { low = Math.max(0, low - Math.ceil((7 - high + low) / 2)); high = Math.min(127, low + 7); low = Math.max(0, high - 7); }
+      roll = { left, right, top: 24, bottom: split ? 252 : height - 30, range: [low - .5, high + .5] };
+    }
+    const parameter = pitch ? roll : { left, right, top: split ? 286 : 24, bottom: height - 30, range };
+    return { height, roll, parameter, split };
+  }
+
+  /**
+   * 钢琴卷帘先画半音行和键盘，再按实际音高安放音符。原生绝对音高与音符共轴；
+   * 气声、声线、pitchDelta 等参数在下轨使用自己的单位，不把音分相加冒充合成基频。
+   * 连线来自宿主采样；圆点只来自候选实际节点，不能把等距显示采样当成控制点。
+   */
   function plot(canvas, series, range, unit, context = {}) {
     const width = Math.round(canvas.getBoundingClientRect().width);
-    if (!width) return;
-    const notes = context.notes || [], pitch = Boolean(context.pitch), noteLane = notes.length > 0 && !pitch;
-    const height = notes.length ? 240 : 180, scale = window.devicePixelRatio || 1;
-    canvas.classList.toggle("curve-with-notes", Boolean(notes.length));
+    if (!width) return null;
+    const notes = context.notes || [], pitch = Boolean(context.pitch);
+    const geometry = chartGeometry(width, range, notes, pitch), { roll, parameter: bounds, split, height } = geometry;
+    canvas.classList.toggle("curve-with-notes", Boolean(roll));
+    canvas.classList.toggle("curve-parameter-lanes", split);
+    const scale = window.devicePixelRatio || 1;
     canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale);
     const ctx = canvas.getContext("2d"); ctx.scale(scale, scale);
-    const css = getComputedStyle(document.documentElement);
-    const color = (name) => css.getPropertyValue(name).trim();
-    const bounds = { left: pitch ? 54 : 42, right: width - 12, top: noteLane ? 68 : 18, bottom: height - 28 };
-    const span = range[1] - range[0] || 1;
+    const css = getComputedStyle(document.documentElement), color = (name) => css.getPropertyValue(name).trim();
     const x = (position) => bounds.left + position * (bounds.right - bounds.left);
-    const y = (value) => bounds.bottom - (value - range[0]) / span * (bounds.bottom - bounds.top);
+    const y = (value, track = bounds) => track.bottom - (value - track.range[0]) / (track.range[1] - track.range[0] || 1) * (track.bottom - track.top);
     ctx.clearRect(0, 0, width, height); ctx.font = "10px Segoe UI, sans-serif";
-    ctx.textAlign = "right"; ctx.textBaseline = "middle";
-    // MIDI 轴按整半音绘制，音符跨度较大时跳过部分刻度，但不改变曲线或矩形的实际坐标。
-    const ticks = pitch ? Array.from({ length: Math.floor(range[1]) - Math.ceil(range[0]) + 1 }, (_, index) => Math.ceil(range[0]) + index).filter((_, index) => index % Math.max(1, Math.ceil(span / 7)) === 0)
-      : Array.from({ length: 5 }, (_, index) => range[0] + span * index / 4);
-    for (const value of ticks) {
-      const at = y(value);
-      ctx.strokeStyle = color("--border"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(bounds.left, at); ctx.lineTo(bounds.right, at); ctx.stroke();
-      ctx.fillStyle = color("--subtle"); ctx.fillText(pitch ? `${pitchName(value)} ${value}` : format(value), bounds.left - 6, at);
-    }
-    // 原生音高直接与 MIDI 矩形共轴；其他参数单独展示乐谱时间条，避免把音符 pitch 当参数值。
-    for (const note of notes) {
-      const left = x(note.startPosition), right = x(note.endPosition);
-      const noteHeight = pitch ? Math.max(3, .7 / span * (bounds.bottom - bounds.top)) : 24;
-      const top = pitch ? y(note.pitch) - noteHeight / 2 : 20;
-      ctx.fillStyle = color("--surface-selected"); ctx.strokeStyle = color("--border-strong"); ctx.lineWidth = 1;
-      ctx.fillRect(left, top, Math.max(1, right - left), noteHeight); ctx.strokeRect(left, top, Math.max(1, right - left), noteHeight);
-      if (right - left > 24 && (!pitch || noteHeight > 10)) {
-        ctx.save(); ctx.beginPath(); ctx.rect(left + 3, top, Math.max(0, right - left - 6), noteHeight); ctx.clip();
-        ctx.fillStyle = color("--muted"); ctx.textAlign = "left"; ctx.textBaseline = "middle";
-        ctx.fillText(`${pitchName(note.pitch)} · ${format(note.pitch)}`, left + 4, top + noteHeight / 2); ctx.restore();
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    if (roll) {
+      const rowHeight = (roll.bottom - roll.top) / (roll.range[1] - roll.range[0]);
+      for (let midi = Math.ceil(roll.range[0]); midi <= Math.floor(roll.range[1]); midi++) {
+        const top = y(midi + .5, roll), black = [1, 3, 6, 8, 10].includes(midi % 12);
+        // 键盘、半音背景均使用主题语义色；C 音行加强分界，窄轨也能读出音程方向。
+        ctx.fillStyle = color(black ? "--panel-raised" : "--panel");
+        ctx.fillRect(roll.left, top, roll.right - roll.left, rowHeight);
+        ctx.fillStyle = color(black ? "--surface-selected" : "--input");
+        ctx.fillRect(4, top, black ? roll.left - 16 : roll.left - 6, rowHeight);
+        ctx.strokeStyle = color(midi % 12 === 0 ? "--border-strong" : "--border");
+        ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(4, top); ctx.lineTo(roll.right, top); ctx.stroke();
+        if (rowHeight >= 12 || midi % 12 === 0) {
+          ctx.fillStyle = color("--muted"); ctx.fillText(pitchName(midi), 8, top + rowHeight / 2);
+        }
+      }
+      for (const note of notes) {
+        const left = x(note.startPosition), right = x(note.endPosition), top = y(note.pitch, roll) - rowHeight * .38;
+        const noteHeight = Math.max(2, rowHeight * .76);
+        ctx.fillStyle = color("--surface-selected"); ctx.strokeStyle = color("--border-strong");
+        ctx.fillRect(left, top, Math.max(1, right - left), noteHeight);
+        ctx.strokeRect(left, top, Math.max(1, right - left), noteHeight);
+        if (right - left > 30 && noteHeight >= 12) {
+          ctx.save(); ctx.beginPath(); ctx.rect(left + 2, top, Math.max(0, right - left - 4), noteHeight); ctx.clip();
+          ctx.fillStyle = color("--text"); ctx.fillText(pitchName(note.pitch), left + 5, top + noteHeight / 2); ctx.restore();
+        }
       }
     }
+    if (!pitch) {
+      ctx.textAlign = "right";
+      for (let index = 0; index <= 4; index++) {
+        const value = bounds.range[0] + (bounds.range[1] - bounds.range[0]) * index / 4, at = y(value);
+        ctx.strokeStyle = color("--border"); ctx.beginPath(); ctx.moveTo(bounds.left, at); ctx.lineTo(bounds.right, at); ctx.stroke();
+        ctx.fillStyle = color("--subtle"); ctx.fillText(format(value), bounds.left - 6, at);
+      }
+    }
+    // 两个轨道使用完全相同的 x 映射；时间网格贯穿各轨，但不跨越标题间隔。
     const hasTime = finite(context.startSeconds) && finite(context.endSeconds) && context.endSeconds > context.startSeconds;
-    ctx.fillStyle = color("--subtle"); ctx.textBaseline = "top"; ctx.textAlign = "left";
-    ctx.fillText(hasTime ? `${format(context.startSeconds)} s` : "0%", bounds.left, bounds.bottom + 8);
-    ctx.textAlign = "right"; ctx.fillText(hasTime ? `${format(context.endSeconds)} s` : "100%", bounds.right, bounds.bottom + 8);
-    ctx.textAlign = "left"; ctx.fillText(noteLane ? "选区音符（乐谱）" : unit || "参数值", bounds.left, 2);
-    if (noteLane) ctx.fillText(unit || "参数值", bounds.left, 52);
+    const divisions = width < 360 ? 2 : 4;
+    for (let index = 0; index <= divisions; index++) {
+      const position = index / divisions, at = x(position);
+      ctx.strokeStyle = color("--border"); ctx.setLineDash([2, 4]);
+      for (const track of split ? [roll, bounds] : [bounds]) { ctx.beginPath(); ctx.moveTo(at, track.top); ctx.lineTo(at, track.bottom); ctx.stroke(); }
+      ctx.setLineDash([]); ctx.fillStyle = color("--subtle"); ctx.textBaseline = "top";
+      ctx.textAlign = index === 0 ? "left" : index === divisions ? "right" : "center";
+      ctx.fillText(hasTime ? `${format(context.startSeconds + position * (context.endSeconds - context.startSeconds))} s` : `${Math.round(position * 100)}%`, at, bounds.bottom + 8);
+    }
+    ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.fillStyle = color("--muted");
+    ctx.fillText(roll ? pitch ? "音符与原生音高 · MIDI" : "选区音符 · MIDI" : unit || "参数值", bounds.left, 4);
+    if (split) ctx.fillText(`${context.label || "参数曲线"} · ${unit || "参数值"}`, bounds.left, bounds.top - 20);
+    // 曲线和节点裁剪在各自数值轨中，避免误画到钢琴键或相邻参数轨。
+    ctx.save(); ctx.beginPath(); ctx.rect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top); ctx.clip();
     for (const line of series) {
       ctx.strokeStyle = color(line.before ? "--waveform-b" : "--waveform-a"); ctx.lineWidth = line.before ? 1.5 : 2;
       ctx.setLineDash(line.before ? [4, 4] : []); ctx.beginPath(); let begun = false;
@@ -194,7 +240,14 @@
       }
       ctx.stroke(); ctx.setLineDash([]);
     }
-    return bounds;
+    if (context.showPoints && Array.isArray(context.controlPoints)) {
+      ctx.fillStyle = color("--panel"); ctx.strokeStyle = color("--waveform-a"); ctx.lineWidth = 1.5;
+      for (const point of context.controlPoints) {
+        ctx.beginPath(); ctx.arc(x(point.position), y(point.value), 2.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
+    }
+    ctx.restore();
+    return geometry;
   }
 
   function representation(value, renderMode) {
@@ -209,6 +262,10 @@
     const figure = node("figure", "curve-preview-figure"), canvas = node("canvas", "curve-canvas curve-preview-canvas");
     const hasBefore = points.some((item) => finite(item.before));
     const values = points.flatMap((item) => finite(item.before) ? [item.before, item.after] : [item.after]);
+    const controlPoints = Array.isArray(preview.controlPoints) ? preview.controlPoints.filter((point) =>
+      finite(point?.position) && point.position >= 0 && point.position <= 1 && finite(point?.value)) : null;
+    const showPoints = preview.renderMode === "points" || preview.representation === "automation-points";
+    if (controlPoints) values.push(...controlPoints.map((point) => point.value));
     const notes = previewNotes(preview.notes), pitch = preview.parameter === "pitchCurve" || preview.kind === "pitch" || preview.representation === "native-pitch-curve";
     if (pitch) values.push(...notes.map((note) => note.pitch));
     let low = Math.min(...values), high = Math.max(...values);
@@ -216,9 +273,13 @@
     const unit = preview.unit || "参数值";
     canvas.dataset.curvePreview = "true"; canvas.setAttribute("role", "img");
     canvas.setAttribute("aria-label", `宿主曲线预览，${hasBefore ? "虚线为调整前，实线为调整后" : "仅展示调整后，原曲线未提供"}。${notes.length ? `包含 ${notes.length} 个乐谱音符矩形。` : ""}调整后起点 ${format(points[0].after)}，终点 ${format(points.at(-1).after)} ${unit}。完整数值见预览明细。`);
-    previewData.set(canvas, { points, range: [low, high], unit, notes, pitch, startSeconds: preview.startSeconds, endSeconds: preview.endSeconds });
+    previewData.set(canvas, { points, range: [low, high], unit, notes, pitch, label: preview.label,
+      controlPoints, showPoints, startSeconds: preview.startSeconds, endSeconds: preview.endSeconds });
     // 同一预览也会留在已应用的历史建议卡中，不用“尚未写入”覆盖真实操作状态。
-    figure.append(canvas, node("figcaption", "field-help", `${hasBefore ? "宿主预览快照：虚线为调整前，实线为调整后。" : "宿主预览快照：实线为调整后；未提供原曲线。"}${notes.length ? `矩形为 ${notes.length} 个选区乐谱音符${pitch ? "，与曲线共用 MIDI 坐标" : "，单独显示在时间条"}，不代表实际演唱音高。` : "此预览未提供音符位置。"}应用状态见操作提示。`));
+    const pointsNote = showPoints ? controlPoints ? `圆点为选区内 ${controlPoints.length} 个宿主实际控制点。`
+      : "此预览未提供实际控制点；使用新版桥接生成新预览后可显示节点。" : "";
+    figure.append(canvas, node("figcaption", "field-help", `${hasBefore ? "虚线为调整前，实线为调整后。" : "实线为调整后；未提供原曲线。"}${pointsNote}${notes.length ? `矩形为 ${notes.length} 个按音高排列的乐谱音符${pitch ? "，与曲线共用 MIDI 坐标" : "；下方参数轨与上方音符共用时间轴"}，不代表实际演唱音高。` : "此预览未提供音符位置。"}应用状态见操作提示。`));
+    if (showPoints) canvas.setAttribute("aria-label", `${canvas.getAttribute("aria-label") || "宿主曲线预览"}${pointsNote}`);
     if (notes.length) {
       const noteDetails = node("details", "message-details curve-note-details"), list = node("ol", "curve-note-list");
       noteDetails.append(node("summary", "", "查看选区音符"));
@@ -248,8 +309,11 @@
     const initialValue = () => definition()?.kind === "pitch" ? definition().nativeRange?.initial ?? 60 : clamp(Number($("parameter-delta").value) || 0, ...valueRange());
     // 时间比例保留足够精度，防止较长选区中的短音符被格式化到同一横坐标。
     const writePoints = () => { $("curve-points").value = state.points.map(([position, value]) => `${Number(position.toFixed(9))} ${format(value)}`).join("\n"); };
-    const draw = () => plot($("curve-editor-canvas"), [{ points: state.points }], valueRange(), definition()?.unit,
-      { notes: selectionNotes(state.selection), pitch: definition()?.kind === "pitch", startSeconds: state.selection?.startSeconds, endSeconds: state.selection?.endSeconds });
+    let editorGeometry = null;
+    const draw = () => { editorGeometry = plot($("curve-editor-canvas"), [{ points: state.points }], valueRange(), definition()?.unit,
+      { notes: selectionNotes(state.selection), pitch: definition()?.kind === "pitch", label: definition()?.label,
+        showPoints: $("parameter-render-mode").value === "points", controlPoints: state.points.map(([position, value]) => ({ position, value })),
+        startSeconds: state.selection?.startSeconds, endSeconds: state.selection?.endSeconds }); };
     function changed() { onChange?.(); onValidityChange?.(); }
 
     function sync() {
@@ -313,7 +377,7 @@
     }
     $("parameter").addEventListener("change", () => { state.selected = $("parameter").value; configureParameter(); });
     $("parameter-method").addEventListener("change", () => { reset(false); sync(); changed(); });
-    $("parameter-render-mode").addEventListener("change", changed);
+    $("parameter-render-mode").addEventListener("change", () => { draw(); changed(); });
     $("parameter-delta").addEventListener("input", changed);
     $("curve-reset").addEventListener("click", () => reset());
     $("curve-points").addEventListener("input", () => {
@@ -326,10 +390,10 @@
     const canvas = $("curve-editor-canvas");
     function pointerPoint(event) {
       const rect = canvas.getBoundingClientRect(), [low, high] = valueRange();
-      const hasNotes = selectionNotes(state.selection).length > 0, pitch = definition()?.kind === "pitch";
-      const left = pitch ? 54 : 42, top = hasNotes && !pitch ? 68 : 18, height = hasNotes ? 240 : 180;
-      const position = clamp((event.clientX - rect.left - left) / Math.max(1, rect.width - left - 12), 0, 1);
-      const value = high - clamp((event.clientY - rect.top - top) / (height - 28 - top), 0, 1) * (high - low);
+      // 命中测试复用最近一次绘图的真实轨道与音域，避免钢琴卷帘加高后笔迹偏移。
+      const bounds = editorGeometry.parameter;
+      const position = clamp((event.clientX - rect.left - bounds.left) / Math.max(1, bounds.right - bounds.left), 0, 1);
+      const value = clamp(bounds.range[1] - clamp((event.clientY - rect.top - bounds.top) / (bounds.bottom - bounds.top), 0, 1) * (bounds.range[1] - bounds.range[0]), low, high);
       return [Number(position.toFixed(9)), Number(value.toFixed(3))];
     }
     function paint(event) {
@@ -351,7 +415,11 @@
     }
     canvas.addEventListener("pointerdown", (event) => {
       if (event.button !== 0 || !event.isPrimary || state.busy || !state.connected || !definition()?.available || !usingCurve()) return;
-      if (state.points.length < 2) return;
+      if (state.points.length < 2 || !editorGeometry) return;
+      const rect = canvas.getBoundingClientRect(), bounds = editorGeometry.parameter;
+      // 非音高参数只能在下方参数轨绘制；点击上方音符或键盘不能写出一条满幅偏移。
+      if (event.clientX < rect.left + bounds.left || event.clientX > rect.left + bounds.right ||
+          event.clientY < rect.top + bounds.top || event.clientY > rect.top + bounds.bottom) return;
       event.preventDefault(); canvas.setPointerCapture(event.pointerId);
       const samples = new Map();
       state.stroke = { pointerId: event.pointerId, samples, original: state.points.map((point) => [...point]), originalError: state.error, previous: null }; paint(event);
@@ -368,6 +436,9 @@
     canvas.addEventListener("pointercancel", (event) => finishStroke(event, true));
     canvas.addEventListener("lostpointercapture", (event) => finishStroke(event, true));
     window.addEventListener("resize", draw); window.addEventListener("synthv:themechange", draw);
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(draw); observer.observe(canvas);
+    }
     // 首次构建使用显式空目录，随后仅由真实选区读取刷新能力。
     state.selection = undefined; updateCatalog(null);
     return Object.freeze({
@@ -397,5 +468,10 @@
   }
   window.addEventListener("resize", () => document.querySelectorAll("canvas[data-curve-preview]").forEach(drawPreview));
   window.addEventListener("synthv:themechange", () => document.querySelectorAll("canvas[data-curve-preview]").forEach(drawPreview));
+  if (typeof ResizeObserver === "function") {
+    // 观察固定容器而非每个历史 Canvas，避免关闭会话后观察器长期保留已移除的图形。
+    const observer = new ResizeObserver(() => document.querySelectorAll("canvas[data-curve-preview]").forEach(drawPreview));
+    for (const target of document.querySelectorAll("#page-chat, #manual-inspector")) observer.observe(target);
+  }
   window.SynthVCurves = Object.freeze({ createEditor, createPreview, representation });
 })();
