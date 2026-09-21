@@ -8,6 +8,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const bridge = window.SynthVWorkbench;
+  const ui = window.SynthVUI;
   if (!bridge) return;
   const state = {
     conversations: [], conversation: null, loading: false, sending: false,
@@ -32,6 +33,12 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = String(text);
     return node;
+  }
+  /** 装饰图形统一来自本地图标表；保留包装类，并避免辅助技术重复朗读图形。 */
+  function decorativeIcon(className, name) {
+    const wrapper = element("span", className);
+    wrapper.setAttribute("aria-hidden", "true"); wrapper.append(ui.icon(name));
+    return wrapper;
   }
   function feedback(id, message = "", error = false) {
     $(id).textContent = message;
@@ -89,10 +96,10 @@
     $("chat-model-label").title = configured ? "当前会话的模型选择。已配置不代表已验证供应商连接。" : "在设置中配置平台，再从消息输入区选择。";
     $("chat-form").setAttribute("aria-busy", state.sending ? "true" : "false");
     for (const id of ["star-conversation", "edit-conversation", "delete-conversation"]) $(id).disabled = busy || !state.conversation;
-    $("star-conversation").textContent = state.conversation?.starred ? "★" : "☆";
+    // 图标、悬停说明与辅助名称同步更新；收藏状态仍由真实会话数据决定。
+    ui.setIconButton($("star-conversation"), "star", state.conversation?.starred ? "取消当前会话星标" : "星标当前会话");
     $("star-conversation").setAttribute("aria-pressed", String(Boolean(state.conversation?.starred)));
     $("star-conversation").classList.toggle("is-starred", Boolean(state.conversation?.starred));
-    $("star-conversation").setAttribute("aria-label", state.conversation?.starred ? "取消当前会话星标" : "星标当前会话");
     for (const id of ["save-conversation-metadata", "cancel-conversation-metadata", "confirm-delete-conversation", "cancel-delete-conversation"]) $(id).disabled = state.metadataBusy;
     $("conversation-delete-mode").disabled = state.metadataBusy;
     $("conversation-title-input").disabled = state.metadataBusy; $("conversation-note-input").disabled = state.metadataBusy;
@@ -126,7 +133,10 @@
     for (const conversation of [...state.conversations].sort((a, b) => Number(Boolean(b.starred)) - Number(Boolean(a.starred)))) {
       const button = element("button", "conversation-item"); button.type = "button";
       if (conversation.id === state.conversation?.id) { button.classList.add("active"); button.setAttribute("aria-current", "page"); }
-      button.append(element("span", "conversation-icon", conversation.starred ? "★" : "◌"), element("span", "conversation-title", conversation.title || "未命名会话"));
+      const indicator = element("span", "conversation-icon"); indicator.setAttribute("aria-hidden", "true");
+      indicator.append(ui.icon(conversation.starred ? "star" : "message"));
+      button.append(indicator, element("span", "conversation-title", conversation.title || "未命名会话"));
+      button.setAttribute("aria-label", `${conversation.starred ? "已星标，" : ""}${conversation.title || "未命名会话"}`);
       button.title = `${conversation.title || "未命名会话"}${conversation.note ? " · " + conversation.note : ""}${conversation.updatedAt ? " · " + dateLabel(conversation.updatedAt) : ""}`;
       button.addEventListener("click", () => openConversation(conversation.id));
       list.append(button);
@@ -236,7 +246,7 @@
 
   function renderMessageAttachment(asset) {
     const card = element("div", "message-audio");
-    card.append(element("span", "message-audio-icon", "♫"));
+    card.append(decorativeIcon("message-audio-icon", "music"));
     const content = element("div", "message-audio-content");
     content.append(element("strong", "", assetName(asset)));
     if (Number.isFinite(asset.durationSeconds)) content.append(element("span", "", `${number(asset.durationSeconds)} 秒`));
@@ -307,7 +317,7 @@
     if (!live) {
       live = element("article", "chat-message message-assistant live-message"); live.id = "chat-live-message";
       const heading = element("header", "message-meta");
-      heading.append(element("span", "message-avatar", "∿"), element("strong", "", "调教助手"), element("span", "message-context", "正在等待真实响应"));
+      heading.append(decorativeIcon("message-avatar", "wave"), element("strong", "", "调教助手"), element("span", "message-context", "正在等待真实响应"));
       const body = element("div", "message-text"); body.id = "chat-live-text";
       const reasoning = element("details", "message-details live-reasoning"); reasoning.open = true;
       reasoning.append(element("summary", "", "思考摘要 · 仅显示模型提供的内容"));
@@ -362,7 +372,7 @@
       const role = ["user", "assistant", "error"].includes(message.role) ? message.role : "assistant";
       const article = element("article", `chat-message message-${role}`);
       const meta = element("header", "message-meta");
-      meta.append(element("span", "message-avatar", role === "user" ? "你" : role === "error" ? "!" : "∿"));
+      meta.append(role === "assistant" ? decorativeIcon("message-avatar", "wave") : element("span", "message-avatar", role === "user" ? "你" : "!"));
       meta.append(element("strong", "", role === "user" ? "你" : role === "error" ? "服务消息" : "调教助手"));
       if (message.model && role !== "user") meta.append(element("span", "message-model", message.model));
       if (message.createdAt) meta.append(element("time", "", dateLabel(message.createdAt)));
@@ -455,9 +465,8 @@
     const container = $("composer-attachments"); container.replaceChildren();
     for (const asset of state.attachments) {
       const chip = element("span", "attachment-chip");
-      chip.append(element("span", "", "♫"), element("span", "attachment-name", assetName(asset)));
-      const remove = element("button", "attachment-remove", "×"); remove.type = "button";
-      remove.setAttribute("aria-label", `移除音频附件 ${assetName(asset)}`);
+      chip.append(decorativeIcon("", "music"), element("span", "attachment-name", assetName(asset)));
+      const remove = ui.iconButton("close", `移除音频附件 ${assetName(asset)}`, { className: "attachment-remove" });
       remove.addEventListener("click", () => { state.attachments = state.attachments.filter((item) => assetKey(item) !== assetKey(asset)); renderAttachments(); });
       chip.append(remove); container.append(chip);
     }
@@ -533,18 +542,19 @@
       const content = element("span", "library-item-info");
       content.append(element("strong", "", assetName(asset)), element("small", "", `${asset.kind === "upload" ? "上传素材" : "工程录音"} · ${number(asset.durationSeconds)} 秒${asset.createdAt ? " · " + dateLabel(asset.createdAt) : ""}`));
       if (asset.name && asset.name !== asset.label) content.append(element("small", "", `原文件：${asset.name}`));
-      label.append(input, element("span", "library-audio-icon", "♫"), content); row.append(label);
+      label.append(input, decorativeIcon("library-audio-icon", "music"), content); row.append(label);
       if (asset.note) row.append(element("p", "asset-note", asset.note));
       const url = localAudioUrl(asset);
       if (url) { const audio = element("audio"); audio.controls = true; audio.preload = "none"; audio.src = url; audio.setAttribute("aria-label", `试听 ${assetName(asset)}`); row.append(audio); }
       if (Array.isArray(asset.analysis?.warnings) && asset.analysis.warnings.length) row.append(element("p", "field-help warning", asset.analysis.warnings.join(" ")));
       const toolbar = element("div", "asset-toolbar");
-      const star = element("button", `button button-quiet star-button${asset.starred ? " is-starred" : ""}`, asset.starred ? "★ 已星标" : "☆ 星标");
-      star.type = "button"; star.setAttribute("aria-pressed", String(Boolean(asset.starred))); star.addEventListener("click", () => updateAsset(asset, { starred: !asset.starred }));
-      const edit = element("button", "button button-quiet", "名称与备注"); edit.type = "button"; edit.id = `asset-edit-${asset.kind}-${asset.id}`;
+      // 管理操作统一使用图标组件；完整对象名称保留在 title 和 aria-label 中。
+      const star = ui.iconButton("star", `${asset.starred ? "取消星标" : "星标"}“${assetName(asset)}”`, { id: `asset-star-${asset.kind}-${asset.id}`, pressed: Boolean(asset.starred), className: `star-button${asset.starred ? " is-starred" : ""}` });
+      star.addEventListener("click", () => updateAsset(asset, { starred: !asset.starred }, star.id));
+      const edit = ui.iconButton("note", `编辑“${assetName(asset)}”的名称与备注`, { id: `asset-edit-${asset.kind}-${asset.id}` });
       // 列表重绘会替换原按钮，按素材稳定标识将焦点移到新建的名称输入框。
       edit.addEventListener("click", () => { state.assetEditor = { key, label: assetName(asset), note: asset.note || "" }; state.assetDelete = ""; renderLibrary(); $(`asset-name-${asset.kind}-${asset.id}`)?.focus(); });
-      const remove = element("button", "button button-quiet", "删除"); remove.type = "button"; remove.id = `asset-delete-${asset.kind}-${asset.id}`;
+      const remove = ui.iconButton("trash", `删除“${assetName(asset)}”`, { id: `asset-delete-${asset.kind}-${asset.id}` });
       remove.addEventListener("click", () => { state.assetDelete = key; state.assetDeleteMode = "trash"; state.assetEditor = null; renderLibrary(); $("audio-library-items").querySelector(".inline-confirm select")?.focus(); });
       toolbar.append(star, edit, remove); row.append(toolbar);
       if (state.assetEditor?.key === key) {
@@ -558,7 +568,7 @@
         const cancel = element("button", "button button-quiet", "取消"); cancel.type = "button";
         cancel.addEventListener("click", () => { state.assetEditor = null; renderLibrary(); $(edit.id)?.focus(); });
         actions.append(save, cancel); form.append(nameLabel, noteLabel, actions);
-        form.addEventListener("submit", (event) => { event.preventDefault(); if (form.reportValidity()) updateAsset(asset, { label: name.value.trim(), note: note.value }); }); row.append(form);
+        form.addEventListener("submit", (event) => { event.preventDefault(); if (form.reportValidity()) updateAsset(asset, { label: name.value.trim(), note: note.value }, edit.id); }); row.append(form);
       }
       if (state.assetDelete === key) {
         // 删除控件共用网格布局；显式关联标签，便于键盘与辅助技术定位同一选项。
@@ -588,8 +598,14 @@
   }
 
   /** 更改素材资料不上传音频给模型；服务返回后再更新卡片与当前附件名称。 */
-  async function updateAsset(asset, payload) {
+  async function updateAsset(asset, payload, focusTargetId = "") {
     if (state.assetBusy || state.libraryLoading || state.sending) return;
+    // 只有显式用户操作传入焦点目标；后台刷新不恢复焦点，也不打断正在阅读的控件。
+    const originalFocus = document.activeElement;
+    let rebuilt = false;
+    let focusMoved = false;
+    const trackFocus = (event) => { if (event.target !== originalFocus && event.target !== document.body) focusMoved = true; };
+    if (focusTargetId) document.addEventListener("focusin", trackFocus);
     state.assetBusy = assetKey(asset); syncLibrary();
     try {
       const result = await bridge.api(`/api/assets/${encodeURIComponent(asset.kind)}/${encodeURIComponent(asset.id)}/metadata`, payload);
@@ -597,11 +613,21 @@
       state.assets = state.assets.map((item) => assetKey(item) === assetKey(asset) ? updated : item);
       state.attachments = state.attachments.map((item) => assetKey(item) === assetKey(asset) ? updated : item);
       if (payload.label !== undefined || payload.note !== undefined) state.assetEditor = null;
-      renderAttachments(); renderLibrary();
+      renderAttachments(); renderLibrary(); rebuilt = true;
       if (asset.kind === "recording") await bridge.refreshRecordings();
       feedback("library-feedback", "素材信息已保存在本机，未发送给模型。");
     } catch (error) { feedback("library-feedback", bridge.errorMessage(error), true); }
-    finally { state.assetBusy = ""; syncLibrary(); }
+    finally {
+      if (focusTargetId) document.removeEventListener("focusin", trackFocus);
+      state.assetBusy = ""; syncLibrary();
+      // 列表按钮须先解除禁用才可聚焦；若用户已经离页或选择其他控件，不抢回焦点。
+      const active = document.activeElement;
+      const stayedAtOperation = !active || active === document.body || active === originalFocus;
+      if (focusTargetId && !focusMoved && window.SynthVPages.current === "library" && stayedAtOperation) {
+        const target = rebuilt ? $(focusTargetId) : originalFocus?.isConnected ? originalFocus : $(focusTargetId);
+        if (target && !target.disabled) target.focus();
+      }
+    }
   }
 
   /** 已确认删除后同步当前草稿和历史附件；永久删除与可恢复删除使用不同提示。 */

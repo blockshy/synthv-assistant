@@ -252,7 +252,7 @@ MCP 客户端与工作台应使用相同的 `SYNTHV_ASSISTANT_DATA`，或共同�
 - **应用超时或结果未知：** 先检查 SynthV 实际状态，必要时撤销，再重新读取选区和规划；不要立即重复应用。
 - **端口被占用：** 使用 `scripts/start.ps1 -Port 8766` 等其他本地端口，不要终止不相关进程。
 
-更多实现细节见 [架构说明](docs/architecture.md)，模型及音频限制见 [模型与音频说明](docs/audio-review.md)，开发与问题反馈见 [贡献指南](CONTRIBUTING.md)。
+更多实现细节见 [架构说明](docs/architecture.md)，模型及音频限制见 [模型与音频说明](docs/audio-review.md)，界面开发见 [前端设计与实现规范](docs/frontend-guidelines.md)，开发与问题反馈见 [贡献指南](CONTRIBUTING.md)。
 
 ## 许可证
 

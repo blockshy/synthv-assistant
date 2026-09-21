@@ -150,7 +150,8 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                 elif path.startswith("/uploads/") and path.endswith(".wav"):
                     file, data = service.read_audio("upload", path[9:-4])
                 else:
-                    name = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/chat.js": "chat.js", "/models.js": "models.js", "/layout.js": "layout.js", "/pages.js": "pages.js", "/style.css": "style.css"}.get(path)
+                    # 静态资源使用显式白名单；共享 UI 模块和页面脚本遵循同源 CSP，不开放任意文件读取。
+                    name = {"/": "index.html", "/index.html": "index.html", "/ui.js": "ui.js", "/app.js": "app.js", "/chat.js": "chat.js", "/models.js": "models.js", "/layout.js": "layout.js", "/pages.js": "pages.js", "/style.css": "style.css"}.get(path)
                     if not name:
                         return self.response_json({"error": "页面不存在。"}, 404)
                     file = ROOT / "web" / name

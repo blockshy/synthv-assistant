@@ -8,6 +8,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const bridge = window.SynthVWorkbench;
+  const ui = window.SynthVUI;
   const pages = new Set(["chat", "settings", "library", "record", "trash"]);
   const state = { current: "chat", recording: false, readingSelection: false, lastRecording: null, trashLoading: false, trashBusy: "", trashRequest: 0, trashItems: [], trashConfirm: "" };
   function node(tag, className, text) {
@@ -192,16 +193,17 @@
       content.append(node("h3", "", name));
       const type = { conversation: "会话", upload: "上传素材", recording: "工程录音" }[item.kind] || "项目";
       const date = new Date(item.deletedAt), when = Number.isNaN(date.getTime()) ? "" : " · " + date.toLocaleString("zh-CN");
-      content.append(node("p", "field-help", `${item.starred ? "★ · " : ""}${type}${when}`));
+      content.append(node("p", "field-help", `${item.starred ? "已星标 · " : ""}${type}${when}`));
       if (item.note) content.append(node("p", "asset-note", item.note));
       if (item.purgePending) content.append(node("p", "field-help warning", "上次永久删除未完成，资源已停用且不能恢复。请重试永久删除以完成清理。"));
       const actions = node("div", "asset-toolbar");
       // 服务端中断标记表示已进入永久删除流程，不能误导用户继续恢复。
       if (!item.permanent && !item.purgePending && item.restorable !== false) {
-        const restore = node("button", "button button-secondary", "恢复"); restore.type = "button";
+        // 工具栏图标携带完整目标名称，恢复事件与忙碌控制继续沿用原流程。
+        const restore = ui.iconButton("restore", `恢复“${name}”`);
         restore.addEventListener("click", () => restoreItem(item, restore)); actions.append(restore);
       }
-      const remove = node("button", "button button-danger-quiet", item.purgePending ? "重试永久删除" : "永久删除"); remove.type = "button"; remove.id = `trash-purge-${item.kind}-${item.id}`;
+      const remove = ui.iconButton("trash", `${item.purgePending ? "重试永久删除" : "永久删除"}“${name}”`, { id: `trash-purge-${item.kind}-${item.id}` });
       remove.addEventListener("click", () => { state.trashConfirm = key; renderTrash(); $("trash-list").querySelector(".inline-confirm button")?.focus(); }); actions.append(remove);
       row.append(content, actions);
       if (state.trashConfirm === key) {

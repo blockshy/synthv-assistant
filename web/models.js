@@ -50,7 +50,9 @@
     $("chat-model").placeholder = platform?.model ? `平台默认：${platform.model}` : "留空使用平台默认模型";
     $("chat-reasoning").disabled = busy || state.capabilityLoading;
     $("refresh-chat-models").disabled = busy || state.catalogLoading || !platform?.configured;
-    $("refresh-chat-models").textContent = state.catalogLoading ? "…" : "↻";
+    // 刷新状态只更新可读名称与忙碌属性，保持共享 SVG，不以省略号替换整个按钮。
+    window.SynthVUI.setIconButton($("refresh-chat-models"), "refresh", state.catalogLoading ? "正在刷新模型列表" : "从当前平台刷新模型列表（会访问供应商）");
+    $("refresh-chat-models").setAttribute("aria-busy", String(state.catalogLoading));
     $("chat-model-feedback").textContent = state.feedback;
     $("chat-model-feedback").hidden = !state.feedback;
     $("chat-model-feedback").classList.toggle("error", state.feedbackError);

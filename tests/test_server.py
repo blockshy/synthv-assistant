@@ -63,6 +63,14 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(status, 403)
         self.service.edit.assert_not_called()
 
+    def test_shared_ui_module_is_served_without_exposing_other_files(self):
+        """共享组件是页面启动依赖；白名单只开放该资源，不能顺带开放相邻开发文件。"""
+        status, headers, body = self.request("GET", "/ui.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"window.SynthVUI", body)
+        self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+        self.assertEqual(self.request("GET", "/AGENTS.md")[0], 404)
+
     def test_model_platform_routes_and_message_options(self):
         """平台与能力管理都验证令牌，聊天选择完整交给后台任务。"""
         self.service.list_model_platforms.return_value = {"items": [], "revision": "empty"}
