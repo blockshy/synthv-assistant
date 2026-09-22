@@ -19,7 +19,7 @@
     status: bridge.getStatus(), manualBusy: bridge.getManualBusy(), settingsSaving: false,
     modelState: window.SynthVModels?.getState(),
     jobProgress: { startedAt: 0, elapsedSeconds: 0, stage: "", text: "", reasoning: "", reasoningAvailable: false, receivedCharacters: 0 },
-    jobTimer: null, localMessages: [],
+    jobTimer: null, localMessages: [], reuseUncertain: new Set(),
   };
   const parameterNames = { breathiness: "气声", tension: "张力", loudness: "响度", gender: "性别", pitchDelta: "音高偏移", toneShift: "音色偏移", vibratoEnv: "颤音包络", pitchCurve: "原生音高曲线" };
   const parameterUnits = { breathiness: "参数值", tension: "参数值", loudness: "dB", gender: "参数值", pitchDelta: "音分", toneShift: "音分", vibratoEnv: "参数值", pitchCurve: "MIDI 半音" };
@@ -128,6 +128,12 @@
     document.querySelectorAll("[data-batch-apply]").forEach((button) => {
       button.disabled = busy || state.manualBusy || !connected || !state.status?.writeEnabled || button.dataset.batchApply !== state.activeBatch?.id;
     });
+    document.querySelectorAll("[data-message-reuse]").forEach((button) => {
+      const message = state.conversation?.messages.find((item) => item.id === button.dataset.messageReuse);
+      const reason = reuseBlockedReason(message);
+      button.disabled = busy || state.settingsSaving || state.manualBusy || !connected || Boolean(reason);
+      button.title = reason || "在 SynthV 当前选区创建本地提案并重新预览；不请求模型，也不会直接应用。";
+    });
     document.querySelectorAll(".attachment-remove").forEach((button) => { button.disabled = state.sending; });
     document.querySelectorAll("[data-chat-restore]").forEach((button) => {
       button.disabled = busy || state.manualBusy || !connected || !state.status?.writeEnabled;
@@ -184,7 +190,10 @@
     try {
       const result = await bridge.api(`/api/conversations/${encodeURIComponent(id)}`);
       if (request !== state.conversationRequest) return;
-      setConversation(result); feedback("chat-feedback");
+      setConversation(result);
+      // 复用请求超时可能已经追加消息；只有主动重读完整历史，才允许用户核实后再次选择复用。
+      for (const key of state.reuseUncertain) if (key.startsWith(`${id}:`)) state.reuseUncertain.delete(key);
+      syncControls(); feedback("chat-feedback");
       document.body.classList.remove("sidebar-open"); $("toggle-sidebar").setAttribute("aria-expanded", "false");
     } catch (error) { if (request === state.conversationRequest) feedback("chat-feedback", bridge.errorMessage(error), true); }
     finally { if (request === state.conversationRequest) { state.loading = false; syncControls(); } }
@@ -383,6 +392,65 @@
     state.activePreview = ""; state.activeBatch = null;
   }
 
+  /** 未核实的写入不能通过复制提案绕过防重放；已核实的应用允许用户明确选择新的复用目标。 */
+  function reuseBlockedReason(message) {
+    if (message?.role !== "assistant" || !Array.isArray(message.actions) || !message.actions.length) return "此消息没有可复用的参数建议。";
+    if (message.actions.some((action) => !["proposed", "previewed", "applied"].includes(action.status)
+        || (action.status === "applied" && action.result?.verified !== true))) return "此方案仍有执行结果未核实，请先检查工程与会话记录。";
+    if (state.reuseUncertain.has(`${state.conversation?.id}:${message.id}`)) return "上次复用状态未确认，请重新打开会话，核实是否已追加本地提案后再操作。";
+    return "";
+  }
+
+  /**
+   * 复用只把已有建议复制到当前用户选区，匹配与参数可用性由本机服务检查。
+   * 此处只提交来源消息编号，不重发模型请求或附件，不继承旧预览票据，也不改变写入开关。
+   * 请求结果不明时保留来源锁，防止再次点击重复追加；成功后仅自动进行只读预览。
+   */
+  async function reuseMessage(messageId) {
+    if (state.loading || state.actionBusy || state.sending || state.metadataBusy || state.renderModeSaving
+        || state.manualBusy || state.settingsSaving || state.modelState?.busy || !state.status?.bridge?.connected) return;
+    const conversation = state.conversation;
+    const source = conversation?.messages.find((message) => message.id === messageId);
+    if (reuseBlockedReason(source)) return;
+    const key = `${conversation.id}:${messageId}`;
+    const previousMessageIds = new Set(conversation.messages.map((message) => message.id));
+    const previousActionIds = new Set(conversation.messages.flatMap((message) => message.actions || []).map((action) => action.id));
+    let reused = null;
+    state.actionBusy = `reuse:${messageId}`; clearPreviewAuthorization();
+    bridge.clearManualPreview(); bridge.setAssistantBusy(true); renderHistory();
+    feedback("chat-feedback", "正在读取当前选区并复用已有建议，不会请求模型或修改工程…");
+    try {
+      const response = await bridge.api(`/api/conversations/${encodeURIComponent(conversation.id)}/reuse`, { messageId });
+      const updated = response.conversation;
+      const message = Array.isArray(updated?.messages) ? updated.messages.find((item) => item.id === response.messageId) : null;
+      // 仅新追加、尚未预览的本地提案可以进入自动预览；不得把来源或其他会话的旧票据重新激活。
+      if (updated?.id !== conversation.id || state.conversation?.id !== conversation.id
+          || !message?.id || previousMessageIds.has(message.id) || message.role !== "assistant" || message.origin !== "reuse"
+          || !message.selection || !Array.isArray(message.actions) || !message.actions.length
+          || message.actions.some((action) => !action.id || previousActionIds.has(action.id) || action.status !== "proposed"
+            || action.preview || action.previewBatchId || action.result)
+          || new Set(message.actions.map((action) => action.id)).size !== message.actions.length) {
+        throw new Error("服务未返回可核实的新复用提案。");
+      }
+      setConversation(updated, true, true); reused = message;
+    } catch (error) {
+      // 明确的业务拒绝发生在持久化前，允许用户调整选区后再试；丢失或畸形响应则须先核实历史。
+      const rejected = error.httpStatus === 400;
+      if (!rejected) state.reuseUncertain.add(key);
+      feedback("chat-feedback", rejected ? bridge.errorMessage(error)
+        : `${bridge.errorMessage(error)} 请重新打开会话，核实是否已追加本地复用提案；未自动重试。`, true);
+    } finally {
+      state.actionBusy = ""; bridge.setAssistantBusy(false); renderHistory(Boolean(reused));
+    }
+    if (!reused) return;
+    if (!state.status?.bridge?.connected || state.manualBusy) {
+      feedback("chat-feedback", "本地复用提案已创建，尚未预览或修改工程。连接恢复且宿主空闲后，请点击提案中的预览按钮。"); return;
+    }
+    // 释放复用锁后立即交给既有预览入口；只有用户随后点击确认按钮，才可能进入应用路径。
+    if (reused.actions.length > 1) await executeBatch(reused.id, "preview");
+    else await executeAction(reused.actions[0].id, "preview");
+  }
+
   /**
    * 组合预览只请求一次；确认应用前立即撤销本地票据，异常时不重发写请求。
    * 服务端负责同一消息、选区和完整参数快照检查，前端不能自行拼装可应用批次。
@@ -532,12 +600,14 @@
     if (!messages.length && !state.sending) history.append(welcome);
     for (const message of messages) {
       const role = ["user", "assistant", "error"].includes(message.role) ? message.role : "assistant";
+      const localReuse = role === "assistant" && message.origin === "reuse";
       const article = element("article", `chat-message message-${role}`);
       if (message.delivery) article.dataset.delivery = message.delivery;
       const meta = element("header", "message-meta");
       meta.append(role === "assistant" ? decorativeIcon("message-avatar", "wave") : element("span", "message-avatar", role === "user" ? "你" : "!"));
       meta.append(element("strong", "", role === "user" ? "你" : role === "error" ? "服务消息" : "调教助手"));
-      if (message.model && role !== "user") meta.append(element("span", "message-model", message.model));
+      if (localReuse) meta.append(element("span", "message-model", "本地复用"));
+      else if (message.model && role !== "user") meta.append(element("span", "message-model", message.model));
       if (message.createdAt) meta.append(element("time", "", dateLabel(message.createdAt)));
       article.append(meta);
       // 正文和附件属于同一条消息：用户气泡统一承载两者，发送状态与选区详情保留在气泡外。
@@ -550,10 +620,10 @@
         body.append(attachments);
       }
       article.append(body);
-      if (typeof message.reasoningSummary === "string" && message.reasoningSummary.trim()) {
+      if (!localReuse && typeof message.reasoningSummary === "string" && message.reasoningSummary.trim()) {
         const summary = element("details", "message-details reasoning-summary");
         summary.append(element("summary", "", "思考摘要 · 模型实际返回"), element("pre", "", message.reasoningSummary)); article.append(summary);
-      } else if (role === "assistant" || role === "error") article.append(element("p", "message-context", "本条回复未提供可展示的思考摘要。"));
+      } else if (!localReuse && (role === "assistant" || role === "error")) article.append(element("p", "message-context", "本条回复未提供可展示的思考摘要。"));
       if (role === "user") {
         const count = Array.isArray(message.attachments) ? message.attachments.length : 0;
         const delivery = { preparing: "正在准备发送", queued: "任务已入队，等待本机确认消息记录", failed: "未发送，原草稿已保留", unknown: "发送状态未确认，原草稿已保留；核实会话后再重发" };
@@ -561,10 +631,10 @@
         const selection = message.delivery ? message.includeSelection ? "拟附带选区" : "不附带选区" : message.selection ? "含选区上下文" : "无选区上下文";
         article.append(element("p", `message-context${["failed", "unknown"].includes(message.delivery) ? " error" : ""}`,
           `${message.delivery ? delivery[message.delivery] + " · " : ""}${audio} · ${selection}${message.renderMode ? ` · ${message.renderMode === "points" ? "控制点模式" : "绘制模式"}` : ""}`));
-      } else if (message.inputMode) {
+      } else if (!localReuse && message.inputMode) {
         article.append(element("p", "message-context", message.inputMode === "audio" ? "本次请求包含音频附件；回复内容由模型返回。" : "文字与工程信息回复；本次未传入音频。"));
       }
-      if (message.selection) article.append(details("发送时的选区摘要", message.selection));
+      if (message.selection) article.append(details(localReuse ? "复用目标选区摘要" : "发送时的选区摘要", message.selection));
       const actions = Array.isArray(message.actions) ? message.actions : [];
       if (actions.length) {
         const group = actions.length > 1 ? renderActionGroup(message) : element("section", "message-actions");
@@ -576,6 +646,12 @@
           const restore = element("button", "button button-quiet chat-restore", "恢复最近一次修改");
           restore.type = "button"; restore.dataset.chatRestore = "true";
           restore.addEventListener("click", restoreLatest); group.append(restore);
+        }
+        if (role === "assistant") {
+          const controls = element("div", "action-controls");
+          const reuse = element("button", "button button-quiet", "复用到当前选区");
+          reuse.type = "button"; reuse.dataset.messageReuse = message.id;
+          reuse.addEventListener("click", () => reuseMessage(message.id)); controls.append(reuse); group.append(controls);
         }
         article.append(group);
       }

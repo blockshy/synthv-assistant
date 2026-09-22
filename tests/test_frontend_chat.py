@@ -79,7 +79,7 @@ const context={window,document,location:{origin:'http://local.test',href:'http:/
   localStorage:{getItem(){return null;},setItem(){},removeItem(){}},matchMedia:()=>({matches:false,addEventListener(){}}),
   setInterval:()=>1,clearInterval(){},requestAnimationFrame:callback=>callback(),Event:class{},CustomEvent:class{}};
 vm.createContext(context);
-source=source.replace('  initialize();','  window.testChat = {sendMessage, setConversation, state, openConversation, renderHistory, executeBatch, executeAction, syncControls};');
+source=source.replace('  initialize();','  window.testChat = {sendMessage, setConversation, state, openConversation, renderHistory, executeBatch, executeAction, reuseMessage, syncControls};');
 vm.runInContext(source,context);
 const chat=window.testChat;
 const base=(id='conversation-a',messages=[])=>({id,title:'隔离会话',messages,renderMode:'smooth',modelOptions:{}});
@@ -96,6 +96,8 @@ const previewed=(source,batchId='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')=>({...source
     curvePreview:[{position:0,before:0,after:.1},{position:1,before:0,after:.1}]}});
 const batchButtons=()=>get('chat-history').querySelectorAll('[data-batch-apply]');
 const allowWrites=()=>{chat.state.status={bridge:{connected:true},writeEnabled:true};chat.syncControls();};
+const reuseButtons=()=>get('chat-history').querySelectorAll('[data-message-reuse]');
+const reused=(id,actions)=>({...proposal(id,actions),origin:'reuse',text:'本地复用已有建议，未调用模型。',selection:{noteCount:2}});
 """
 
 
@@ -408,6 +410,128 @@ assert.equal(chat.state.activeBatch,null);assert.equal(batchButtons().length,0);
 assert.match(get('chat-feedback').textContent,/未返回完整可核实/);
 assert.doesNotMatch(get('chat-feedback').textContent,/已确认应用/);
 await chat.executeBatch('reply','apply');assert.equal(calls.length,2);
+""")
+
+    def test_reuse_single_creates_local_message_and_previews_without_model_audio_or_write(self):
+        """复用只发送来源编号并预览新提案，正文明确为本地操作且保留用户尚未发送的附件。"""
+        self.run_case(r"""
+const old=action('old'),source=proposal('source',[old]);
+chat.setConversation(base('conversation-a',[source]));
+chat.state.activePreview='old';chat.state.activeBatch={id:'old-batch'};
+chat.state.attachments=[{kind:'upload',id:'unsent',name:'未发送.wav'}];
+const fresh=reused('local',[action('fresh')]);
+fresh.inputMode='audio';fresh.model='旧模型';fresh.reasoningSummary='旧来源摘要不应冒充新思考';
+let saves=0;save=()=>{saves++;};
+api=async(path,body)=>{
+  if(path.endsWith('/reuse')){
+    assert.equal(chat.state.activePreview,'');assert.equal(chat.state.activeBatch,null);
+    assert.deepEqual(JSON.parse(JSON.stringify(body)),{messageId:'source'});
+    return {conversation:base('conversation-a',[source,fresh]),messageId:'local'};
+  }
+  assert.equal(path,'/api/assistant/actions/fresh/preview');
+  return {action:{...fresh.actions[0],status:'previewed',preview:{previewId:'fresh-preview'}}};
+};
+await chat.reuseMessage('source');
+assert.equal(calls.length,2);assert.equal(saves,0);
+assert.equal(calls[0][0],'/api/conversations/conversation-a/reuse');
+assert.equal(chat.state.activePreview,'fresh');assert.equal(chat.state.status.writeEnabled,false);
+assert.equal(chat.state.attachments[0].id,'unsent');assert.equal(old.status,'proposed');
+const card=get('chat-history').children.at(-1);
+assert.match(card.textContent,/本地复用/);assert.match(card.textContent,/复用目标选区摘要/);
+assert.doesNotMatch(card.textContent,/未提供可展示的思考摘要|本次请求包含音频|旧来源摘要|旧模型/);
+assert.equal(get('chat-history').querySelectorAll('[data-action-apply]').at(-1).disabled,true);
+assert.equal(calls.some(([path])=>/messages|apply|write|upload/.test(path)),false);
+""")
+
+    def test_reuse_batch_previews_only_new_eligible_parameters_once(self):
+        """部分参数被后端排除后，自动组合预览只使用新消息内剩余项目；双击不会重复追加。"""
+        self.run_case(r"""
+const source=proposal('source',[action('a'),action('b','breathiness'),action('c','pitchCurve')]);
+chat.setConversation(base('conversation-a',[source]));
+const fresh=reused('local',[action('new-a'),action('new-b','breathiness')]),cloning=deferred();
+fresh.text+=' 原生音高当前不可用，已排除。';
+api=(path,body)=>path.endsWith('/reuse')?cloning.promise:Promise.resolve({batchId:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  actions:fresh.actions.map(item=>previewed(item)),errors:[]});
+const pending=chat.reuseMessage('source');
+assert.equal(reuseButtons()[0].disabled,true);
+await chat.reuseMessage('source');assert.equal(calls.length,1);
+cloning.resolve({conversation:base('conversation-a',[source,fresh]),messageId:'local'});await pending;
+assert.equal(calls.length,2);assert.equal(calls[1][0],'/api/assistant/batches/preview');
+assert.deepEqual(Array.from(calls[1][1].actionIds),['new-a','new-b']);
+assert.deepEqual(Array.from(chat.state.activeBatch.actionIds),['new-a','new-b']);
+assert.equal(batchButtons().length,1);assert.equal(batchButtons()[0].disabled,true);
+assert.match(get('chat-history').textContent,/已排除/);
+assert.equal(calls.some(([path])=>path.endsWith('/apply')),false);
+""")
+
+    def test_reuse_guards_unknown_results_busy_and_disconnect(self):
+        """断连、忙碌和未核实写入都不能通过复制建议生成新的可执行提案。"""
+        self.run_case(r"""
+const one=action('a'),source=proposal('source',[one]);
+chat.setConversation(base('conversation-a',[source]));
+for(const status of ['unknown','invalid']){
+  one.status=status;chat.renderHistory();assert.equal(reuseButtons()[0].disabled,true);
+  await chat.reuseMessage('source');
+}
+one.status='applied';one.result={verified:false};chat.renderHistory();
+assert.equal(reuseButtons()[0].disabled,true);assert.match(reuseButtons()[0].title,/未核实/);
+await chat.reuseMessage('source');
+one.result={verified:true};chat.renderHistory();assert.equal(reuseButtons()[0].disabled,false);
+chat.state.status.bridge.connected=false;chat.syncControls();assert.equal(reuseButtons()[0].disabled,true);
+await chat.reuseMessage('source');chat.state.status.bridge.connected=true;
+for(const flag of ['loading','sending','metadataBusy','renderModeSaving','manualBusy','settingsSaving']){
+  chat.state[flag]=true;chat.syncControls();assert.equal(reuseButtons()[0].disabled,true);
+  await chat.reuseMessage('source');chat.state[flag]=false;
+}
+assert.equal(calls.length,0); // 检查不依赖按钮 disabled，直接调用入口也不能绕过保护。
+""")
+
+    def test_reuse_lost_response_requires_history_read_before_retry(self):
+        """复制可能已持久化但响应丢失时不自动重试，来源锁须在主动重读历史后解除。"""
+        self.run_case(r"""
+const source=proposal('source',[action('a')]),conversation=base('conversation-a',[source]);
+chat.setConversation(conversation);chat.state.activePreview='old';
+api=async(path)=>{if(path.endsWith('/reuse'))throw new Error('响应连接中断');return conversation;};
+await chat.reuseMessage('source');
+assert.equal(chat.state.activePreview,'');assert.equal(chat.state.activeBatch,null);
+assert.equal(reuseButtons()[0].disabled,true);assert.match(get('chat-feedback').textContent,/重新打开会话/);
+await chat.reuseMessage('source');assert.equal(calls.length,1);
+await chat.openConversation('conversation-a');assert.equal(reuseButtons()[0].disabled,false);
+await chat.reuseMessage('source');assert.equal(calls.filter(([path])=>path.endsWith('/reuse')).length,2);
+assert.equal(calls.some(([path])=>path.endsWith('/preview')),false);
+""")
+
+    def test_reuse_business_rejection_can_retry_after_selection_change(self):
+        """明确的 400 业务拒绝没有追加消息，用户换好选区后可以主动再次尝试。"""
+        self.run_case(r"""
+chat.setConversation(base('conversation-a',[proposal('source',[action('a')])]));
+api=async()=>{const error=new Error('当前音符节奏不匹配');error.httpStatus=400;throw error;};
+await chat.reuseMessage('source');
+assert.equal(reuseButtons()[0].disabled,false);assert.match(get('chat-feedback').textContent,/节奏不匹配/);
+assert.doesNotMatch(get('chat-feedback').textContent,/已追加/);
+await chat.reuseMessage('source');assert.equal(calls.length,2);
+assert.equal(chat.state.conversation.messages.length,1);
+""")
+
+    def test_reuse_rejects_old_or_malformed_tickets_and_does_not_preview_on_disconnect(self):
+        """畸形响应不能激活历史票据；复制期间断连则保留新建议，重连后仍由用户发起预览。"""
+        self.run_case(r"""
+const source=proposal('source',[action('a')]),conversation=base('conversation-a',[source]);
+chat.setConversation(conversation);
+api=async()=>({conversation,messageId:'source'});
+await chat.reuseMessage('source');assert.equal(calls.length,1);assert.equal(chat.state.activePreview,'');
+assert.match(get('chat-feedback').textContent,/未返回可核实/);
+api=async()=>conversation;await chat.openConversation('conversation-a');
+const fresh=reused('local',[action('b')]);
+api=async()=>{
+  emit('synthv:state',{status:{bridge:{connected:false},writeEnabled:false},manualBusy:false,settingsSaving:false});
+  return {conversation:base('conversation-a',[source,fresh]),messageId:'local'};
+};
+await chat.reuseMessage('source');
+assert.equal(chat.state.conversation.messages.length,2);assert.equal(chat.state.activePreview,'');
+assert.match(get('chat-feedback').textContent,/尚未预览或修改工程/);
+emit('synthv:state',{status:{bridge:{connected:true},writeEnabled:false},manualBusy:false,settingsSaving:false});
+assert.equal(calls.some(([path])=>path.endsWith('/preview')),false);
 """)
 
 

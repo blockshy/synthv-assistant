@@ -181,6 +181,10 @@ class AssistantService:
     def preview_action(self, identifier):
         return self.conversations().preview_action(identifier)
 
+    def reuse_message(self, identifier, message_id):
+        """仅在本地复制参数建议到当前选区；不启动模型任务，也不复制旧确认票据。"""
+        return self.conversations().reuse_message(identifier, message_id)
+
     def apply_action(self, identifier):
         """会话模块校验预览状态后再调用现有的宿主编辑入口。"""
         return self.conversations().apply_action(identifier)

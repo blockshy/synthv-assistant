@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -130,6 +131,67 @@ def _parameter_identity(selection: dict, parameter: str) -> str:
     return _fingerprint(identity)
 
 
+def _proposal_selection_identity(selection: dict) -> str:
+    """提案的稳定目标身份不含连接编号和音符索引；应用仍核对严格预览身份。
+
+    在组内插入其他音符可能只改变 index，相同起点的音符也可能换序。这些展示
+    顺序变化不改变建议含义；歌词、音高、时值、秒坐标、声库与工程位置仍绑定。
+    """
+    snapshot = dict(selection)
+    snapshot["notes"] = sorted(
+        [{key: value for key, value in note.items() if key != "index"} for note in selection["notes"]],
+        key=_encoded,
+    )
+    return _selection_identity(snapshot, "")
+
+
+def _target_scope(selection: dict) -> dict:
+    """以底层音符组及组内 blick 定位，组移动和变速不能绕过已应用重叠保护。
+
+    声音曲线属于 NoteGroup 而非其工程时间位置。只比较绝对秒范围或把组偏移
+    加进组身份，会将移动后的同一条曲线误认成新目标，重复叠加已经应用的增量。
+    缺少可靠组内时间时保留空范围，后续对已应用方案拒绝猜测。
+    """
+    notes = selection.get("notes", [])
+    valid = notes and all(isinstance(note, dict) and all(
+        not isinstance(note.get(key), bool) and isinstance(note.get(key), (int, float))
+        and math.isfinite(note[key]) for key in ("onset", "duration")) and note["duration"] > 0 for note in notes)
+    return {"group": _fingerprint({key: selection.get(key) for key in ("projectFile", "groupUUID")}),
+            "start": min(note["onset"] for note in notes) if valid else None,
+            "end": max(note["onset"] + note["duration"] for note in notes) if valid else None}
+
+
+def _melody_layout(selection: dict) -> list[tuple[float, float, float]]:
+    """用实际音高和归一化秒坐标描述旋律，允许平移/整体拉伸，不忽略休止与变速。
+
+    参数曲线使用选区时间的 0..1 坐标，因此比较秒比例比只比较节拍更可靠。
+    数值必须有限，缺失音符、零时长或不完整快照不能冒充结构一致。
+    """
+    def number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ConversationError("音高方案缺少可靠的音符和时间资料，无法复用；请重新读取选区生成音高建议。")
+        return float(value)
+
+    start, end = number(selection.get("startSeconds")), number(selection.get("endSeconds"))
+    notes = selection.get("notes")
+    if end <= start or not isinstance(notes, list) or not 1 <= len(notes) <= 128:
+        raise ConversationError("音高方案的选区时间或音符资料无效，无法复用。")
+    offset = number(selection.get("groupPitchOffset", 0))
+    result = []
+    for note in notes:
+        if not isinstance(note, dict):
+            raise ConversationError("音高方案的音符资料无效，无法复用。")
+        onset, duration = number(note.get("onsetSeconds")), number(note.get("durationSeconds"))
+        if duration <= 0 or onset < start - 1e-6 or onset + duration > end + 1e-6:
+            raise ConversationError("音高方案的音符超出选区或时长无效，无法复用。")
+        result.append(((onset - start) / (end - start), (onset + duration - start) / (end - start),
+                       number(note.get("pitch")) + offset))
+    result.sort()
+    if any(left[1] > right[0] + 1e-6 for left, right in zip(result, result[1:])):
+        raise ConversationError("选区存在重叠音符，无法确定单条音高曲线的对应关系；请缩小选区后复用。")
+    return result
+
+
 def _public_action(action: dict) -> dict:
     """只投影状态机的公开字段，私有指纹与会话不会进入前端响应。"""
     fields = {"id", "parameter", "delta", "curve", "renderMode", "reason", "status", "preview", "result",
@@ -142,7 +204,7 @@ def _public_document(document: dict) -> dict:
     result["modelOptions"] = normalize_model_options(document.get("modelOptions"))
     result["renderMode"] = normalize_render_mode(document.get("renderMode", "smooth"))
     fields = {"id", "role", "text", "createdAt", "attachments", "inputMode", "provider", "model", "selection",
-              "platformId", "reasoningEffort", "reasoningSummary", "renderMode"}
+              "platformId", "reasoningEffort", "reasoningSummary", "renderMode", "origin"}
     result["messages"] = [{**{key: value for key, value in message.items() if key in fields},
                            "actions": [_public_action(action) for action in message.get("actions", [])]}
                           for message in document["messages"]]
@@ -505,8 +567,68 @@ class ConversationManager:
                     action[key] = value
             reply["actions"].append(action)
             guards[action["id"]] = {"selection": _selection_identity(selection, session), "session": session,
-                                     "parameter": _parameter_identity(selection, parameter)}
+                                     "parameter": _parameter_identity(selection, parameter),
+                                     "proposalSelection": _proposal_selection_identity(selection),
+                                     "targetScope": _target_scope(selection)}
         return reply, guards
+
+    @staticmethod
+    def _source_selection(document: dict, action_id: str) -> dict | None:
+        """优先取复用消息自身的快照，旧模型消息才回溯紧邻的用户请求快照。"""
+        original = None
+        for message in document["messages"]:
+            if message.get("role") == "user":
+                original = message.get("selection")
+            if any(action.get("id") == action_id for action in message.get("actions", [])):
+                candidate = message.get("selection", original)
+                return candidate if isinstance(candidate, dict) else None
+        return None
+
+    def _prepare_preview_guard(self, document: dict, action: dict, guard: dict,
+                               selection: dict, session: str, *, after_undo: bool = False) -> None:
+        """只在用户请求重新预览时重新绑定；不能在应用或预览后校验时迁移凭据。
+
+        旧文件可用当前内容加旧 session 验证原哈希；索引变化时先由旧公开快照
+        重建并验证原哈希，证明工程、组和声库相同，再忽略索引比较。不能用
+        相似旋律绕过私有目标保护；跨位置复用另走显式复制入口。
+        """
+        strict = session == guard.get("session") and _selection_identity(selection, session) == guard.get("selection")
+        stable = _proposal_selection_identity(selection)
+        if not strict:
+            same = stable == guard.get("proposalSelection")
+            if not same and not guard.get("proposalSelection"):
+                same = _selection_identity(selection, guard.get("session")) == guard.get("selection")
+                original = self._source_selection(document, action["id"])
+                if not same and original and isinstance(original.get("notes"), list):
+                    reconstructed = dict(selection)
+                    for key in ("notes", "noteCount", "startSeconds", "endSeconds", "groupPitchOffset"):
+                        if key in original:
+                            reconstructed[key] = original[key]
+                    same = (_selection_identity(reconstructed, guard.get("session")) == guard.get("selection")
+                            and _proposal_selection_identity(reconstructed) == stable)
+            if not same:
+                raise ConversationError("当前选区与原提案目标不同。可回到原选区重新预览，或点击“复用到当前选区”生成新预览，无需重复发送要求。")
+        candidate = {**guard, "selection": _selection_identity(selection, session), "session": session,
+                     "proposalSelection": stable, "targetScope": _target_scope(selection)}
+        # 跨连接必须有完整曲线指纹，避免点数相同却值已变化。旧摘要在同连接仍兼容。
+        self._check_guard(action, candidate, selection, session, after_undo=after_undo)
+        if not strict and session != guard.get("session"):
+            self._require_parameter_fingerprint(action, selection, reconnect=True)
+        guard.update(candidate)
+
+    @staticmethod
+    def _require_parameter_fingerprint(action: dict, selection: dict, *, reconnect: bool = False) -> None:
+        """撤销和跨连接恢复都必须由完整指纹证明参数原态，不能仅凭点数判断。"""
+        definition = selection.get("parameters", {}).get(action["parameter"], {})
+        capabilities = selection.get("capabilities", {})
+        fingerprint = definition.get("fingerprint") if isinstance(definition, dict) else None
+        if (not isinstance(capabilities, dict) or capabilities.get("curves") is not True
+                or not isinstance(definition, dict) or definition.get("available") is not True
+                or not isinstance(fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{16}:[1-9][0-9]{0,11}", fingerprint) is None):
+            if reconnect:
+                raise ConversationError("桥接会话已重连，但缺少完整参数指纹，无法验证原预览；请更新桥接，或使用“复用到当前选区”重新预览。")
+            raise ConversationError("当前桥接缺少完整参数指纹，无法确认撤销结果；请更新桥接并重新生成提案。")
 
     def _find_action(self, action_id: str) -> tuple[list, dict, dict, dict]:
         action_id = _identifier(action_id)
@@ -521,10 +643,97 @@ class ConversationManager:
                         return documents, document, action, guard
         raise ConversationError("调教提案不存在。")
 
+    def reuse_message(self, identifier: str, message_id: str) -> dict:
+        """将用户明确选择的方案复制到当前选区，始终创建新的待预览动作。
+
+        此入口既不请求模型，也不读取/上传原消息音频，更不写工程。音高曲线
+        要求音符旋律及相对节奏相符；通用增量包络按当前选区时长缩放。新的
+        目标基线由当前参数定义，不能携带旧 previewId、结果或确认票据。
+        """
+        identifier, message_id = _identifier(identifier), _identifier(message_id)
+        with self._lock(), self._lock(identifier), self.service.operation_lock:
+            document = self._read(identifier)
+            source = next((message for message in document["messages"] if message["id"] == message_id), None)
+            if not source or source.get("role") != "assistant" or not 1 <= len(source.get("actions", [])) <= 5:
+                raise ConversationError("请从包含参数建议的助手消息复用方案。")
+            actions = source["actions"]
+            if any(action.get("status") not in {"proposed", "previewed", "applied"}
+                   or (action.get("status") == "applied" and action.get("result", {}).get("verified") is not True)
+                   for action in actions):
+                raise ConversationError("原方案包含结果未知或未经核实的修改，不能通过复用重复执行；请先检查工程。")
+            if len(document["messages"]) >= MAX_MESSAGES:
+                raise ConversationError("单个会话最多 100 条消息，请新建会话。")
+            selection, session = self._capture_selection()
+            current_scope = _target_scope(selection)
+            normalized, excluded = [], []
+            for action in actions:
+                guard = document["_private"].get("actions", {}).get(action.get("id"))
+                if not isinstance(guard, dict):
+                    raise ConversationError("原方案缺少保护资料，无法复用。")
+                original = self._source_selection(document, action["id"])
+                if action["status"] == "applied":
+                    old_scope = guard.get("targetScope")
+                    # 旧提案缺少组定位哈希时，重叠组内范围保守拒绝；不要把缺失资料
+                    # 当成另一个目标。用户仍可回原选区执行正常的撤销后重新预览。
+                    group_matches = not isinstance(old_scope, dict) or old_scope.get("group") == current_scope["group"]
+                    source_scope = old_scope if isinstance(old_scope, dict) else _target_scope(original or {})
+                    start, end = source_scope.get("start"), source_scope.get("end")
+                    values = (start, end, current_scope["start"], current_scope["end"])
+                    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in values):
+                        raise ConversationError("已应用方案缺少可靠目标范围，无法判断是否重复叠加；请先检查工程。")
+                    if group_matches and max(start, current_scope["start"]) < min(end, current_scope["end"]):
+                        raise ConversationError("当前选区与已应用方案的原选区重叠，不能再次复制叠加；请先撤销，再使用原建议的重新预览。")
+                try:
+                    proposal = {key: action[key] for key in ("parameter", "delta", "curve", "renderMode", "reason") if key in action}
+                    checked = validate_action(proposal, selection)
+                    if checked["parameter"] in {"pitchCurve", "pitchDelta"} and "curve" in checked:
+                        if original is None:
+                            raise ConversationError("原音高方案没有音符快照，无法验证复用对应关系。")
+                        before, after = _melody_layout(original), _melody_layout(selection)
+                        if len(before) != len(after) or any(abs(old - new) > 1e-6
+                                for old_note, new_note in zip(before, after) for old, new in zip(old_note, new_note)):
+                            raise ConversationError("音符音高或相对节奏不匹配，未复用音高曲线；请选择相同旋律和节奏的片段，或另行生成音高建议。")
+                    if checked["parameter"] == "pitchCurve":
+                        from .pitch_shapes import validate_note_alignment
+                        validate_note_alignment(checked.get("curve"), selection)
+                    normalized.append(checked)
+                except (ParameterError, ConversationError) as error:
+                    excluded.append(f"{action.get('label') or action['parameter']}：{error}")
+            if not normalized:
+                raise ConversationError("没有适用于当前选区的参数。" + "；".join(excluded))
+            text = (f"已在本地复用 {len(normalized)} 项参数建议到当前选区，未再次调用模型或发送音频。"
+                    "曲线按当前选区时长缩放，并基于当前参数生成新预览；尚未修改工程，请核对新范围与效果后确认。")
+            if excluded:
+                text += "\n\n未复用的参数：\n" + "\n".join(excluded)
+            reply, guards = self._planned_message({"text": text, "actions": normalized}, selection, session)
+            reply.update(origin="reuse", selection=_safe_selection(selection))
+            # 复制建议本身不会删除原消息及应用记录，但必须撤销所有旧预览确认资格。
+            # 使用同一 document 实例，避免从磁盘读回旧副本覆盖本次新增消息。
+            for path in self._paths():
+                other = document if path.stem == identifier else self._read(path.stem)
+                changed = other["_private"].pop("batch", None) is not None
+                for message in other["messages"]:
+                    for item in message.get("actions", []):
+                        if item.get("status") == "previewed":
+                            item["status"] = "proposed"
+                            for key in ("preview", "previewBatchId"):
+                                item.pop(key, None)
+                            changed = True
+                if changed and other is not document:
+                    self._save(other)
+            document["messages"].append(reply)
+            document["_private"]["actions"].update(guards)
+            # 元数据装饰可能因资料损坏失败，必须在追加落盘前完成，避免 HTTP 400
+            # 被页面解释为“尚未创建”后重复复制。成功写入后只更新普通时间字段。
+            public = self._public(document)
+            self._save(document)
+            public["updatedAt"] = document["updatedAt"]
+            return {"conversation": public, "messageId": reply["id"]}
+
     @staticmethod
     def _check_guard(action: dict, guard: dict, selection: dict, session: str, *, after_undo: bool = False) -> None:
         if session != guard.get("session") or _selection_identity(selection, session) != guard.get("selection"):
-            raise ConversationError("桥接会话或目标选区已变化，请重新发送要求生成提案。")
+            raise ConversationError("本次预览的桥接会话或选区已变化，请重新预览后再确认；若已改选其他片段，可使用“复用到当前选区”。")
         if action["parameter"] == "pitchCurve" and selection.get("parameters", {}).get("pitchCurve", {}).get("available") is False:
             # 已存提案可能早于能力诊断升级；先给出本地固定的具体能力提示，不能
             # 把非零音高偏移的叠加保护误报为无缘由的摘要变化。
@@ -537,18 +746,11 @@ class ConversationManager:
             # 旧桥接只报告点数，无法分辨「已经撤销」与「同点数但不同数值」。
             # 只有新桥接的完整曲线指纹可证明原状态；格式与 Lua fingerprint()
             # 一致，为两个 32 位散列及序列化长度，拒绝 unavailable/oversized。
-            definition = selection.get("parameters", {}).get(action["parameter"], {})
-            capabilities = selection.get("capabilities", {})
-            fingerprint = definition.get("fingerprint") if isinstance(definition, dict) else None
-            if (not isinstance(capabilities, dict) or capabilities.get("curves") is not True
-                    or not isinstance(definition, dict) or definition.get("available") is not True
-                    or not isinstance(fingerprint, str)
-                    or re.fullmatch(r"[0-9a-f]{16}:[1-9][0-9]{0,11}", fingerprint) is None):
-                raise ConversationError("当前桥接缺少完整参数指纹，无法确认撤销结果；请更新桥接并重新生成提案。")
+            ConversationManager._require_parameter_fingerprint(action, selection)
         if _parameter_identity(selection, action["parameter"]) != guard.get("parameter"):
             if after_undo:
                 raise ConversationError("目标参数尚未恢复到本提案生成前的状态；请先撤销对应修改，再重新预览。若已继续编辑，请重新生成提案。")
-            raise ConversationError("目标参数摘要已变化，请重新生成该参数的调教提案。")
+            raise ConversationError("目标参数摘要已变化。若要沿用原建议，请点击“复用到当前选区”，基于当前参数重新预览并确认。")
         try:
             # 能力可能在连接期间变化；即使所有点数未变，也不能应用已不可用的操作。
             validate_action({key: action[key] for key in ("parameter", "delta", "curve", "renderMode", "reason")
@@ -567,7 +769,7 @@ class ConversationManager:
                 if after_undo and action.get("result", {}).get("verified") is not True:
                     raise ConversationError("该提案缺少已确认的应用记录，不能重新执行；请检查工程并重新生成提案。")
                 selection, session = self._capture_selection()
-                self._check_guard(action, guard, selection, session, after_undo=after_undo)
+                self._prepare_preview_guard(document, action, guard, selection, session, after_undo=after_undo)
                 if after_undo:
                     # 宿主原生撤销和网页恢复都表现为完整原指纹重现。确认后先持久
                     # 退回 proposed，并丢弃旧确认凭据；即使本次预览中断也只能重做
@@ -681,7 +883,7 @@ class ConversationManager:
                     if restored and action.get("result", {}).get("verified") is not True:
                         raise ConversationError("该提案缺少已确认的应用记录，不能重新执行；请检查工程并重新生成提案。")
                     try:
-                        self._check_guard(action, guard, selection, session, after_undo=restored)
+                        self._prepare_preview_guard(document, action, guard, selection, session, after_undo=restored)
                         eligible_ids.add(action["id"])
                     except ConversationError as error:
                         # 同一乐句的一项能力或参数守卫失败，不妨碍其他参数只读预演。

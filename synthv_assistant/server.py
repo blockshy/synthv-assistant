@@ -234,6 +234,11 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                     return self.workbench_response(service.update_conversation_model_options, path.split("/")[3], args)
                 elif re.fullmatch(r"/api/conversations/[0-9a-f]{32}/render-mode", path):
                     return self.workbench_response(service.update_conversation_render_mode, path.split("/")[3], args)
+                elif re.fullmatch(r"/api/conversations/[0-9a-f]{32}/reuse", path):
+                    # 浏览器只能指定已有消息；曲线、目标及新凭据全部由本机重新校验。
+                    if set(args) != {"messageId"}:
+                        raise ValueError("复用方案只接受 messageId 字段。")
+                    return self.workbench_response(service.reuse_message, path.split("/")[3], args["messageId"])
                 elif re.fullmatch(r"/api/conversations/[0-9a-f]{32}/delete", path):
                     if args:
                         raise ValueError("移入回收站不接受额外字段。")

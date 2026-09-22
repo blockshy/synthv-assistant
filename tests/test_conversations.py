@@ -363,7 +363,8 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(self.service.preview.call_count, 1)
         self.assertEqual(self.service.edit.call_count, 1)
 
-    def test_repreview_after_undo_still_binds_original_selection_and_session(self):
+    def test_repreview_after_undo_binds_original_selection_but_can_reconnect(self):
+        """实际音符变化仍拒绝；完整原指纹恢复后，桥接重连只需新预览与确认。"""
         action, original = self.prepare_applied_fingerprinted_action()
         self.selection["parameters"]["breathiness"] = original
         self.selection["notes"][0]["pitch"] = 61
@@ -371,10 +372,10 @@ class ConversationTests(unittest.TestCase):
             self.manager.preview_action(action["id"])
         self.selection["notes"][0]["pitch"] = 60
         self.service.bridge.status.return_value["session"] = "new-session"
-        with self.assertRaisesRegex(ConversationError, "会话"):
-            self.manager.preview_action(action["id"])
-        self.assertEqual(self.read_saved()["messages"][-1]["actions"][0]["status"], "applied")
-        self.assertEqual(self.service.preview.call_count, 1)
+        self.assertEqual(self.manager.preview_action(action["id"])["status"], "previewed")
+        self.assertEqual(self.read_saved()["_private"]["actions"][action["id"]]["session"], "new-session")
+        self.assertEqual(self.service.preview.call_count, 2)
+        self.assertEqual(self.service.edit.call_count, 1)
 
     def test_legacy_applied_action_cannot_replay_from_point_count_or_later_upgrade(self):
         """旧摘要不能证明撤销，升级后当前新增的指纹也不能补造旧提案的原指纹。"""
