@@ -321,40 +321,41 @@ function M.write(group, snapshot)
   return true
 end
 
-local function assertZeroDelta(group, begin, finish)
+local function inspectDelta(group, begin, finish)
+  -- 原生控制曲线与 pitchDelta 是两个独立编辑对象；已有偏移不妨碍读取、克隆
+  -- 和预览原生曲线。这里只检查依赖是否可完整读取，绝不清零、相减或猜测合成
+  -- 顺序。预览明确展示原生控制值，而不是声称已测得最终音频基频。
   local curve,points,interpolation,fingerprint=deltaState(group)
   local kind=interpolation:lower()
   if kind~="linear" and kind~="cosine" and kind~="cubic" then
-    fail("音高偏移插值方式未知，无法确认其在选区内为零。")
+    fail("音高偏移插值方式未知，无法可靠读取原生音高依赖。")
   end
+  local nonzero=false
   local positions={[begin]=true,[finish]=true}
   for _,point in ipairs(points) do if point[1]>begin and point[1]<finish then positions[point[1]]=true end end
   local breaks={}; for position in pairs(positions) do breaks[#breaks+1]=position end
   table.sort(breaks)
   -- 将旧断点分段后检查端点与三个内部点，覆盖三次插值由区外点带来的内部弯曲。
-  -- 任意非零值均拒绝，不按容差吞掉小偏移，也绝不为了通过检查清除 pitchDelta。
+  -- 非零值仅产生保留说明；非有限值仍拒绝。完整指纹继续参与应用和恢复校验，
+  -- 因而用户在预览后编辑旧偏移时，不能应用一个依赖已失效的候选。
   for index=1,#breaks-1 do
     for sample=0,4 do
       local value=invoke(curve,"get",breaks[index]+(breaks[index+1]-breaks[index])*sample/4)
-      if not finite(value) or value~=0 then
-        fail("选区内音高偏移并非零，无法确认原生音高叠加顺序；请先处理音高偏移曲线。")
-      end
+      if not finite(value) then fail("无法可靠读取选区内的音高偏移，未生成原生音高预览。") end
+      nonzero=nonzero or value~=0
     end
   end
-  return fingerprint
+  return fingerprint,nonzero
 end
 
+local preservedDeltaWarning="选区内已有音高偏移，将原样保留；图中显示新原生控制曲线，不代表最终合成音高，请应用后试听。"
+
 function M.selectionAvailability(group, begin, finish)
-  -- 接口存在不代表当前选区可以使用绝对音高。先在只读目录阶段检查旧音高偏移，
-  -- 防止模型反复提出必然被预览拒绝的 pitchCurve；绝不删除、归零或猜测相减。
-  -- 保留 describe 的完整数据指纹，本函数仅补充选区限制及固定的机器可读原因。
+  -- 保留 describe 的完整指纹，能力判断与预览采用相同依赖读取检查；已有非零
+  -- 偏移仅提示保留，不再把「控制曲线预览」误当成必须先合成音频才能完成的操作。
   if not finite(begin) or not finite(finish) or finish<=begin then return {available=true} end
-  local ok,result=pcall(assertZeroDelta,group,begin,finish)
-  if ok then return {available=true} end
-  if result=="选区内音高偏移并非零，无法确认原生音高叠加顺序；请先处理音高偏移曲线。" then
-    return {available=false,code="pitch-delta-nonzero",
-      message="选区内已有非零音高偏移，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）做小幅调整，或在宿主中处理旧音高后重新读取选区。"}
-  end
+  local ok,result,nonzero=pcall(inspectDelta,group,begin,finish)
+  if ok then return {available=true,message=nonzero and preservedDeltaWarning or nil} end
   return {available=false,code="pitch-delta-unknown",
     message="无法确认选区内音高偏移的兼容状态，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）或检查宿主曲线。"}
 end
@@ -404,7 +405,8 @@ function M.preview(args, ctx)
   local transpose,timeOffset,low,high,noteCount=validateInput(args,ctx)
   local coordinateMode=calibratedInterpolationMode()
   local before=M.snapshot(ctx.group)
-  before.pitchDeltaFingerprint=assertZeroDelta(ctx.group,ctx.begin,ctx.finish)
+  local deltaFingerprint,hasExistingDelta=inspectDelta(ctx.group,ctx.begin,ctx.finish)
+  before.pitchDeltaFingerprint=deltaFingerprint
   local kept,replaced={},0
   for _,entry in ipairs(before.controls) do
     local row=entry.description
@@ -540,6 +542,7 @@ function M.preview(args, ctx)
     startSeconds=ctx.startSeconds,endSeconds=ctx.endSeconds,beforePointCount=before.pointCount,
     pointCount=after.pointCount,controlCount=#after.controls,
     replacedControlCount=replaced,pitchRange={low,high},curvePreview=previewRows,controlPoints=controlPoints,beforeAvailable=false,
+    capabilityWarnings=hasExistingDelta and {preservedDeltaWarning} or nil,
     summary="将按绝对MIDI音高写入连续原生曲线，替换完全位于选区内的原生曲线；已采样核验宿主插值，未读取生成音高作为基线，尚未写入。"}}
 end
 

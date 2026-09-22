@@ -128,7 +128,7 @@
 
 - 参数名称来自当前返回目录，声线模式必须使用其中的 `modeName`，不得硬编码某个声库一定提供 Cute、Sweet 等风格。目录可能只含当前已返回设置，页面应展示这一限制，不能把缺项擅自补成可用选项。
 - 手动补充是独立的用户操作：先提示用户核对 SynthV 当前声库面板原名，再提交 `{name,selection}`。名称去首尾空白后最多 80 个 UTF-8 字节，不能把 HTML maxlength 字符数当成字节校验，也不能偷偷截断名称。请求携带最近读取的完整选区，由后端抽取身份字段；过期或注册失败时不在本地伪造成功选项。展示 `source=host` 与 `source=user` 的区别，说明补充仅在桥接会话中有效，并不代表 API 已枚举或验证全部声线。
-- 先看 `capabilities.curves`、`capabilities.nativePitch`、`capabilities.batchPreview` 和参数 `available`。组合流程要求新版桥接明确提供 batchPreview，不能降级为逐项预览来冒充整组快照。脚本 API 不可用或当前选区已有非零 pitchDelta、兼容状态无法核实时，原生曲线按实际目录禁用并说明原因；新模型方案使用目录允许的偏移入口，不能清除已有音高或偷偷转换历史原生提案。
+- 先看 `capabilities.curves`、`capabilities.nativePitch`、`capabilities.batchPreview` 和参数 `available`。组合流程要求新版桥接明确提供 batchPreview，不能降级为逐项预览来冒充整组快照。脚本 API 不可用或音高依赖无法可靠读取时，原生曲线按实际目录禁用并说明原因。已有非零 pitchDelta 不单独禁用原生曲线，需常显宿主返回的保留说明及非最终合成音高提示；不能清除已有音高或偷偷转换历史原生提案。
 - 草稿协议沿用增量或曲线二选一。曲线为 2～64 个 `[position,value]`，位置严格递增且首尾为 0、1；横轴是当前连续选区的时间比例。通用/声线/pitchDelta 的值为偏移，pitchCurve 为绝对 MIDI，必须显示对应单位。
 - 默认 `smooth`，`points` 是显式的自动化控制点选项。原生 pitchCurve 只开放 smooth，并按真实音符 pitch 加 groupPitchOffset 计算允许音域；缺少可靠资料时禁用，不能猜测 60 或把音分当 MIDI 提交。
 - 会话输入区的绘制模式是独立持久偏好，发送时固定快照，切换不会改写历史提案；控制点模式的音高提案使用 pitchDelta。AI 逐音符包络由本机编译，前端不拼造新的音符或曲线来绕过 64 点上限。

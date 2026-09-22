@@ -395,15 +395,19 @@ class ProposalReuseTests(unittest.TestCase):
         self.service.preview.assert_not_called()
         self.assert_no_external_execution()
 
-    def test_reconnect_with_changed_parameter_still_requires_explicit_reuse(self):
+    def test_reconnect_with_changed_parameter_can_repreview_without_cloning_message(self):
+        """同一目标重连并改过参数后，重新预览复用意图，无需复制消息或再次请求模型。"""
         source = self.proposed_message()
+        action_id = source["actions"][0]["id"]
+        previous_guard = self.read_saved()["_private"]["actions"][action_id]
         self.service.bridge.status.return_value["session"] = "session-2"
         self.selection["parameters"]["breathiness"]["fingerprint"] = "fedcba9876543210:100"
-        with self.assertRaises(ConversationError):
-            self.manager.preview_action(source["actions"][0]["id"])
-        self.service.preview.assert_not_called()
-        message, _ = self.reuse(source)
-        self.assertEqual(self.manager.preview_action(message["actions"][0]["id"])["status"], "previewed")
+        self.assertEqual(self.manager.preview_action(action_id)["status"], "previewed")
+        saved = self.read_saved()
+        self.assertEqual(len(saved["messages"]), 2)
+        self.assertEqual(saved["_private"]["actions"][action_id]["session"], "session-2")
+        self.assertNotEqual(saved["_private"]["actions"][action_id]["parameter"], previous_guard["parameter"])
+        self.service.preview.assert_called_once()
         self.assert_no_external_execution()
 
     def test_stable_identity_ignores_note_indexes_and_input_order_but_keeps_lyrics(self):
@@ -450,6 +454,78 @@ class ProposalReuseTests(unittest.TestCase):
         self.assertNotEqual(first["batchId"], second["batchId"])
         self.assertEqual(second["errors"], [])
         self.assertTrue(all(action["status"] == "previewed" for action in second["actions"]))
+        self.assert_no_external_execution()
+
+    def test_batch_repreview_binds_each_current_parameter_and_rejects_stale_confirmation(self):
+        """组合候选各自绑定当前基线；一项参数再改动时，不能确认整批旧预览。"""
+        source = self.proposed_message([
+            {"parameter": "breathiness", "delta": 0.1, "reason": "调整气声。"},
+            {"parameter": "tension", "delta": 0.1, "reason": "调整张力。"},
+        ])
+        ids = [action["id"] for action in source["actions"]]
+        first = self.manager.preview_batch(ids)
+        first_guards = self.read_saved()["_private"]["actions"]
+        for parameter in ("breathiness", "tension"):
+            self.selection["parameters"][parameter]["fingerprint"] = "fedcba9876543210:100"
+        with self.assertRaisesRegex(ConversationError, "参数摘要"):
+            self.manager.apply_batch(first["batchId"])
+        second = self.manager.preview_batch(ids)
+        self.assertEqual(second["errors"], [])
+        self.assertTrue(all(action["status"] == "previewed" for action in second["actions"]))
+        self.assertNotEqual(first["batchId"], second["batchId"])
+        current_guards = self.read_saved()["_private"]["actions"]
+        for action_id in ids:
+            self.assertNotEqual(first_guards[action_id]["parameter"], current_guards[action_id]["parameter"])
+        self.selection["parameters"]["tension"]["fingerprint"] = "aaaaaaaaaaaaaaaa:100"
+        with self.assertRaisesRegex(ConversationError, "参数摘要"):
+            self.manager.apply_batch(second["batchId"])
+        self.assert_no_external_execution()
+
+    def test_batch_repreview_cannot_rebind_parameter_changes_during_host_preview(self):
+        """批次的基线只能在读取选区时更新，宿主预演中发生编辑必须整体失效。"""
+        source = self.proposed_message([
+            {"parameter": "breathiness", "delta": 0.1, "reason": "调整气声。"},
+            {"parameter": "tension", "delta": 0.1, "reason": "调整张力。"},
+        ])
+        ids = [action["id"] for action in source["actions"]]
+        self.manager.preview_batch(ids)
+        self.selection["parameters"]["tension"]["fingerprint"] = "fedcba9876543210:100"
+
+        def batch_with_edit(*args, **kwargs):
+            result = self.host_batch(*args, **kwargs)
+            self.selection["parameters"]["tension"]["fingerprint"] = "aaaaaaaaaaaaaaaa:100"
+            return result
+
+        self.service.preview_batch.side_effect = batch_with_edit
+        with self.assertRaisesRegex(ConversationError, "参数摘要"):
+            self.manager.preview_batch(ids)
+        saved = self.read_saved()
+        self.assertNotIn("batch", saved["_private"])
+        for action in saved["messages"][-1]["actions"]:
+            self.assertEqual(action["status"], "proposed")
+            self.assertNotIn("preview", action)
+        self.assert_no_external_execution()
+
+    def test_batch_repreview_keeps_unrestored_applied_parameter_locked(self):
+        """同一批中只更新未应用动作；已应用且未撤销的动作不得借其他成功项解锁。"""
+        source = self.proposed_message([
+            {"parameter": "tension", "delta": 0.1, "reason": "调整张力。"},
+            {"parameter": "breathiness", "delta": 0.1, "reason": "调整气声。"},
+        ])
+        self.mark_status(source, "applied", verified=True)
+        ids = [action["id"] for action in source["actions"]]
+        original_guard = self.read_saved()["_private"]["actions"][ids[0]]
+        for parameter in ("tension", "breathiness"):
+            self.selection["parameters"][parameter]["fingerprint"] = "fedcba9876543210:100"
+        result = self.manager.preview_batch(ids)
+        self.assertEqual([action["status"] for action in result["actions"]], ["applied", "previewed"])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["actionId"], ids[0])
+        self.assertIn("尚未恢复", result["errors"][0]["message"])
+        saved = self.read_saved()
+        self.assertEqual(saved["_private"]["actions"][ids[0]], original_guard)
+        self.assertTrue(saved["messages"][-1]["actions"][0]["result"]["verified"])
+        self.assertEqual(saved["_private"]["batch"]["actionIds"], [ids[1]])
         self.assert_no_external_execution()
 
 

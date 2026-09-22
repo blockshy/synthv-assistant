@@ -897,6 +897,15 @@
       $("preview-details").textContent = printable(result);
       const chart = window.SynthVCurves.createPreview(result);
       $("preview-curve-chart").replaceChildren(); if (chart) $("preview-curve-chart").append(chart);
+      // 与会话预览一样常显服务端返回的能力限制；特别是原生音高与保留偏移的
+      // 区别，不能要求用户打开完整 JSON 才能发现。只呈现已校验的有界字符串，
+      // 不从草稿补造说明，并通过 textContent 避免把提示解释成 HTML。
+      if (Array.isArray(result.capabilityWarnings)) for (const warning of result.capabilityWarnings.slice(0, 16)) {
+        if (typeof warning !== "string" || !warning.trim() || warning.length > 1000) continue;
+        const note = document.createElement("p"); note.className = "field-help warning";
+        note.dataset.previewWarning = result.parameter || payload.parameter;
+        note.textContent = warning; $("preview-curve-chart").append(note);
+      }
       $("preview-result").hidden = false;
       feedback("tuning-feedback", state.status?.writeEnabled ? "预览已就绪，尚未改动工程。" : "预览已就绪。开启选区写入后才能应用。");
     });

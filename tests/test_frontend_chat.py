@@ -303,6 +303,67 @@ assert.match(get('chat-feedback').textContent,/已确认应用 2 项/);
 await chat.executeBatch('reply-a','apply');assert.equal(calls.length,2);
 """)
 
+    def test_preview_warnings_remain_visible_outside_single_and_batch_details(self):
+        """音高语义与边界保护说明常显，组合标注所属参数，字符串不能变成页面脚本。"""
+        self.run_case(r"""
+const pitch=previewed(action('pitch','pitchCurve'));
+pitch.label='原生音高曲线';
+pitch.preview.capabilityWarnings=['已有音高偏移会保留；图中原生曲线不是最终音频基频。','<script>仅作文字</script>',null,{},''];
+chat.setConversation(base('conversation-a',[proposal('single',[pitch])]));
+let notices=get('chat-history').querySelectorAll('[data-preview-warning]');
+assert.equal(notices.length,2);
+assert(notices.every(node=>node.parent.tag==='article'));
+assert.match(notices[0].textContent,/不是最终音频基频/);
+assert.equal(notices[1].textContent,'<script>仅作文字</script>');
+assert.equal(notices[1].children.length,0);
+const tension=previewed(action('tension'));
+tension.label='张力';tension.preview.capabilityWarnings=['为保持选区外曲线，已补充保护点。'];
+chat.setConversation(base('conversation-b',[proposal('batch',[pitch,tension])]));
+notices=get('chat-history').querySelectorAll('[data-preview-warning]');
+assert.equal(notices.length,3); // 折叠的逐项卡片不重复生成提示。
+assert(notices.every(node=>node.parent.tag==='section'&&node.parent.classList.contains('message-actions')));
+assert.match(notices[0].textContent,/^原生音高曲线：.*不是最终音频基频/);
+assert.match(notices[2].textContent,/^张力：.*保护点/);
+const folded=get('chat-history').querySelectorAll('.batch-action-details')[0];
+assert.equal(folded.querySelectorAll('[data-preview-warning]').length,0);
+chat.setConversation(base('conversation-c',[proposal('clean',[action('clean')])]));
+assert.equal(get('chat-history').querySelectorAll('[data-preview-warning]').length,0);
+assert.equal(calls.length,0); // 说明只依赖已返回的预览，不发起额外请求。
+""")
+
+    def test_manual_preview_shows_warnings_and_clears_them_for_next_result(self):
+        """执行实际手动预览提交处理器，确认提示位于展开图表内且不会残留到下一次预览。"""
+        self.run_case(r"""
+const appSource=fs.readFileSync('web/app.js','utf8');
+const begin=appSource.indexOf('  $("tuning-form").addEventListener("submit",');
+const end=appSource.indexOf('  $("apply-change").addEventListener(',begin);
+assert(begin>=0&&end>begin,'缺少手动预览处理器边界');
+for(const id of ['tuning-form','preview-summary','preview-details','preview-curve-chart','preview-result']) {
+  const node=new Element();node.id=id;fields.set(id,node);
+}
+get('tuning-form').reportValidity=()=>true;
+const result={previewId:'manual-preview',parameter:'pitchCurve',label:'原生音高曲线',
+  capabilityWarnings:['保留已有音高偏移；原生曲线不是最终音频基频。','<b>仍是纯文本</b>',null]};
+let manualPending,previews=0;
+const manualContext={document,window,$:get,state:{status:{writeEnabled:false}},
+  parameterEditor:{getPayload:()=>({parameter:'pitchCurve',curve:[[0,60],[1,60]]}),describe:()=>({unit:'MIDI 半音'})},
+  runBusy:(_kind,_feedback,task)=>{manualPending=task();},invalidatePreview(){},feedback(){},
+  api:async(path)=>{assert.equal(path,'/api/preview');previews++;return result;},
+  finite:Number.isFinite,numberText:String,printable:JSON.stringify};
+vm.createContext(manualContext);vm.runInContext(appSource.slice(begin,end),manualContext);
+get('tuning-form').listeners.submit({preventDefault(){}});await manualPending;
+const chart=get('preview-curve-chart');
+let notices=chart.querySelectorAll('[data-preview-warning]');
+assert.equal(notices.length,2);assert(notices.every(node=>node.parent===chart));
+assert.match(notices[0].textContent,/不是最终音频基频/);
+assert.equal(notices[1].textContent,'<b>仍是纯文本</b>');assert.equal(notices[1].children.length,0);
+assert.equal(get('preview-result').hidden,false);
+delete result.capabilityWarnings;
+get('tuning-form').listeners.submit({preventDefault(){}});await manualPending;
+assert.equal(chart.querySelectorAll('[data-preview-warning]').length,0);
+assert.equal(previews,2);
+""")
+
     def test_batch_apply_timeout_keeps_unknown_and_never_replays(self):
         """写请求结果不明时两项都保持 unknown，失败后再次调用也不得重放。"""
         self.run_case(r"""

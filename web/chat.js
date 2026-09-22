@@ -298,6 +298,19 @@
     return card;
   }
 
+  /** 将服务端校验过的预览限制常显于图表旁，避免关键语义只留在折叠 JSON 中。 */
+  function appendPreviewWarnings(container, preview, label = "") {
+    if (!Array.isArray(preview?.capabilityWarnings)) return;
+    // 只接收公开预览契约中的有界字符串，不读取模型理由或推测额外风险。
+    // element 内部使用 textContent；提示即使含尖括号，也只能作为文字展示。
+    for (const warning of preview.capabilityWarnings.slice(0, 16)) {
+      if (typeof warning !== "string" || !warning.trim() || warning.length > 1000) continue;
+      const note = element("p", "field-help warning", label ? `${label}：${warning}` : warning);
+      note.dataset.previewWarning = preview.parameter || "";
+      container.append(note);
+    }
+  }
+
   /** 预览信息直接呈现宿主返回的范围，不把模型推测值当作已读取的工程事实。 */
   function renderAction(action, grouped = false) {
     const card = element("article", "assistant-action"); card.dataset.actionId = action.id;
@@ -324,7 +337,10 @@
       for (const [label, value] of fields) { const group = element("div"); group.append(element("dt", "", label), element("dd", "", value)); scope.append(group); }
       card.append(scope);
       if (Number.isFinite(preview.beforePointCount) || Number.isFinite(preview.pointReduction)) card.append(element("p", "action-curve-summary", `${Number.isFinite(preview.beforePointCount) ? `原有 ${preview.beforePointCount} 点` : "原有点数未提供"}${Number.isFinite(preview.pointReduction) ? ` · 精简减少 ${preview.pointReduction} 点` : ""} · ${window.SynthVCurves.representation(preview.representation, preview.renderMode)}`));
-      if (!grouped) { const chart = window.SynthVCurves.createPreview(preview); if (chart) card.append(chart); }
+      if (!grouped) {
+        const chart = window.SynthVCurves.createPreview(preview); if (chart) card.append(chart);
+        appendPreviewWarnings(card, preview);
+      }
       card.append(details("完整预览明细", preview));
     }
     if (action.result) card.append(details("查看真实执行结果", action.result));
@@ -375,6 +391,9 @@
       : "一次读取并预览整组参数；确认后应用本次预览成功的项目。历史图形仅供查看，重新预览后才能应用。"));
     const chart = window.SynthVCurves.createCombinedPreview(actions.map((action, colorIndex) => ({ id: action.id, label: label(action), colorIndex, preview: action.preview })));
     if (chart) group.append(chart);
+    // 组合方案把限制按参数归属放在展开区域；逐项折叠明细不再重复这些段落。
+    // 尤其原生音高存在保留的 pitchDelta 时，用户确认前必须看到图形的语义。
+    for (const action of actions) appendPreviewWarnings(group, action.preview, label(action));
     if (errors.length) {
       const list = element("ul", "field-help error");
       for (const action of errors) list.append(element("li", "", `${label(action)}：${state.actionErrors.get(action.id)}`));

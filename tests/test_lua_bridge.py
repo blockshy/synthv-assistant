@@ -76,6 +76,13 @@ function Curve:get(x)
       local m1=(nextp[2]-a[2])/(nextp[1]-a[1])
       -- 允许不同三次切线权重，验证保护算法依赖宿主读回而非猜测一种样条公式。
       m0=m0*(host.cubicSlopeFactor or 1); m1=m1*(host.cubicSlopeFactor or 1)
+      if host.clampCubicTangents then
+        -- 覆盖限制过冲的三次插值：不均匀旧节点可能让某一段的切线被截为零，
+        -- 插入节点后又恢复为非零。该替身用于反例验证，不声称复刻宿主私有实现。
+        local secant=(b[2]-a[2])/length
+        if m0*secant<0 or math.abs(m0)>3*math.abs(secant) then m0=0 end
+        if m1*secant<0 or math.abs(m1)>3*math.abs(secant) then m1=0 end
+      end
       return (2*t^3-3*t^2+1)*a[2]+(t^3-2*t^2+t)*length*m0
         +(-2*t^3+3*t^2)*b[2]+(t^3-t^2)*length*m1
     end
@@ -266,6 +273,90 @@ end; host.curve.points=p
         self.assertGreater(smooth["pointReduction"], 0)
         self.assertAlmostEqual(smooth["curvePreview"][48]["after"], 0.1)
         self.assertEqual(self.host.mutations, 0)
+
+    def test_graded_guards_preserve_sparse_clamped_cubic_without_editing_the_host(self):
+        """短陡坡夹着长缓坡时，插入边缘点会改变切线限制；预览应保形而非误拦截。"""
+        for mirrored in (False, True):
+            with self.subTest(mirrored=mirrored):
+                # 全部坐标与数值均为合成数据；真实 blick 尺度和 float32 保存精度
+                # 用来覆盖老算法 512 点仍无法收敛的边界，不读取或提交用户工程。
+                self.lua.execute('''
+local scale=700000000
+local axis=SV:getProject():getTimeAxis()
+function axis:getSecondsFromBlick(b) return b/scale end
+function axis:getBlickFromSeconds(s) return s*scale end
+local note=SV:getMainEditor():getSelection():getSelectedNotes()[1]
+function note:getOnset() return scale end
+function note:getDuration() return 9*scale end
+host.method="Cubic"; host.quantize=true; host.clampCubicTangents=true
+host.mutations=0; host.undos=0
+host.curve.points={{.85*scale,-.02},{.88*scale,-.28},{10.4*scale,-.31},{10.43*scale,0}}
+for _,point in ipairs(host.curve.points) do
+  point[2]=string.unpack("f",string.pack("f",point[2]))
+end
+''')
+                if mirrored:
+                    self.lua.execute('''
+local mirrored={}
+for index=#host.curve.points,1,-1 do
+  local point=host.curve.points[index]
+  mirrored[#mirrored+1]={11*700000000-point[1],-point[2]}
+end
+host.curve.points=mirrored
+''')
+                original = [[point[1], point[2]] for point in self.host.curve.points.values()]
+                # 密集独立采样覆盖两侧原始陡坡、选区附近缓坡及首尾常值外推；
+                # 不只检查保护点本身，后者即使插值漂移也可能恰好全部通过。
+                positions = [(0.5 + index / 4000) * 700000000 for index in range(2001)]
+                positions += [(10 + index / 4000) * 700000000 for index in range(2001)]
+                before = [self.host.curve.get(self.host.curve, value) for value in positions]
+                response = self.call("preview", parameter="breathiness",
+                                     curve=[[0, 0], [0.2, 0.03], [0.7, 0.05], [1, 0]])
+                self.assertTrue(response["ok"], response.get("error"))
+                preview = response["result"]
+                self.assertLessEqual(preview["pointCount"], 4000)
+                self.assertLess(len(preview["controlPoints"]), 50)
+                self.assertTrue(any("区外保护点" in item for item in preview["capabilityWarnings"]))
+                self.assertEqual(self.host.mutations, 0)
+                self.assertEqual(self.host.undos, 0)
+                self.enable()
+                self.assertTrue(self.call("apply", previewId=preview["previewId"])["ok"])
+                after = [self.host.curve.get(self.host.curve, value) for value in positions]
+                self.assertLessEqual(max(abs(a - b) for a, b in zip(before, after)), 1e-7)
+                # 保形不能以取消调教为代价：选区中段必须真实叠加曲线所要求的增量。
+                middle = preview["curvePreview"][48]
+                self.assertAlmostEqual(middle["after"] - middle["before"], 0.042, delta=0.002)
+                self.assertEqual(self.host.curve.getInterpolationMethod(self.host.curve), "Cubic")
+                self.assertTrue(self.call("restore")["ok"])
+                self.assertEqual([[point[1], point[2]] for point in self.host.curve.points.values()], original)
+                self.assertEqual([self.host.curve.get(self.host.curve, value) for value in positions], before)
+
+    def test_graded_guards_preserve_unclamped_cubic_at_real_blick_scale(self):
+        """普通三次曲线也会发生细分接缝漂移；回退不可只适用于切线截断替身。"""
+        self.lua.execute('''
+local scale=700000000
+local axis=SV:getProject():getTimeAxis()
+function axis:getSecondsFromBlick(b) return b/scale end
+function axis:getBlickFromSeconds(s) return s*scale end
+local note=SV:getMainEditor():getSelection():getSelectedNotes()[1]
+function note:getOnset() return scale end
+function note:getDuration() return scale end
+host.method="Cubic"; host.quantize=true
+host.curve.points={{0,.2},{.5*scale,-.2},{2.4*scale,.4},{3*scale,0}}
+for _,point in ipairs(host.curve.points) do
+  point[2]=string.unpack("f",string.pack("f",point[2]))
+end
+''')
+        positions = [index * 700000 for index in range(-100, 3101)
+                     if index <= 1000 or index >= 2000]
+        before = [self.host.curve.get(self.host.curve, value) for value in positions]
+        response = self.call("preview", parameter="tension", delta=0.05)
+        self.assertTrue(response["ok"], response.get("error"))
+        self.assertEqual(self.host.mutations, 0)
+        self.enable()
+        self.assertTrue(self.call("apply", previewId=response["result"]["previewId"])["ok"])
+        after = [self.host.curve.get(self.host.curve, value) for value in positions]
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(before, after)), 1e-7)
 
     def test_preview_nodes_match_applied_points_without_external_points_or_resampling(self):
         """真实节点与隔离宿主写后读回一一对应，变速、时间偏移和 float32 量化不改变契约。"""

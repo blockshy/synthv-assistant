@@ -55,12 +55,17 @@ class ConversationBatchTests(unittest.TestCase):
         self.assertNotIn("projectFile", json.dumps(result))
         self.service.edit.assert_not_called()
 
-    def test_same_count_manual_edit_fails_one_guard_without_losing_other_parameter(self):
+    def test_same_count_manual_edit_repreviews_current_baseline_but_rejects_later_apply(self):
+        """新预览可以接受用户先前编辑；生成候选后再改值必须阻止整批确认。"""
         self.selection["parameters"]["breathiness"]["fingerprint"] = "0123456789abcdef:101"
         result = self.preview()
-        self.assertEqual(len(result["errors"]), 1)
-        self.assertEqual([item["id"] for item in self.service.preview_batch.call_args.args[1]], [self.ids[1]])
-        self.assertEqual(result["actions"][1]["status"], "previewed")
+        self.assertEqual(result["errors"], [])
+        self.assertEqual([item["id"] for item in self.service.preview_batch.call_args.args[1]], self.ids)
+        self.assertTrue(all(item["status"] == "previewed" for item in result["actions"]))
+        self.selection["parameters"]["breathiness"]["fingerprint"] = "0123456789abcdef:102"
+        with self.assertRaisesRegex(ConversationError, "参数摘要"):
+            self.manager.apply_batch(result["batchId"])
+        self.service.edit.assert_not_called()
 
     def test_cross_message_duplicate_and_cross_conversation_requests_never_reach_host(self):
         second = self.send()["messages"][-1]["actions"][0]["id"]

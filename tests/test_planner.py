@@ -180,7 +180,9 @@ class PlannerTests(unittest.TestCase):
         result = self.call()
         self.assertEqual(result["actions"][0]["renderMode"], "smooth")
         self.assertIn("未提供音频", result["text"])
-        self.assertIn("非零 pitchDelta 会拒绝预览", result["actions"][0]["reason"])
+        # 原生控制曲线不再因旧偏移存在而被一律拒绝；规划说明必须保留依赖与试听语义。
+        self.assertIn("保留已有音高偏移", result["actions"][0]["reason"])
+        self.assertIn("最终效果需试听", result["actions"][0]["reason"])
         for text in ("我已经听过音高效果。", "我可以自动选中末音。"):
             self.respond({"text": text, "actions": []})
             with self.assertRaises(planner.PlannerError):

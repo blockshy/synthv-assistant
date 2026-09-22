@@ -588,6 +588,11 @@ class ConversationManager:
                                selection: dict, session: str, *, after_undo: bool = False) -> None:
         """只在用户请求重新预览时重新绑定；不能在应用或预览后校验时迁移凭据。
 
+        未应用的建议保留参数调整意图；用户主动重新预览时，以当前曲线建立新的
+        基线，不要求工程始终停留在模型生成建议的时刻。此处只是生成只读候选，
+        预览完成与确认应用仍由 _check_guard 严格核对该候选捕获的真实基线。
+        已应用建议必须先证明撤销回到原态，结果未知的建议也不能借此解锁。
+
         旧文件可用当前内容加旧 session 验证原哈希；索引变化时先由旧公开快照
         重建并验证原哈希，证明工程、组和声库相同，再忽略索引比较。不能用
         相似旋律绕过私有目标保护；跨位置复用另走显式复制入口。
@@ -610,7 +615,15 @@ class ConversationManager:
                 raise ConversationError("当前选区与原提案目标不同。可回到原选区重新预览，或点击“复用到当前选区”生成新预览，无需重复发送要求。")
         candidate = {**guard, "selection": _selection_identity(selection, session), "session": session,
                      "proposalSelection": stable, "targetScope": _target_scope(selection)}
-        # 跨连接必须有完整曲线指纹，避免点数相同却值已变化。旧摘要在同连接仍兼容。
+        if not after_undo and action.get("status") in {"proposed", "previewed"}:
+            # 参数指纹覆盖整条曲线，选区外编辑或能力目录更新也可能改变摘要。
+            # 对未应用建议重新预览时重建基线，避免把正常编辑误当成不可恢复的
+            # 旧提案；动作的范围、类型、可用状态仍须通过下方 validate_action。
+            # 不修改 applied/unknown 的基线，否则会把未撤销或结果未知的写入
+            # 伪装成全新建议，并可能重复叠加。旧预览凭据由预览入口统一清除。
+            candidate["parameter"] = _parameter_identity(selection, action["parameter"])
+        # 跨连接必须绑定完整曲线指纹，保证新预览到确认之间的同点数改值也能
+        # 被识别；旧摘要仅保留同连接兼容，不能借重连降低新候选的验证强度。
         self._check_guard(action, candidate, selection, session, after_undo=after_undo)
         if not strict and session != guard.get("session"):
             self._require_parameter_fingerprint(action, selection, reconnect=True)
@@ -618,7 +631,7 @@ class ConversationManager:
 
     @staticmethod
     def _require_parameter_fingerprint(action: dict, selection: dict, *, reconnect: bool = False) -> None:
-        """撤销和跨连接恢复都必须由完整指纹证明参数原态，不能仅凭点数判断。"""
+        """撤销核验与跨连接候选均须有完整参数指纹，不能仅凭控制点数量保护。"""
         definition = selection.get("parameters", {}).get(action["parameter"], {})
         capabilities = selection.get("capabilities", {})
         fingerprint = definition.get("fingerprint") if isinstance(definition, dict) else None
@@ -750,7 +763,7 @@ class ConversationManager:
         if _parameter_identity(selection, action["parameter"]) != guard.get("parameter"):
             if after_undo:
                 raise ConversationError("目标参数尚未恢复到本提案生成前的状态；请先撤销对应修改，再重新预览。若已继续编辑，请重新生成提案。")
-            raise ConversationError("目标参数摘要已变化。若要沿用原建议，请点击“复用到当前选区”，基于当前参数重新预览并确认。")
+            raise ConversationError("本次预览的目标参数摘要已变化，请重新预览后再确认。")
         try:
             # 能力可能在连接期间变化；即使所有点数未变，也不能应用已不可用的操作。
             validate_action({key: action[key] for key in ("parameter", "delta", "curve", "renderMode", "reason")

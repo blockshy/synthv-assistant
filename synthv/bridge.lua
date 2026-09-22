@@ -171,10 +171,12 @@ local function selection()
       durationSeconds=axis:getSecondsFromBlick(finish)-axis:getSecondsFromBlick(onset)}
   end
   local curves,voiceFingerprint,modeCount=parameterCatalog(editor,ref,group)
+  local pitchWarning=nil
   if curves.pitchCurve and curves.pitchCurve.available and first and last then
-    -- begin/finish 必须换回音符组坐标；选区目录与真正预览复用同一零偏移校验。
+    -- begin/finish 必须换回音符组坐标；目录与预览采用相同的完整依赖读取检查。
     -- 不修改参数指纹，避免把能力提示误当成工程数据发生了改变。
     local availability=NativePitch.selectionAvailability(group,first-ref:getTimeOffset(),last-ref:getTimeOffset())
+    if availability.available then pitchWarning=availability.message end
     if not availability.available then
       curves.pitchCurve.available=false
       curves.pitchCurve.unavailableCode=availability.code
@@ -187,6 +189,7 @@ local function selection()
   if curves.pitchCurve and not curves.pitchCurve.available then
     warnings[#warnings+1]=curves.pitchCurve.unavailableReason
   end
+  if pitchWarning then warnings[#warnings+1]=pitchWarning end
   return {projectFile=projectName(),groupName=group:getName(),groupUUID=group:getUUID(),
     groupOffset=ref:getTimeOffset(),groupPitchOffset=pitchOffset,notes=notes,noteCount=#notes,voiceFingerprint=voiceFingerprint,
     startSeconds=first and axis:getSecondsFromBlick(first) or nil,
@@ -289,7 +292,32 @@ local function validateOutsideCurve(curve,original,points,begin,finish,method)
   -- 不放宽误差阈值、不更改插值类型，也不把“新点值等于旧值”当作整段不变的证据。
   local map={}; for _,point in ipairs(points) do map[point[1]]={point[1],point[2]} end
   local guardCount=0
-  for attempt=1,10 do
+  -- 记录原始插值区间，而非后来插入保护点形成的小段。局部细分若无法收敛，
+  -- 回退算法会整体重建受影响区间，避免稀疏/密集采样接缝把三次切线误差不断外推。
+  local regionKeys={[begin]=true,[finish]=true}
+  for _,point in ipairs(original) do regionKeys[point[1]]=true end
+  local regionEdges={}; for position in pairs(regionKeys) do regionEdges[#regionEdges+1]=position end
+  table.sort(regionEdges)
+  local regionSpan=math.max(1,regionEdges[#regionEdges]-regionEdges[1])
+  table.insert(regionEdges,1,regionEdges[1]-regionSpan)
+  regionEdges[#regionEdges+1]=regionEdges[#regionEdges]+regionSpan
+  local affectedRegions={}
+  local function rememberRegions(bad)
+    -- inspect 按时间排序返回失败段；双指针归并避免最多 4000 段逐一互相比对。
+    local first=1
+    for _,segment in ipairs(bad) do
+      while first<#regionEdges and regionEdges[first+1]<=segment[1] do first=first+1 end
+      local index=first
+      while index<#regionEdges and regionEdges[index]<segment[2] do
+        local left,right=regionEdges[index],regionEdges[index+1]
+        if (right<=begin or left>=finish) and segment[1]<right and segment[2]>left then
+          affectedRegions[index]=true
+        end
+        index=index+1
+      end
+    end
+  end
+  local function inspect()
     local proposed={}; for _,point in pairs(map) do proposed[#proposed+1]=point end
     if #proposed>MAX_CURVE_POINTS then error("候选曲线超过4000个控制点，请缩短选区。") end
     table.sort(proposed,function(a,b) return a[1]<b[1] end)
@@ -326,7 +354,12 @@ local function validateOutsideCurve(curve,original,points,begin,finish,method)
         if drift then bad[#bad+1]={left,right} end
       end
     end
+    return normalized,candidate,bad
+  end
+  for attempt=1,10 do
+    local normalized,candidate,bad=inspect()
     if #bad==0 then return normalized,candidate,guardCount end
+    rememberRegions(bad)
     if interpolationKind~="cubic" or attempt==10 then break end
     local added=0
     for _,segment in ipairs(bad) do
@@ -343,9 +376,49 @@ local function validateOutsideCurve(curve,original,points,begin,finish,method)
     end
     if added==0 then break end
     guardCount=guardCount+added
-    -- 区外修复额外限制到 512 点，防止无法收敛的宿主实现产生很重的预览任务；
-    -- 超限仍拒绝而非放宽阈值，整条曲线的 4000 点上限也一直有效。
+    -- 局部修补最多 512 点；再继续堆积可能只会移动超差接缝，改用下面的整体网格。
     if guardCount>512 then break end
+  end
+  if interpolationKind=="cubic" then
+    -- 只保留原有区外节点和已经确定的区内候选，丢弃上轮失败的临时保护点。
+    -- 余弦网格在每个原始区间两端渐密，邻接采样间距连续变化；既能照顾旧节点的
+    -- 切线，又不会出现逐段四分造成的突然间距变化。它只是候选生成策略，是否保形
+    -- 仍完全以宿主克隆的实际插值及同一个 1e-7 阈值判断，不假设宿主的样条公式。
+    local interior={}
+    for _,point in ipairs(points) do
+      if point[1]>=begin and point[1]<=finish then interior[point[1]]=point end
+    end
+    for resolution=3,9 do
+      map={}
+      for position,point in pairs(interior) do map[position]=point end
+      for _,point in ipairs(original) do
+        if point[1]<begin or point[1]>finish then map[point[1]]=point end
+      end
+      guardCount=0
+      local count=0; for _ in pairs(map) do count=count+1 end
+      local exhausted=false
+      local subdivisions=2^resolution
+      for index in pairs(affectedRegions) do
+        local left,right=regionEdges[index],regionEdges[index+1]
+        for step=1,subdivisions-1 do
+          local ratio=(1-math.cos(math.pi*step/subdivisions))/2
+          local position=math.floor(left+(right-left)*ratio+0.5)
+          if position>left and position<right and not map[position] then
+            -- 逐点检查预算，而非先创建可能数百万个采样点再检查总数。
+            if count>=MAX_CURVE_POINTS then exhausted=true; break end
+            local value=curve:get(position)
+            if not finite(value) then error("宿主返回了无效的区外曲线采样，未生成预览。") end
+            map[position]={position,value}; guardCount=guardCount+1; count=count+1
+          end
+        end
+        if exhausted then break end
+      end
+      -- 只允许在已有的整条曲线 4000 点预算内修复；保持失败的曲线完全未写入。
+      if exhausted then break end
+      local normalized,candidate,bad=inspect()
+      if #bad==0 then return normalized,candidate,guardCount end
+      rememberRegions(bad)
+    end
   end
   error("候选曲线会影响选区以外的插值，已拒绝预览；请扩大选区或手动调整边界。")
 end

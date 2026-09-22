@@ -163,6 +163,15 @@ function SV:getComputedPitchForGroup() error("computed pitch must not be used as
 '''
 
 
+def delta_fixture_snapshot(host):
+    """完整复制隔离宿主的偏移数据，用于核对预览、写入和恢复均未清理或重采样旧曲线。"""
+    return {
+        "points": [[point[1], point[2]] for point in host.deltaPoints.values()],
+        "interpolation": host.deltaMethod,
+        "default": host.deltaDefault,
+    }
+
+
 @unittest.skipIf(LuaRuntime is None, "未安装可选 Lua 测试依赖 lupa")
 class NativePitchLuaTests(unittest.TestCase):
     def setUp(self):
@@ -370,32 +379,48 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
         self.lua.execute('host.addFixture("point",1500,60,nil,{keep=true})')
         self.rejects_preview("移除它可能影响邻近音高")
 
-    def test_nonzero_delta_and_cubic_internal_overshoot_are_rejected(self):
+    def test_nonzero_delta_and_cubic_internal_overshoot_warn_without_rejection(self):
+        """已有偏移和插值内部的非零值都属于保留依赖，不应阻止独立原生曲线预览。"""
         self.lua.execute("host.deltaPoints={{0,0},{1500,0.00000001},{4000,0}}")
-        self.rejects_preview("音高偏移并非零")
-        # 端点均为零仍可能有三次插值弯曲，必须检查分段内部，不能只看控制点。
+        original = delta_fixture_snapshot(self.host)
+        preview = self.preview()
+        self.assertIn("原样保留", preview["public"]["capabilityWarnings"][1])
+        self.assertEqual(delta_fixture_snapshot(self.host), original)
+        # 端点均为零仍可能有三次插值弯曲，保留提示同样需要检查分段内部。
         self.lua.execute('''
           host.deltaPoints={{0,0},{1000,0},{2000,0},{4000,0}}; host.deltaMethod="Cubic"
           host.deltaEvaluator=function(x) local t=(x-1000)/1000; return t*(1-t)*(t+1) end
         ''')
-        self.rejects_preview("音高偏移并非零")
-        self.assertEqual(self.native.selectionAvailability(self.group, 1000, 2000)["code"], "pitch-delta-nonzero")
+        original = delta_fixture_snapshot(self.host)
+        preview = self.preview()
+        self.assertIn("不代表最终合成音高", preview["public"]["capabilityWarnings"][1])
+        availability = self.native.selectionAvailability(self.group, 1000, 2000)
+        self.assertTrue(availability["available"])
+        self.assertIn("原样保留", availability["message"])
+        self.assertEqual(delta_fixture_snapshot(self.host), original)
+        self.assertEqual(self.host.mutations, 0)
 
     def test_selection_availability_reports_nonzero_delta_without_mutation(self):
-        """能力目录提前拒绝当前选区的既有偏移，不清除数据，也不改变完整描述指纹。"""
+        """能力目录允许保留已有偏移，提示展示语义，同时保持数据和完整依赖指纹不变。"""
         self.lua.execute("host.deltaPoints={{0,0},{1500,0.00000001},{4000,0}}")
         before = self.native.describe(self.group, self.ref)["fingerprint"]
+        original = delta_fixture_snapshot(self.host)
         result = self.native.selectionAvailability(self.group, 1000, 2000)
-        self.assertFalse(result["available"])
-        self.assertEqual(result["code"], "pitch-delta-nonzero")
-        self.assertIn("pitchDelta", result["message"])
+        self.assertTrue(result["available"])
+        self.assertIsNone(result["code"])
+        self.assertIn("原样保留", result["message"])
+        self.assertIn("不代表最终合成音高", result["message"])
+        self.assertEqual(delta_fixture_snapshot(self.host), original)
         self.assertEqual(self.native.describe(self.group, self.ref)["fingerprint"], before)
         self.assertEqual(self.host.mutations, 0)
 
     def test_selection_availability_checks_only_requested_region_and_fails_closed(self):
         """区外存在偏移不自动禁用当前零值选区；未知插值仍固定错误且不暴露异常文本。"""
         self.lua.execute("host.deltaPoints={{0,10},{1000,0},{2000,0},{4000,5}}")
-        self.assertTrue(self.native.selectionAvailability(self.group, 1000, 2000)["available"])
+        availability = self.native.selectionAvailability(self.group, 1000, 2000)
+        self.assertTrue(availability["available"])
+        self.assertIsNone(availability["message"])
+        self.assertIsNone(self.preview()["public"]["capabilityWarnings"])
         self.host.deltaMethod = "CustomSpline"
         result = self.native.selectionAvailability(self.group, 1000, 2000)
         self.assertFalse(result["available"])
@@ -408,6 +433,44 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
         self.preview()
         self.host.deltaMethod = "CustomSpline"
         self.rejects_preview("插值方式未知")
+
+    def test_existing_delta_never_subtracts_from_absolute_native_candidate(self):
+        """绝对 MIDI 输入只换算组移调；不能把旧音分偏移相减或声称得到最终合成基频。"""
+        self.lua.execute('''
+          host.nativeSemantics="group"; host.timeOffset=5000; host.pitchOffset=12; host.variableTempo=true
+          host.deltaPoints={{0,100},{1500,-50},{4000,25}}
+        ''')
+        original = delta_fixture_snapshot(self.host)
+        proposal = self.preview(self.request([[0, 72], [0.5, 73], [1, 72]]))
+        control = proposal["after"]["controls"][1]["description"]
+        self.assertEqual(control["pitch"], 60)
+        self.assertEqual([point[2] for point in control["points"].values()], [0, 1, 0])
+        self.assertEqual([point["value"] for point in proposal["public"]["controlPoints"].values()], [72, 73, 72])
+        self.assertEqual(proposal["public"]["curvePreview"][49]["after"], 73)
+        self.assertIn("不代表最终合成音高", proposal["public"]["capabilityWarnings"][1])
+        self.assertEqual(delta_fixture_snapshot(self.host), original)
+        self.assertEqual(self.host.mutations, 0)
+
+    def test_nonfinite_delta_values_remain_unavailable_without_native_writes(self):
+        """放开有限非零偏移不能同时放开 NaN/Infinity，包括采样结果和参数定义中的值。"""
+        for value in ["0/0", "math.huge", "-math.huge"]:
+            for field in ["point", "default", "sample"]:
+                with self.subTest(value=value, field=field):
+                    self.lua.execute("host.deltaPoints={{0,25},{4000,25}}; host.deltaDefault=0; host.deltaEvaluator=nil")
+                    if field == "point":
+                        self.lua.execute(f"host.deltaPoints[1][2]={value}")
+                        expected = "控制点包含无效数值"
+                    elif field == "default":
+                        self.lua.execute(f"host.deltaDefault={value}")
+                        expected = "参数定义无效"
+                    else:
+                        # 节点值合法，但实际宿主插值求值异常时也不得生成可应用预览。
+                        self.lua.execute(f"host.deltaEvaluator=function() return {value} end")
+                        expected = "无法可靠读取选区内的音高偏移"
+                    self.rejects_preview(expected)
+                    availability = self.native.selectionAvailability(self.group, 1000, 2000)
+                    self.assertFalse(availability["available"])
+                    self.assertEqual(availability["code"], "pitch-delta-unknown")
 
     def test_float32_readback_becomes_exact_write_and_restore_target(self):
         self.host.quantize = True
@@ -445,12 +508,42 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
         self.assertTrue(self.native.same(self.group, snapshot))
 
     def test_delta_dependency_change_blocks_write_before_any_mutation(self):
+        """完整依赖包含区外点、插值方式和默认值，允许旧偏移不能放松预览后的竞争检查。"""
+        for mutation in [
+            "host.deltaPoints[2][2]=75",
+            "host.deltaPoints[1][2]=-50",
+            'host.deltaMethod="Cosine"',
+            "host.deltaDefault=25",
+        ]:
+            with self.subTest(mutation=mutation):
+                self.lua.execute('host.deltaPoints={{0,25},{1500,50},{4000,-25}}; host.deltaMethod="Linear"; host.deltaDefault=0')
+                proposal = self.preview()
+                self.lua.execute(mutation)
+                changed = delta_fixture_snapshot(self.host)
+                self.assertFalse(self.native.same(self.group, proposal["before"]))
+                with self.assertRaisesRegex(Exception, "音高偏移曲线已变化"):
+                    self.native.write(self.group, proposal["after"])
+                self.assertEqual(self.host.mutations, 0)
+                self.assertEqual(delta_fixture_snapshot(self.host), changed)
+
+    def test_nonzero_delta_dependency_change_blocks_restore_before_mutation(self):
+        """恢复入口同样保留用户后改的偏移，不能凭旧快照清空它或覆盖现有原生曲线。"""
+        self.lua.execute('''
+          host.deltaPoints={{0,25},{1500,50},{4000,-25}}
+          host.addFixture("curve",1000,60,{{0,0},{1000,0}},{owner="original"})
+        ''')
         proposal = self.preview()
-        self.lua.execute("host.deltaPoints[1][2]=1")
-        self.assertFalse(self.native.same(self.group, proposal["before"]))
+        self.native.write(self.group, proposal["after"])
+        self.lua.execute("host.deltaPoints[2][2]=75")
+        changed = delta_fixture_snapshot(self.host)
+        current_native = self.native.snapshot(self.group)
+        writes = self.host.mutations
+        self.assertFalse(self.native.same(self.group, proposal["after"]))
         with self.assertRaisesRegex(Exception, "音高偏移曲线已变化"):
-            self.native.write(self.group, proposal["after"])
-        self.assertEqual(self.host.mutations, 0)
+            self.native.write(self.group, proposal["before"])
+        self.assertEqual(self.host.mutations, writes)
+        self.assertTrue(self.native.same(self.group, current_native))
+        self.assertEqual(delta_fixture_snapshot(self.host), changed)
 
     def test_partial_write_failure_keeps_snapshots_reusable_for_root_rollback(self):
         self.lua.execute('''
@@ -803,6 +896,75 @@ function selected:getSelectedNotes() return {note(1000,60,1),note(1500,64,2)} en
         self.assertTrue(self.native.same(self.group, original))
         self.assertEqual(self.host.undos, 2)
         self.assertEqual(self.host.controls[1]["metadata"]["owner"], "fixture")
+
+    def test_dispatch_nonzero_delta_is_unchanged_through_preview_apply_and_restore(self):
+        """真实分发器在隔离宿主中完整执行生命周期，偏移的区内外点及定义必须逐项原样保留。"""
+        self.lua.execute('''
+          host.deltaPoints={{-250,25.123456789},{1000,-25},{1500,100},{2000,50},{4500,-17}}
+          host.deltaDefault=3; host.deltaMethod="Cosine"
+          host.addFixture("curve",1000,60,{{0,0},{1000,0}},{owner="original-native"})
+        ''')
+        original_delta = delta_fixture_snapshot(self.host)
+        original_native = self.native.snapshot(self.group)
+        selection = self.call("get_selection")
+        self.assertTrue(selection["ok"], selection.get("error"))
+        self.assertTrue(selection["result"]["parameters"]["pitchCurve"]["available"])
+        self.assertTrue(any("不代表最终合成音高" in warning for warning in selection["result"]["capabilityWarnings"]))
+        preview = self.prepare()
+        self.assertIn("不代表最终合成音高", preview["capabilityWarnings"][0])
+        self.assertEqual([node["value"] for node in preview["controlPoints"]], [60, 60.5, 60])
+        self.assertEqual(delta_fixture_snapshot(self.host), original_delta)
+        self.assertTrue(self.native.same(self.group, original_native))
+        self.assertEqual(self.host.mutations, 0)
+        applied = self.call("apply", previewId=preview["previewId"])
+        self.assertTrue(applied["ok"], applied.get("error"))
+        self.assertTrue(applied["result"]["verified"])
+        self.assertEqual(delta_fixture_snapshot(self.host), original_delta)
+        self.assertFalse(self.native.same(self.group, original_native))
+        restored = self.call("restore")
+        self.assertTrue(restored["ok"], restored.get("error"))
+        self.assertTrue(restored["result"]["verified"])
+        self.assertTrue(self.native.same(self.group, original_native))
+        self.assertEqual(delta_fixture_snapshot(self.host), original_delta)
+        self.assertEqual(self.host.undos, 2)
+
+    def test_dispatch_delta_edit_after_preview_blocks_apply_without_writes(self):
+        """允许既有非零偏移之后，用户在确认前修改它仍应使旧预览失效。"""
+        self.lua.execute("host.deltaPoints={{0,25},{1500,50},{4000,-25}}")
+        preview = self.prepare()
+        self.lua.execute("host.deltaPoints[2][2]=75")
+        changed = delta_fixture_snapshot(self.host)
+        current_native = self.native.snapshot(self.group)
+        failed = self.call("apply", previewId=preview["previewId"])
+        self.assertFalse(failed["ok"])
+        self.assertIn("原参数曲线已经改变", failed["error"])
+        self.assertEqual(self.host.mutations, 0)
+        self.assertEqual(self.host.undos, 0)
+        self.assertTrue(self.native.same(self.group, current_native))
+        self.assertEqual(delta_fixture_snapshot(self.host), changed)
+
+    def test_dispatch_delta_edit_after_apply_blocks_restore_without_writes(self):
+        """确认应用后再手动改变偏移时，恢复拒绝覆盖并保留现有原生控件和恢复记录。"""
+        self.lua.execute("host.deltaPoints={{0,25},{1500,50},{4000,-25}}")
+        preview = self.prepare()
+        applied = self.call("apply", previewId=preview["previewId"])
+        self.assertTrue(applied["ok"], applied.get("error"))
+        self.lua.execute("host.deltaPoints[2][2]=75")
+        changed = delta_fixture_snapshot(self.host)
+        current_native = self.native.snapshot(self.group)
+        writes = self.host.mutations
+        failed = self.call("restore")
+        self.assertFalse(failed["ok"])
+        self.assertIn("曲线已被手动修改或撤销", failed["error"])
+        self.assertEqual(self.host.mutations, writes)
+        self.assertEqual(self.host.undos, 1)
+        self.assertTrue(self.native.same(self.group, current_native))
+        self.assertEqual(delta_fixture_snapshot(self.host), changed)
+        # 恢复原依赖后仍可重试撤销，失败保护不能丢掉此前已经验证的原始快照。
+        self.lua.execute("host.deltaPoints[2][2]=50")
+        restored = self.call("restore")
+        self.assertTrue(restored["ok"], restored.get("error"))
+        self.assertEqual(self.host.undos, 2)
 
     def test_dispatch_corrupted_write_rolls_back_and_invalidates_preview(self):
         original = self.native.snapshot(self.group)

@@ -40,7 +40,8 @@ curve 格式为 [[position,value],...]，2 至 64 点，position 是当前连续
 同样受上述增量上限限制，边缘淡入淡出由宿主处理。多个局部变化应放在同一参数曲线中。
 pitchCurve 与 pitchDelta 不同：仅当 capabilities.nativePitch=true 且本次目录
 pitchCurve.kind=pitch、available=true 时可用；value 是工程绝对 MIDI 半音 0..127，
-若目录未提供可用 pitchCurve 或警告已有非零音高偏移，应选择小幅 pitchDelta；
+若目录未提供可用 pitchCurve，应选择小幅 pitchDelta；
+已有非零音高偏移会原样保留，不再禁止原生曲线；预览展示原生控制值，不是最终音频基频，
 不得建议自动清空既有偏移，也不得把绝对音高直接减去音符音高当作等效替换。
 还须落在本次全部音符 pitch 加 groupPitchOffset 后的最低至最高音上下各 2 半音范围内。
 只支持 curve 和 renderMode=smooth，不支持 delta 或 points。不要把 cents 当 MIDI；
@@ -53,8 +54,8 @@ pitchShape.curve 是每个音符重复采用的相对 cents 包络，2至8点，
 直接提供绝对 curve 时，每个音符主体25/50/75%处必须距离其乐谱音高不超过75 cents，
 不能跨越短音符忽略它的音高。这些规则用于保持旋律，不能用音高曲线代替音符改谱。
 会话选择控制点模式时不能使用 pitchCurve/pitchShape，音高调整使用 pitchDelta。
-这会按绝对 MIDI 音高覆盖当前连续选区；已有跨界曲线、区内引导点或非零 pitchDelta 时
-宿主会拒绝预览，不会自动覆盖冲突资料。应保守使用并在预览中说明限制。
+这会按绝对 MIDI 控制值绘制当前连续选区；已有跨界曲线或区内引导点时
+宿主会拒绝预览。不会清除 pitchDelta；最终听感需要试听，应保守使用并说明限制。
 声库模式目录只包含宿主 getVoice 实际返回的当前组/轨道模式，可能不完整；未列出的模式不可猜测。
 目录 source=host 表示宿主已返回，source=user 表示用户已核对声线面板原名后临时补充；
 两者都只授权使用本次实际目录中的名称。你不能自行注册名称，不能把用户补充说成 API 完整枚举。
@@ -250,7 +251,7 @@ def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
         if _contains_code(reason) or _unsupported_claim(reason, has_audio, has_curves):
             raise PlannerError("模型动作原因包含不支持的命令、执行声明或能力承诺，已拒绝该计划。")
         seen.add(parameter)
-        scope = ("（按绝对 MIDI 音高覆盖当前连续选区；已有跨界曲线、区内引导点或非零 pitchDelta 会拒绝预览。）"
+        scope = ("（绘制原生音高控制曲线并保留已有音高偏移；跨界原生曲线或区内引导点会拒绝预览，最终效果需试听。）"
                  if parameter == "pitchCurve" else "（仅作用于当前所选音符覆盖的连续时间段。）")
         checked.append({**normalized, "reason": _redact(reason, key) + scope})
     limitation = ("已附加音频，听感判断仍需你试听确认。" if has_audio else

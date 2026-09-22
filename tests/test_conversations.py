@@ -140,7 +140,8 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(applied["status"], "applied")
         self.service.edit.assert_called_once_with("apply", {"previewId": "curve-preview"})
 
-    def test_voice_or_same_point_count_fingerprint_change_blocks_new_preview(self):
+    def test_voice_change_blocks_preview_but_current_parameter_baseline_can_refresh(self):
+        """声线属于建议目标，不能自动替换；同选区当前参数可以生成新的只读预览。"""
         self.selection.update(modern_selection())
         self.selection["voiceFingerprint"] = "voice-original"
         self.selection["parameters"]["breathiness"]["fingerprint"] = "curve-original"
@@ -148,11 +149,81 @@ class ConversationTests(unittest.TestCase):
         self.selection["voiceFingerprint"] = "voice-other"
         with self.assertRaises(ConversationError):
             self.manager.preview_action(action["id"])
+        self.service.preview.assert_not_called()
         self.selection["voiceFingerprint"] = "voice-original"
         self.selection["parameters"]["breathiness"]["fingerprint"] = "same-point-count-different-values"
-        with self.assertRaises(ConversationError):
+        self.assertEqual(self.manager.preview_action(action["id"])["status"], "previewed")
+        self.service.preview.assert_called_once()
+        self.service.edit.assert_not_called()
+
+    def test_refreshed_parameter_baseline_is_saved_and_requires_separate_confirmation(self):
+        """已预览后又编辑参数时，新候选必须绑定当前曲线，并淘汰旧确认凭据。"""
+        self.selection.update(modern_selection())
+        definition = self.selection["parameters"]["breathiness"]
+        definition["fingerprint"] = "0123456789abcdef:100"
+        action = self.proposed()
+        first = self.manager.preview_action(action["id"])
+        first_guard = self.read_saved()["_private"]["actions"][action["id"]]
+        definition["fingerprint"] = "fedcba9876543210:100"
+        # 旧候选仍须拒绝应用，只有用户主动请求新预览才允许更新参数基线。
+        with self.assertRaisesRegex(ConversationError, "参数摘要"):
+            self.manager.apply_action(action["id"])
+        second = self.manager.preview_action(action["id"])
+        second_guard = self.read_saved()["_private"]["actions"][action["id"]]
+        self.assertNotEqual(first_guard["parameter"], second_guard["parameter"])
+        self.assertNotEqual(first["preview"]["previewId"], second["preview"]["previewId"])
+        self.service.edit.assert_not_called()
+        # 重建管理器证明新基线已持久化，而不是仅在当前请求中临时放宽校验。
+        self.assertEqual(ConversationManager(self.service).apply_action(action["id"])["status"], "applied")
+        self.service.edit.assert_called_once_with("apply", {"previewId": second["preview"]["previewId"]})
+        self.assertEqual(self.planner.call_count, 1)
+
+    def test_changed_parameter_during_refreshed_preview_cannot_be_confirmed(self):
+        """重绑定仅发生在预览开始；宿主计算期间再次改值仍拒绝新的候选。"""
+        self.selection.update(modern_selection())
+        definition = self.selection["parameters"]["breathiness"]
+        definition["fingerprint"] = "0123456789abcdef:100"
+        action = self.proposed()
+        self.manager.preview_action(action["id"])
+        definition["fingerprint"] = "fedcba9876543210:100"
+        host_preview = self.service.preview.side_effect
+
+        def preview_with_edit(*args, **kwargs):
+            result = host_preview(*args, **kwargs)
+            definition["fingerprint"] = "aaaaaaaaaaaaaaaa:100"
+            return result
+
+        self.service.preview.side_effect = preview_with_edit
+        with self.assertRaisesRegex(ConversationError, "参数摘要"):
             self.manager.preview_action(action["id"])
+        saved = self.read_saved()["messages"][-1]["actions"][0]
+        self.assertEqual(saved["status"], "proposed")
+        self.assertNotIn("preview", saved)
+        with self.assertRaises(ConversationError):
+            self.manager.apply_action(action["id"])
+        self.service.edit.assert_not_called()
+
+    def test_repreview_validates_changed_parameter_limits_and_availability(self):
+        """刷新基线不能放过能力丢失或安全限幅收紧；有效的目录更新则可继续。"""
+        self.selection.update(modern_selection())
+        self.plan["actions"] = [{"parameter": "tension", "curve": [[0, 0], [1, 0.1]], "reason": "逐渐变化。"}]
+        action = self.proposed()
+        definition = self.selection["parameters"]["tension"]
+        for changed in ({"available": False}, {"maxDelta": 0.05}, {"kind": "pitch"}):
+            with self.subTest(changed=changed):
+                before = copy.deepcopy(definition)
+                definition.update(changed)
+                with self.assertRaises(ConversationError):
+                    self.manager.preview_action(action["id"])
+                definition.clear()
+                definition.update(before)
         self.service.preview.assert_not_called()
+        # 能力元数据改变但动作仍合法时，不应被最初生成建议的摘要永久阻断。
+        definition["maxDelta"] = 0.2
+        self.service.preview.side_effect = None
+        self.service.preview.return_value = {"previewId": "valid-current-limit", "parameter": "tension"}
+        self.assertEqual(self.manager.preview_action(action["id"])["status"], "previewed")
+        self.service.edit.assert_not_called()
 
     def test_curve_capability_loss_and_invalid_preview_cannot_expose_confirmation(self):
         self.selection.update(modern_selection())
@@ -537,12 +608,15 @@ class ConversationTests(unittest.TestCase):
             self.manager.preview_action(action["id"])
         self.service.preview.assert_not_called()
 
-    def test_changed_parameter_summary_blocks_preview(self):
+    def test_changed_parameter_summary_refreshes_proposed_preview(self):
+        """兼容旧桥接摘要时也以当前参数新建候选；宿主仍负责核对实际写入快照。"""
         action = self.proposed()
+        previous_guard = self.read_saved()["_private"]["actions"][action["id"]]
         self.selection["parameters"]["breathiness"]["pointCount"] = 2
-        with self.assertRaisesRegex(ConversationError, "参数摘要"):
-            self.manager.preview_action(action["id"])
-        self.service.preview.assert_not_called()
+        self.assertEqual(self.manager.preview_action(action["id"])["status"], "previewed")
+        self.assertNotEqual(previous_guard["parameter"], self.read_saved()["_private"]["actions"][action["id"]]["parameter"])
+        self.service.preview.assert_called_once()
+        self.service.edit.assert_not_called()
 
     def test_selection_changed_during_host_preview_never_exposes_apply_button(self):
         action = self.proposed()
