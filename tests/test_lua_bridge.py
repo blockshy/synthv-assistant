@@ -74,6 +74,8 @@ function Curve:get(x)
       local previous,nextp=p[math.max(1,i-1)],p[math.min(#p,i+2)]
       local m0=(b[2]-previous[2])/(b[1]-previous[1])
       local m1=(nextp[2]-a[2])/(nextp[1]-a[1])
+      -- 允许不同三次切线权重，验证保护算法依赖宿主读回而非猜测一种样条公式。
+      m0=m0*(host.cubicSlopeFactor or 1); m1=m1*(host.cubicSlopeFactor or 1)
       return (2*t^3-3*t^2+1)*a[2]+(t^3-2*t^2+t)*length*m0
         +(-2*t^3+3*t^2)*b[2]+(t^3-t^2)*length*m1
     end
@@ -214,8 +216,46 @@ end, function() poll() end, function() return session end
         result = self.call("preview", parameter="tension", delta=0.1)
         self.assertFalse(result["ok"])
         self.assertIn("选区以外", result["error"])
+        self.assertNotIn("选择控制点模式", result["error"])
         self.assertEqual(self.host.mutations, 0)
         self.assertEqual(self.host.undos, 0)
+
+    def test_outside_guards_preserve_actual_cubic_samples_and_restore_original_points(self):
+        """左右区外片段都核验真实插值；保护点应用后可恢复完整的原控制点快照。"""
+        for slope in (1, 0.5):
+            for mirrored in (False, True):
+                with self.subTest(slope=slope, mirrored=mirrored):
+                    self.lua.execute('''
+host.method="Cubic"; host.quantize=true; host.mutations=0; host.undos=0
+host.curve.points={{0,0},{500,.00001},{2400,.00002},{3000,.00003}}
+for _,p in ipairs(host.curve.points) do p[2]=string.unpack("f",string.pack("f",p[2])) end
+''')
+                    self.host.cubicSlopeFactor = slope
+                    if mirrored:
+                        self.lua.execute('''
+local p={}; for index=#host.curve.points,1,-1 do
+  local source=host.curve.points[index]; p[#p+1]={3000-source[1],-source[2]}
+end; host.curve.points=p
+''')
+                    original = [[point[1], point[2]] for point in self.host.curve.points.values()]
+                    positions = [index / 4 for index in range(-400, 12401)
+                                 if index <= 4000 or index >= 8000]
+                    before = [self.host.curve.get(self.host.curve, value) for value in positions]
+                    preview = self.call("preview", parameter="breathiness", delta=0.05)
+                    self.assertTrue(preview["ok"], preview.get("error"))
+                    self.assertTrue(any("区外保护点" in warning for warning in preview["result"]["capabilityWarnings"]))
+                    self.assertEqual(self.host.mutations, 0)
+                    self.assertEqual(self.host.undos, 0)
+                    self.enable()
+                    applied = self.call("apply", previewId=preview["result"]["previewId"])
+                    self.assertTrue(applied["ok"], applied.get("error"))
+                    self.assertEqual(self.host.curve.getInterpolationMethod(self.host.curve), "Cubic")
+                    after = [self.host.curve.get(self.host.curve, value) for value in positions]
+                    self.assertLessEqual(max(abs(left - right) for left, right in zip(before, after)), 1e-7)
+                    restored = self.call("restore")
+                    self.assertTrue(restored["ok"], restored.get("error"))
+                    self.assertEqual([[point[1], point[2]] for point in self.host.curve.points.values()], original)
+                    self.assertEqual([self.host.curve.get(self.host.curve, value) for value in positions], before)
 
     def test_default_smooth_mode_removes_redundant_points_without_changing_target(self):
         """相同增量优先保留转折，密集点模式仍可显式选择，两个预览均不写宿主。"""

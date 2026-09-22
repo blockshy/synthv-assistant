@@ -379,6 +379,29 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
           host.deltaEvaluator=function(x) local t=(x-1000)/1000; return t*(1-t)*(t+1) end
         ''')
         self.rejects_preview("音高偏移并非零")
+        self.assertEqual(self.native.selectionAvailability(self.group, 1000, 2000)["code"], "pitch-delta-nonzero")
+
+    def test_selection_availability_reports_nonzero_delta_without_mutation(self):
+        """能力目录提前拒绝当前选区的既有偏移，不清除数据，也不改变完整描述指纹。"""
+        self.lua.execute("host.deltaPoints={{0,0},{1500,0.00000001},{4000,0}}")
+        before = self.native.describe(self.group, self.ref)["fingerprint"]
+        result = self.native.selectionAvailability(self.group, 1000, 2000)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["code"], "pitch-delta-nonzero")
+        self.assertIn("pitchDelta", result["message"])
+        self.assertEqual(self.native.describe(self.group, self.ref)["fingerprint"], before)
+        self.assertEqual(self.host.mutations, 0)
+
+    def test_selection_availability_checks_only_requested_region_and_fails_closed(self):
+        """区外存在偏移不自动禁用当前零值选区；未知插值仍固定错误且不暴露异常文本。"""
+        self.lua.execute("host.deltaPoints={{0,10},{1000,0},{2000,0},{4000,5}}")
+        self.assertTrue(self.native.selectionAvailability(self.group, 1000, 2000)["available"])
+        self.host.deltaMethod = "CustomSpline"
+        result = self.native.selectionAvailability(self.group, 1000, 2000)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["code"], "pitch-delta-unknown")
+        self.assertNotIn("CustomSpline", result["message"])
+        self.assertEqual(self.host.mutations, 0)
 
     def test_zero_cosine_delta_is_supported_but_unknown_interpolation_fails_closed(self):
         self.host.deltaMethod = "Cosine"

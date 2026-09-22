@@ -133,7 +133,7 @@ def _parameter_identity(selection: dict, parameter: str) -> str:
 def _public_action(action: dict) -> dict:
     """只投影状态机的公开字段，私有指纹与会话不会进入前端响应。"""
     fields = {"id", "parameter", "delta", "curve", "renderMode", "reason", "status", "preview", "result",
-              "label", "unit", "kind", "modeName"}
+              "label", "unit", "kind", "modeName", "previewBatchId"}
     return {key: value for key, value in action.items() if key in fields}
 
 
@@ -525,6 +525,14 @@ class ConversationManager:
     def _check_guard(action: dict, guard: dict, selection: dict, session: str, *, after_undo: bool = False) -> None:
         if session != guard.get("session") or _selection_identity(selection, session) != guard.get("selection"):
             raise ConversationError("桥接会话或目标选区已变化，请重新发送要求生成提案。")
+        if action["parameter"] == "pitchCurve" and selection.get("parameters", {}).get("pitchCurve", {}).get("available") is False:
+            # 已存提案可能早于能力诊断升级；先给出本地固定的具体能力提示，不能
+            # 把非零音高偏移的叠加保护误报为无缘由的摘要变化。
+            from .parameters import parameter_policy
+            try:
+                parameter_policy("pitchCurve", selection)
+            except ParameterError as error:
+                raise ConversationError(str(error)) from None
         if after_undo:
             # 旧桥接只报告点数，无法分辨「已经撤销」与「同点数但不同数值」。
             # 只有新桥接的完整曲线指纹可证明原状态；格式与 Lua fingerprint()
@@ -566,16 +574,18 @@ class ConversationManager:
                     # 只读预览。不能把 applied 直接解锁为可执行的旧 previewed。
                     action["status"] = "proposed"
                     action.pop("preview", None)
+                    action.pop("previewBatchId", None)
                     action.pop("result", None)
                     self._save(document)
                 # Lua 只保留最近一次预览；先清除所有旧确认入口，跨会话也不例外。
                 for other_document in documents:
-                    changed = False
+                    changed = other_document["_private"].pop("batch", None) is not None
                     for message in other_document["messages"]:
                         for other_action in message.get("actions", []):
                             if other_action["status"] == "previewed":
                                 other_action["status"] = "proposed"
                                 other_action.pop("preview", None)
+                                other_action.pop("previewBatchId", None)
                                 changed = True
                     if changed:
                         self._save(other_document)
@@ -623,11 +633,170 @@ class ConversationManager:
                 self._save(document)
                 return json.loads(_encoded(_public_action(action)))
 
+    def _batch_actions(self, action_ids: object) -> tuple[list, dict, list, list]:
+        """只允许同一助手消息中的不同参数，不能拼接两个会话或两轮建议。"""
+        if (not isinstance(action_ids, list) or not 1 <= len(action_ids) <= 5
+                or any(not isinstance(item, str) for item in action_ids)
+                or len(set(action_ids)) != len(action_ids)):
+            raise ConversationError("组合预览须包含 1 至 5 个不重复的提案编号。")
+        checked = [_identifier(item) for item in action_ids]
+        documents, document, _, _ = self._find_action(checked[0])
+        for message in document["messages"]:
+            by_id = {action.get("id"): action for action in message.get("actions", [])}
+            if checked[0] in by_id:
+                if message.get("role") != "assistant" or any(item not in by_id for item in checked):
+                    raise ConversationError("组合预览只能包含同一条助手消息中的参数。")
+                actions = [by_id[item] for item in checked]
+                parameters = [action.get("parameter") for action in actions]
+                if len(set(parameters)) != len(parameters):
+                    raise ConversationError("组合预览不能包含重复参数。")
+                if {"pitchCurve", "pitchDelta"} <= set(parameters):
+                    raise ConversationError("原生音高与音高偏移不能同时应用，请分别生成方案，避免重复叠加音高。")
+                guards = [document["_private"].get("actions", {}).get(item) for item in checked]
+                if any(not isinstance(guard, dict) for guard in guards) or any(
+                        action.get("status") not in ACTION_STATES for action in actions):
+                    raise ConversationError("提案保护信息缺失，请重新生成方案。")
+                return documents, document, actions, guards
+        raise ConversationError("调教提案不存在。")
+
+    def preview_batch(self, action_ids: object) -> dict:
+        """一次只读 IPC 生成组合候选；每个失败项保持 proposed，不获得确认权限。
+
+        批次身份随会话原子保存。任何新预览先使旧确认凭据失效，宿主再独立保存
+        最新候选的完整快照。页面刷新可以展示该批次，但不能跨消息或重放已写入批次。
+        """
+        with self._lock():
+            documents, document, actions, guards = self._batch_actions(action_ids)
+            with self._lock(document["id"]), self.service.operation_lock:
+                self.library.assert_available("conversation", document["id"])
+                selection, session = self._capture_selection()
+                # 旧桥接不提供批次持久快照，不能悄悄退化成逐项预览后只剩最后一项。
+                if selection.get("capabilities", {}).get("batchPreview") is not True:
+                    raise ConversationError("当前桥接不支持组合预览，请更新并重新启动 SynthV Assistant 桥接。")
+                errors, eligible_ids = [], set()
+                for action, guard in zip(actions, guards):
+                    if action["status"] == "unknown":
+                        raise ConversationError("该提案应用结果未知，不能重新预览或重复应用；请检查工程并重新生成提案。")
+                    restored = action["status"] == "applied"
+                    if restored and action.get("result", {}).get("verified") is not True:
+                        raise ConversationError("该提案缺少已确认的应用记录，不能重新执行；请检查工程并重新生成提案。")
+                    try:
+                        self._check_guard(action, guard, selection, session, after_undo=restored)
+                        eligible_ids.add(action["id"])
+                    except ConversationError as error:
+                        # 同一乐句的一项能力或参数守卫失败，不妨碍其他参数只读预演。
+                        # applied 项只有完整撤销指纹验证通过才会被重新变成 proposed。
+                        errors.append({"actionId": action["id"], "message": str(error)})
+                for other_document in documents:
+                    changed = other_document["_private"].pop("batch", None) is not None
+                    for message in other_document["messages"]:
+                        for item in message.get("actions", []):
+                            if item.get("status") == "previewed" or (other_document is document and item.get("id") in eligible_ids):
+                                item["status"] = "proposed"
+                                item.pop("preview", None)
+                                item.pop("previewBatchId", None)
+                                item.pop("result", None)
+                                changed = True
+                    if changed:
+                        self._save(other_document)
+                batch_id = uuid.uuid4().hex
+                eligible = []
+                for action in actions:
+                    if action["id"] not in eligible_ids:
+                        continue
+                    try:
+                        if action["parameter"] == "pitchCurve":
+                            from .pitch_shapes import validate_note_alignment
+                            validate_note_alignment(action.get("curve"), selection)
+                        eligible.append(action)
+                    except ParameterError as error:
+                        errors.append({"actionId": action["id"], "message": "未生成预览，尚未修改工程：" + str(error)})
+                if eligible:
+                    try:
+                        result = self.service.preview_batch(batch_id, eligible)
+                    except BridgeError as error:
+                        message = error.public_message or "无法生成宿主预览，尚未修改工程；请检查桥接和当前选区。"
+                        raise ConversationError(message) from None
+                    except OperationBusyError:
+                        raise ConversationError(BUSY_MESSAGE) from None
+                    except Exception:
+                        raise ConversationError("无法生成组合宿主预览，尚未修改工程；请检查桥接和当前选区。") from None
+                    current, current_session = self._capture_selection()
+                    for action, guard in zip(actions, guards):
+                        if action["id"] in eligible_ids:
+                            self._check_guard(action, guard, current, current_session)
+                    errors.extend(result["errors"])
+                    by_id = {item["actionId"]: item["preview"] for item in result["previews"]}
+                    for action in eligible:
+                        if action["id"] not in by_id:
+                            continue
+                        try:
+                            candidate = public_preview({**by_id[action["id"]], "notes": selection_preview_notes(current)})
+                            if action["parameter"] == "pitchCurve":
+                                from .pitch_shapes import validate_preview_note_alignment
+                                validate_preview_note_alignment(candidate, current)
+                            action.update(status="previewed", preview=candidate, previewBatchId=batch_id)
+                        except ParameterError as error:
+                            errors.append({"actionId": action["id"], "message": "未生成预览，尚未修改工程：" + str(error)})
+                successful = [action for action in actions if action["status"] == "previewed"]
+                if successful:
+                    # 仅保存通过前后双重校验的成功子集，应用请求不能再自行添加或删减项。
+                    document["_private"]["batch"] = {"id": batch_id, "actionIds": [action["id"] for action in successful]}
+                self._save(document)
+                return {"batchId": batch_id if successful else None,
+                        "actions": [_public_action(action) for action in actions], "errors": errors}
+
+    def apply_batch(self, batch_id: object) -> dict:
+        """确认一次只写入本批成功子集；所有 unknown 必须先于任何宿主写入落盘。"""
+        identifier = _identifier(batch_id)
+        with self._lock():
+            documents = [self._read(path.stem) for path in self._paths()]
+            document = next((item for item in documents if item["_private"].get("batch", {}).get("id") == identifier), None)
+            if document is None:
+                raise ConversationError("组合预览不存在或已失效，请重新预览后确认。")
+            with self._lock(document["id"]), self.service.operation_lock:
+                self.library.assert_available("conversation", document["id"])
+                ticket = document["_private"]["batch"]
+                _, document, actions, guards = self._batch_actions(ticket.get("actionIds"))
+                if any(action["status"] != "previewed" or action.get("previewBatchId") != identifier
+                       or not action.get("preview", {}).get("previewId") for action in actions):
+                    raise ConversationError("组合预览已应用或失效，请重新预览后确认。")
+                selection, session = self._capture_selection(require_write=True)
+                for action, guard in zip(actions, guards):
+                    self._check_guard(action, guard, selection, session)
+                preview_ids = [action["preview"]["previewId"] for action in actions]
+                for action in actions:
+                    action["status"] = "unknown"
+                document["_private"].pop("batch", None)
+                self._save(document)
+                results = []
+                try:
+                    result = self.service.edit("apply_batch", {"batchId": identifier, "previewIds": preview_ids})
+                    returned = result.get("results") if isinstance(result, dict) else None
+                    if (not isinstance(result, dict) or result.get("verified") is not True
+                            or not isinstance(returned, list) or len(returned) != len(actions)
+                            or any(not isinstance(item, dict) or item.get("verified") is not True
+                                   or item.get("parameter") != action["parameter"]
+                                   for item, action in zip(returned, actions))):
+                        raise ConversationError("宿主未确认组合应用结果。")
+                    for action, item in zip(actions, returned):
+                        action["result"] = {key: item[key] for key in ("verified", "parameter", "pointCount", "undoRecords", "message") if key in item}
+                        action["status"] = "applied"
+                        results.append(action["result"])
+                except Exception:
+                    for action in actions:
+                        action["result"] = {"verified": False, "message": "组合应用结果未确认；请先在 SynthV 检查或撤销，勿重复提交此批次。"}
+                        results.append(action["result"])
+                self._save(document)
+                return {"batchId": identifier, "actions": [_public_action(action) for action in actions], "results": results}
+
     def apply_action(self, action_id: str) -> dict:
         with self._lock():
             _, document, action, guard = self._find_action(action_id)
             with self._lock(document["id"]), self.service.operation_lock:
                 self.library.assert_available("conversation", document["id"])
+                if action.get("previewBatchId"):
+                    raise ConversationError("该参数属于组合预览，请确认并应用完整的预览成功项。")
                 if action["status"] != "previewed" or not action.get("preview", {}).get("previewId"):
                     raise ConversationError("请先生成并确认最新宿主预览；已应用或结果未知的提案不能重复执行。")
                 selection, session = self._capture_selection(require_write=True)

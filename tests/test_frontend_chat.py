@@ -1,4 +1,4 @@
-"""隔离验证用户消息的即时显示与服务端记录去重，不调用供应商或访问真实会话。"""
+"""隔离验证即时消息、音频附件和组合预览确认边界，不调用供应商或访问真实会话。"""
 
 from pathlib import Path
 import shutil
@@ -16,6 +16,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const all = [];
+const descendants=root=>root.children.flatMap(child=>[child,...descendants(child)]);
+const matches=(node,selector)=>{
+  if(selector.startsWith('.'))return node.classList.contains(selector.slice(1));
+  const data=selector.match(/^\[data-([\w-]+)\]$/);
+  if(data)return Object.hasOwn(node.dataset,data[1].replace(/-([a-z])/g,(_,letter)=>letter.toUpperCase()));
+  return node.tag===selector;
+};
 class Element {
   constructor(tag='div') { this.tag=tag; this.children=[]; this.dataset={}; this.attrs={}; this.listeners={};
     this.className=''; this.value=''; this.checked=false; this.disabled=false; this.scrollTop=0; this.scrollHeight=1000;
@@ -32,8 +39,8 @@ class Element {
   remove() { if(this.parent)this.parent.children=this.parent.children.filter(child=>child!==this);this.parent=null; }
   setAttribute(name,value) {this.attrs[name]=value;}
   addEventListener(name,callback) {this.listeners[name]=callback;}
-  querySelector(selector) {return this.children.find(child=>child.tag===selector)||null;}
-  querySelectorAll() {return [];}
+  querySelector(selector) {return this.querySelectorAll(selector)[0]||null;}
+  querySelectorAll(selector) {return descendants(this).filter(child=>matches(child,selector));}
   focus() {}
   contains() {return false;}
 }
@@ -48,7 +55,8 @@ for(const id of ['chat-job-text','chat-job-time','send-scope','conversation-feed
 }
 get('send-message').append(new Element('span'));
 const body=new Element('body');
-const document={getElementById:get,createElement:tag=>new Element(tag),body,querySelectorAll:()=>[],querySelector:()=>body,
+const document={getElementById:get,createElement:tag=>new Element(tag),body,
+  querySelectorAll:selector=>[...new Set([...fields.values(),body].flatMap(root=>[root,...descendants(root)]))].filter(node=>matches(node,selector)),querySelector:()=>body,
   addEventListener(){},removeEventListener(){}};
 const calls=[];
 let api=async()=>{throw new Error('未配置的测试接口');};
@@ -59,14 +67,19 @@ const bridge={api:(...args)=>{calls.push(args);return api(...args);}, waitForJob
   printable:value=>JSON.stringify(value),setAssistantBusy(){},clearManualPreview(){}};
 const models={getState:()=>({configured:true,valid:true,audioInput:'supported',platformName:'测试',modelLabel:'离线模型'}),
   setInteractionBusy(){},setConversation(){},snapshot:()=>({platformId:'offline',model:'offline-model',reasoningEffort:'default'}),ensureSaved:()=>save()};
+const windowListeners=new Map(),curveCalls={single:[],combined:[]};
 const window={SynthVWorkbench:bridge,SynthVUI:{icon:()=>new Element('svg'),setIconButton(){},iconButton:()=>new Element('button')},
-  SynthVModels:models,SynthVPages:{current:'chat',go(){return true;}},SynthVCurves:{representation:()=>'',createPreview:()=>null},
-  addEventListener(){},dispatchEvent(){}};
+  SynthVModels:models,SynthVPages:{current:'chat',go(){return true;}},SynthVCurves:{representation:()=>'',
+    createPreview:preview=>{curveCalls.single.push(preview);const chart=new Element('figure');chart.className='single-test-chart';return chart;},
+    createCombinedPreview:items=>{curveCalls.combined.push(items);if(!items.some(item=>item.preview))return null;
+      const chart=new Element('figure');chart.className='combined-test-chart';return chart;}},
+  addEventListener(name,callback){if(!windowListeners.has(name))windowListeners.set(name,[]);windowListeners.get(name).push(callback);},
+  dispatchEvent(event){for(const callback of windowListeners.get(event.type)||[])callback(event);}};
 const context={window,document,location:{origin:'http://local.test',href:'http://local.test/'},URL,Date,Map,Set,structuredClone,
   localStorage:{getItem(){return null;},setItem(){},removeItem(){}},matchMedia:()=>({matches:false,addEventListener(){}}),
   setInterval:()=>1,clearInterval(){},requestAnimationFrame:callback=>callback(),Event:class{},CustomEvent:class{}};
 vm.createContext(context);
-source=source.replace('  initialize();','  window.testChat = {sendMessage, setConversation, state, openConversation, renderHistory};');
+source=source.replace('  initialize();','  window.testChat = {sendMessage, setConversation, state, openConversation, renderHistory, executeBatch, executeAction, syncControls};');
 vm.runInContext(source,context);
 const chat=window.testChat;
 const base=(id='conversation-a',messages=[])=>({id,title:'隔离会话',messages,renderMode:'smooth',modelOptions:{}});
@@ -75,6 +88,14 @@ const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve
 const tick=async()=>{for(let i=0;i<15;i++)await Promise.resolve();};
 const messages=()=>get('chat-history').children.filter(node=>node.classList.contains('message-user'));
 const start=(text='请调整气声')=>{get('chat-input').value=text;get('send-message').disabled=false;return chat.sendMessage({preventDefault(){}});};
+const emit=(type,detail={})=>window.dispatchEvent({type,detail});
+const action=(id,parameter='tension')=>({id,parameter,delta:.1,status:'proposed',renderMode:'smooth'});
+const proposal=(id,actions)=>({id,role:'assistant',text:'测试组合建议',actions});
+const previewed=(source,batchId='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')=>({...source,status:'previewed',previewBatchId:batchId,
+  preview:{previewId:`preview-${source.id}`,parameter:source.parameter,startSeconds:10,endSeconds:12,
+    curvePreview:[{position:0,before:0,after:.1},{position:1,before:0,after:.1}]}});
+const batchButtons=()=>get('chat-history').querySelectorAll('[data-batch-apply]');
+const allowWrites=()=>{chat.state.status={bridge:{connected:true},writeEnabled:true};chat.syncControls();};
 """
 
 
@@ -180,6 +201,213 @@ assert.match(messages()[0].textContent,/未发送，原草稿已保留/);
 assert.equal(get('chat-input').value,'请调整气声');
 assert.equal(calls.some(([path])=>path.endsWith('/messages')),false);
 assert.equal(chat.state.sending,false);
+""")
+
+    def test_audio_attachments_share_message_bubble_and_create_player_only_when_expanded(self):
+        """附件默认只占文件行，展开播放器也不得提前预读或自动播放。"""
+        self.run_case(r"""
+const assets=[
+  {kind:'upload',id:'a',name:'很长的文件名称用于检查完整名称.wav',url:'/uploads/a.wav',available:true,durationSeconds:2},
+  {kind:'recording',id:'b',name:'对比录音.wav',url:'/recordings/b.wav',available:true,durationSeconds:3},
+];
+chat.setConversation(base('conversation-a',[user('audio-user','请对比这两段录音',assets)]));
+const bubble=messages()[0].children.find(node=>node.classList.contains('message-bubble'));
+assert(bubble,'正文和音频应共同放在用户气泡中');
+assert(bubble.children.some(node=>node.classList.contains('message-text')));
+const group=bubble.children.find(node=>node.classList.contains('message-attachments'));
+assert.equal(group.children.length,2);
+assert.equal(messages()[0].children.some(node=>node.classList.contains('message-audio')),false);
+const card=group.children[0];
+assert.equal(card.tag,'details');
+assert.equal(card.children.length,1); // 折叠状态不创建隐藏播放器或挂载音频地址。
+const heading=card.children[0];
+assert.equal(heading.tag,'summary');
+assert.match(heading.attrs['aria-label'],/展开.*播放控件/);
+assert.equal(heading.children.find(node=>node.classList.contains('message-audio-name')).title,assets[0].name);
+card.open=true;card.listeners.toggle();
+const audio=card.children.find(node=>node.tag==='audio');
+assert(audio);
+assert.equal(audio.preload,'none');
+assert.equal(audio.src,'http://local.test/uploads/a.wav');
+assert.equal(audio.controls,true);
+assert.equal(audio.autoplay,undefined);
+let paused=false;audio.pause=()=>{paused=true;};
+card.open=false;card.listeners.toggle();
+assert.equal(paused,true); // 收起后不能留下看不见的播放。
+card.open=true;card.listeners.toggle();
+assert.equal(card.children.filter(node=>node.tag==='audio').length,1);
+""")
+
+    def test_deleted_and_external_audio_stays_unavailable_inside_message_bubble(self):
+        """历史快照不能让已删附件或外部 URL 获得可播放控件。"""
+        self.run_case(r"""
+const assets=[
+  {kind:'upload',id:'deleted',name:'已删除.wav',url:'/uploads/deleted.wav',deleted:true},
+  {kind:'upload',id:'permanent',name:'永久删除.wav',url:'/uploads/permanent.wav',permanent:true},
+  {kind:'upload',id:'remote',name:'<script>文本文件名</script>',url:'https://external.example/audio.wav',available:true},
+];
+chat.setConversation(base('conversation-a',[user('audio-user','查看附件',assets)]));
+const bubble=messages()[0].children.find(node=>node.classList.contains('message-bubble'));
+const group=bubble.children.find(node=>node.classList.contains('message-attachments'));
+assert.equal(group.children.length,3);
+assert(group.children.every(node=>node.tag==='div'&&!node.listeners.toggle));
+assert.match(group.children[0].textContent,/已移到回收站/);
+assert.match(group.children[1].textContent,/已永久删除/);
+assert.match(group.children[2].textContent,/暂不可用/);
+assert.match(group.children[2].textContent,/<script>文本文件名<\/script>/);
+assert(group.children.every(node=>node.children.every(child=>child.tag!=='audio')));
+""")
+
+    def test_batch_preview_requests_once_and_confirms_only_successful_parameters(self):
+        """组合只创建一个预览请求和一张图；部分失败不混入待确认应用集合。"""
+        self.run_case(r"""
+const actions=[action('pitch','pitchCurve'),action('breath','breathiness'),action('tension')];
+chat.setConversation(base('conversation-a',[proposal('reply-a',actions)]));
+const response=deferred(),applying=deferred();
+api=(path)=>path.endsWith('/preview')?response.promise:applying.promise;
+const pending=chat.executeBatch('reply-a','preview');
+assert.equal(calls.length,1);
+assert.equal(calls[0][0],'/api/assistant/batches/preview');
+assert.deepEqual(Array.from(calls[0][1].actionIds),['pitch','breath','tension']);
+await chat.executeBatch('reply-a','preview');
+assert.equal(calls.length,1); // 忙碌时重复点击不能并发生成两份确认票据。
+response.resolve({batchId:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',actions:[previewed(actions[0]),actions[1],previewed(actions[2])],
+  errors:[{actionId:'breath',message:'宿主未能安全预览气声'}]});
+await pending;
+assert.deepEqual(Array.from(chat.state.activeBatch.actionIds),['pitch','tension']);
+assert.equal(chat.state.actionErrors.get('breath'),'宿主未能安全预览气声');
+assert.equal(batchButtons().length,1);
+assert.match(batchButtons()[0].textContent,/2 项参数/);
+assert.equal(batchButtons()[0].disabled,true); // 未开启写权限仍允许只读预览。
+assert.match(get('chat-history').textContent,/1 项未通过/);
+assert.match(get('chat-feedback').textContent,/2 项预览/);
+assert.equal(get('chat-history').querySelectorAll('.combined-test-chart').length,1);
+assert.equal(get('chat-history').querySelectorAll('.single-test-chart').length,0);
+assert.equal(curveCalls.single.length,0); // 参数明细不能再生成多张重复图。
+await chat.executeBatch('reply-a','apply');assert.equal(calls.length,1);
+allowWrites();assert.equal(batchButtons()[0].disabled,false);
+const confirmed=chat.executeBatch('reply-a','apply');
+assert.equal(chat.state.activeBatch,null); // 发送写请求前立即撤销确认资格。
+assert.equal(actions[0].status,'unknown');assert.equal(actions[2].status,'unknown');
+assert.equal(actions[1].status,'proposed');
+assert.equal(calls[1][0],'/api/assistant/batches/apply');
+assert.deepEqual(JSON.parse(JSON.stringify(calls[1][1])),{batchId:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'});
+await chat.executeBatch('reply-a','apply');assert.equal(calls.length,2);
+applying.resolve({actions:[{...actions[0],status:'applied'},{...actions[2],status:'applied'}]});
+await confirmed;
+assert.equal(actions[0].status,'applied');assert.equal(actions[1].status,'proposed');assert.equal(actions[2].status,'applied');
+assert.equal(batchButtons().length,0);
+assert.match(get('chat-feedback').textContent,/已确认应用 2 项/);
+await chat.executeBatch('reply-a','apply');assert.equal(calls.length,2);
+""")
+
+    def test_batch_apply_timeout_keeps_unknown_and_never_replays(self):
+        """写请求结果不明时两项都保持 unknown，失败后再次调用也不得重放。"""
+        self.run_case(r"""
+const actions=[action('a'),action('b','breathiness')];
+chat.setConversation(base('conversation-a',[proposal('reply',actions)]));allowWrites();
+api=async(path)=>{
+  if(path.endsWith('/preview'))return {batchId:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',actions:actions.map(item=>previewed(item)),errors:[]};
+  throw new Error('应用连接超时，结果待核实');
+};
+await chat.executeBatch('reply','preview');
+await chat.executeBatch('reply','apply');
+assert(actions.every(item=>item.status==='unknown'));
+assert.equal(chat.state.activeBatch,null);
+assert.equal(batchButtons().length,0);
+assert.match(get('chat-feedback').textContent,/结果待核实/);
+await chat.executeBatch('reply','apply');
+await chat.executeBatch('reply','preview'); // 全部 unknown 不能借重新预览绕过待核实状态。
+assert.equal(calls.filter(([path])=>path.endsWith('/apply')).length,1);
+assert.equal(calls.filter(([path])=>path.endsWith('/preview')).length,1);
+assert(actions.every(item=>chat.state.actionErrors.has(item.id)));
+assert.equal(chat.state.actionBusy,'');
+""")
+
+    def test_batch_authorization_is_revoked_by_navigation_manual_preview_and_disconnect(self):
+        """旧图可以保留阅读；会话、手动工具或连接变化不能保留旧批次确认资格。"""
+        self.run_case(r"""
+let sequence=0;
+const actions=[action('a'),action('b','breathiness')],conversation=base('conversation-a',[proposal('reply',actions)]);
+chat.setConversation(conversation);allowWrites();
+api=async(path)=>{
+  if(path.endsWith('/preview')){const batchId=(++sequence).toString(16).padStart(32,'0');return {batchId,actions:actions.map(item=>previewed(item,batchId)),errors:[]};}
+  if(path.endsWith('/conversation-b'))return base('conversation-b');
+  if(path.endsWith('/conversation-a'))return conversation;
+  throw new Error('失效预览不应发送应用请求');
+};
+await chat.executeBatch('reply','preview');assert(chat.state.activeBatch);
+await chat.openConversation('conversation-b');assert.equal(chat.state.activeBatch,null);
+await chat.openConversation('conversation-a');
+assert.equal(batchButtons().length,0);
+await chat.executeBatch('reply','apply');
+assert.equal(calls.some(([path])=>path.endsWith('/apply')),false);
+await chat.executeBatch('reply','preview');
+emit('synthv:preview-invalidated');
+assert.equal(chat.state.activeBatch,null);assert.equal(batchButtons().length,0);
+await chat.executeBatch('reply','apply');
+await chat.executeBatch('reply','preview');
+emit('synthv:state',{status:{bridge:{connected:false},writeEnabled:true},manualBusy:false,settingsSaving:false});
+assert.equal(chat.state.activeBatch,null);
+assert.equal(get('chat-history').querySelectorAll('[data-batch-preview]')[0].disabled,true);
+emit('synthv:state',{status:{bridge:{connected:true},writeEnabled:true},manualBusy:false,settingsSaving:false});
+assert.equal(batchButtons().length,0); // 重连不会自行恢复旧票据。
+await chat.executeBatch('reply','apply');
+assert.equal(calls.some(([path])=>path.endsWith('/apply')),false);
+await chat.executeBatch('reply','preview');
+emit('synthv:restored',{summary:'隔离恢复结果'});
+assert.equal(chat.state.activeBatch,null);assert.equal(batchButtons().length,0);
+""")
+
+    def test_starting_another_preview_revokes_previous_batch_even_if_it_fails(self):
+        """新批预览或单项预览开始即撤销旧权限，失败不能让旧确认按钮恢复。"""
+        self.run_case(r"""
+const actions=[action('a'),action('b')],single=action('single','gender');
+chat.setConversation(base('conversation-a',[proposal('reply',actions),proposal('other',[single])]));allowWrites();
+api=async()=>({batchId:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',actions:actions.map(item=>previewed(item)),errors:[]});
+await chat.executeBatch('reply','preview');assert(chat.state.activeBatch);
+const delayed=deferred();api=()=>delayed.promise;
+const pending=chat.executeBatch('reply','preview');
+assert.equal(chat.state.activeBatch,null);assert.equal(batchButtons().length,0);
+delayed.reject(new Error('预览未完成'));await pending;
+assert.equal(chat.state.activeBatch,null);assert.equal(batchButtons().length,0);
+const previousCount=calls.length;await chat.executeBatch('reply','apply');assert.equal(calls.length,previousCount);
+api=async()=>({batchId:'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',actions:actions.map(item=>previewed(item,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')),errors:[]});
+await chat.executeBatch('reply','preview');
+api=async()=>{throw new Error('单项预览失败');};
+await chat.executeAction('single','preview');
+assert.equal(chat.state.activeBatch,null);assert.equal(chat.state.activePreview,'');
+assert.equal(batchButtons().length,0);
+""")
+
+    def test_invalid_batch_credentials_do_not_enable_apply(self):
+        """响应缺少真实预览凭据时可以展示错误，但不能得到写入入口。"""
+        self.run_case(r"""
+const actions=[action('a'),action('b')];
+chat.setConversation(base('conversation-a',[proposal('reply',actions)]));allowWrites();
+api=async()=>({batchId:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',actions:actions.map(item=>({...previewed(item),preview:{}})),errors:[]});
+await chat.executeBatch('reply','preview');
+assert.equal(chat.state.activeBatch,null);assert.equal(batchButtons().length,0);
+assert.match(get('chat-feedback').textContent,/凭据|核实/);
+await chat.executeBatch('reply','apply');
+assert.equal(calls.length,1);
+""")
+
+    def test_incomplete_batch_apply_response_stays_unknown_without_false_success(self):
+        """只收到部分执行记录时不宣称整组成功，也不能保留可重复提交的确认入口。"""
+        self.run_case(r"""
+const actions=[action('a'),action('b')];
+chat.setConversation(base('conversation-a',[proposal('reply',actions)]));allowWrites();
+api=async(path)=>path.endsWith('/preview')
+  ? {batchId:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',actions:actions.map(item=>previewed(item)),errors:[]}
+  : {actions:[{...actions[0],status:'applied'}]};
+await chat.executeBatch('reply','preview');
+await chat.executeBatch('reply','apply');
+assert(actions.every(item=>item.status==='unknown'));
+assert.equal(chat.state.activeBatch,null);assert.equal(batchButtons().length,0);
+assert.match(get('chat-feedback').textContent,/未返回完整可核实/);
+assert.doesNotMatch(get('chat-feedback').textContent,/已确认应用/);
+await chat.executeBatch('reply','apply');assert.equal(calls.length,2);
 """)
 
 

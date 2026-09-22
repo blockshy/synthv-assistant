@@ -270,6 +270,14 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                 elif re.fullmatch(r"/api/assistant/actions/[0-9a-f]{32}/(?:preview|apply)", path):
                     operation = service.preview_action if path.endswith("/preview") else service.apply_action
                     return self.workbench_response(operation, path.split("/")[4])
+                elif path == "/api/assistant/batches/preview":
+                    if set(args) != {"actionIds"}:
+                        raise ValueError("组合预览只接受 actionIds 字段。")
+                    return self.workbench_response(service.preview_action_batch, args["actionIds"])
+                elif path == "/api/assistant/batches/apply":
+                    if set(args) != {"batchId"}:
+                        raise ValueError("组合确认只接受 batchId 字段。")
+                    return self.workbench_response(service.apply_action_batch, args["batchId"])
                 elif path == "/api/write-mode":
                     result = service.write_mode(args.get("enabled"))
                 elif path == "/api/parameters/vocal-mode":

@@ -40,6 +40,8 @@ curve 格式为 [[position,value],...]，2 至 64 点，position 是当前连续
 同样受上述增量上限限制，边缘淡入淡出由宿主处理。多个局部变化应放在同一参数曲线中。
 pitchCurve 与 pitchDelta 不同：仅当 capabilities.nativePitch=true 且本次目录
 pitchCurve.kind=pitch、available=true 时可用；value 是工程绝对 MIDI 半音 0..127，
+若目录未提供可用 pitchCurve 或警告已有非零音高偏移，应选择小幅 pitchDelta；
+不得建议自动清空既有偏移，也不得把绝对音高直接减去音符音高当作等效替换。
 还须落在本次全部音符 pitch 加 groupPitchOffset 后的最低至最高音上下各 2 半音范围内。
 只支持 curve 和 renderMode=smooth，不支持 delta 或 points。不要把 cents 当 MIDI；
 原生音高优先使用 pitchShape：{"curve":[[0,-12],[0.15,6],[0.35,0],[0.8,0],[1,-8]],"transitionMs":40}。

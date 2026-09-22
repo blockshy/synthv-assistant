@@ -185,6 +185,14 @@ class AssistantService:
         """会话模块校验预览状态后再调用现有的宿主编辑入口。"""
         return self.conversations().apply_action(identifier)
 
+    def preview_action_batch(self, action_ids):
+        """组合提案仍由会话状态机验证，浏览器不能直接提供宿主参数或快照。"""
+        return self.conversations().preview_batch(action_ids)
+
+    def apply_action_batch(self, batch_id):
+        """只接受上次只读预览签发的批次编号，不接受客户端重组成功项。"""
+        return self.conversations().apply_batch(batch_id)
+
     def list_uploads(self):
         from .assets import list_uploads
         return list_uploads()
@@ -330,8 +338,51 @@ class AssistantService:
             return public_preview(preview)
 
     @exclusive_operation(lambda _service: DATA / "operation.lock")
+    def preview_batch(self, batch_id: str, actions: list[dict]) -> dict:
+        """在一次宿主请求中预演最多五个参数，安全转换逐项失败信息。
+
+        原始宿主异常仅用于本机桥接诊断；HTTP 返回严格使用固定提示白名单。
+        Lua 与 Python 都校验条目身份，防止畸形响应交换两个参数的确认对象。
+        """
+        with self.operation_lock:
+            if self.recording:
+                raise ValueError("请等待录音结束后预览参数修改。")
+            if not isinstance(batch_id, str) or re.fullmatch(r"[0-9a-f]{32}", batch_id) is None:
+                raise ValueError("组合预览编号无效。")
+            if not isinstance(actions, list) or not 1 <= len(actions) <= 5:
+                raise ValueError("组合预览须包含 1 至 5 个参数。")
+            selection = self.get_selection()
+            requests = []
+            for action in actions:
+                args = validate_change(action["parameter"], action.get("delta"), curve=action.get("curve"),
+                                       render_mode=action.get("renderMode", "smooth"), selection=selection)
+                requests.append({"actionId": action["id"], "change": args})
+            raw = self.bridge.call("preview_batch", {"batchId": batch_id, "actions": requests}, timeout=40.0)
+            if not isinstance(raw, dict) or raw.get("batchId") != batch_id or not isinstance(raw.get("items"), list):
+                raise ValueError("宿主组合预览响应无效，尚未修改工程。")
+            if len(raw["items"]) != len(actions):
+                raise ValueError("宿主组合预览条目不完整，尚未修改工程。")
+            previews, errors = [], []
+            for action, item in zip(actions, raw["items"]):
+                if not isinstance(item, dict) or item.get("actionId") != action["id"]:
+                    raise ValueError("宿主组合预览身份不匹配，尚未修改工程。")
+                if item.get("ok") is True:
+                    try:
+                        preview = public_preview(item.get("preview"))
+                        if preview.get("parameter") != action["parameter"]:
+                            raise ValueError("宿主组合预览参数不匹配，尚未修改工程。")
+                        previews.append({"actionId": action["id"], "preview": preview})
+                    except ValueError:
+                        errors.append({"actionId": action["id"], "message": "宿主预览资料无效，尚未修改工程。"})
+                else:
+                    safe = BridgeError(item.get("error")).public_message
+                    errors.append({"actionId": action["id"], "message": "未生成预览，尚未修改工程：" + safe if safe
+                                   else "无法生成此参数的宿主预览，尚未修改工程；请检查桥接和当前选区。"})
+            return {"previews": previews, "errors": errors}
+
+    @exclusive_operation(lambda _service: DATA / "operation.lock")
     def edit(self, action: str, args: dict | None = None) -> dict:
-        if action not in {"apply", "restore"}:
+        if action not in {"apply", "apply_batch", "restore"}:
             raise ValueError("未知编辑操作。")
         with self.operation_lock:
             if self.recording:

@@ -80,6 +80,12 @@ def parameter_policy(parameter: object, selection: dict | None) -> tuple[float, 
         if "available" in definition and not isinstance(definition["available"], bool):
             raise ParameterError("宿主参数可用状态无效，请重新读取当前选区。")
         if definition.get("available") is False:
+            # 仅信任本地固定代码，绝不直接回显宿主可能包含工程路径的任意错误文本。
+            # 此提示也用于旧提案：不会自动清除已有音高或将绝对 MIDI 曲线猜成偏移。
+            if parameter == "pitchCurve" and definition.get("unavailableCode") == "pitch-delta-nonzero":
+                raise ParameterError("选区内已有非零音高偏移，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）做小幅调整，或在宿主中处理旧音高后重新读取选区。")
+            if parameter == "pitchCurve" and definition.get("unavailableCode") == "pitch-delta-unknown":
+                raise ParameterError("无法确认选区内音高偏移的兼容状态，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）或检查宿主曲线。")
             raise ParameterError("当前声库或选区不支持该参数，请重新读取选区。")
     if parameter in PARAMETER_LIMITS:
         limit = PARAMETER_LIMITS[parameter]

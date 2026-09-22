@@ -293,13 +293,20 @@
     // 曲线和节点裁剪在各自数值轨中，避免误画到钢琴键或相邻参数轨。
     ctx.save(); ctx.beginPath(); ctx.rect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top); ctx.clip();
     for (const line of series) {
-      ctx.strokeStyle = color(line.before ? "--waveform-b" : "--waveform-a"); ctx.lineWidth = line.before ? 1.5 : 2;
+      ctx.strokeStyle = color(line.colorToken || (line.before ? "--waveform-b" : "--waveform-a")); ctx.lineWidth = line.before ? 1.5 : 2;
       ctx.setLineDash(line.before ? [4, 4] : []); ctx.beginPath(); let begun = false;
       for (const [position, value] of line.points) {
         if (!finite(value)) { begun = false; continue; }
         if (!begun) { ctx.moveTo(x(position), y(value)); begun = true; } else ctx.lineTo(x(position), y(value));
       }
       ctx.stroke(); ctx.setLineDash([]);
+      // 组合图的每个参数拥有自己的颜色和真实节点；不能将等距采样冒充控制点。
+      if (!line.before && Array.isArray(line.controlPoints)) {
+        ctx.fillStyle = color("--panel");
+        for (const point of line.controlPoints) {
+          ctx.beginPath(); ctx.arc(x(point.position), y(point.value), 2.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        }
+      }
     }
     if (context.showPoints && Array.isArray(context.controlPoints)) {
       ctx.fillStyle = color("--panel"); ctx.strokeStyle = color("--waveform-a"); ctx.lineWidth = 1.5;
@@ -315,7 +322,7 @@
     return representationNames[value] || (value ? String(value) : renderMode === "points" ? "密集控制点" : renderMode === "smooth" ? "精简曲线" : "旧版预览");
   }
 
-  /** 预览只使用宿主保存的采样与音符；音分曲线的坐标投影明确标为乐谱参考。 */
+  /** 正式预览采用上下分轨：上方为乐谱音符，下方保留参数本身的数值与单位。 */
   function createPreview(preview) {
     if (!Array.isArray(preview?.curvePreview)) return null;
     const points = preview.curvePreview.filter((item) => finite(item?.position) && item.position >= 0 && item.position <= 1 && finite(item.after));
@@ -325,12 +332,11 @@
     const controlPoints = Array.isArray(preview.controlPoints) ? preview.controlPoints.filter((point) =>
       finite(point?.position) && point.position >= 0 && point.position <= 1 && finite(point?.value)) : null;
     const showPoints = preview.renderMode === "points" || preview.representation === "automation-points";
-    const notes = previewNotes(preview.notes), nativePitch = preview.parameter === "pitchCurve" || preview.kind === "pitch" || preview.representation === "native-pitch-curve";
+    const notes = previewNotes(preview.notes);
     const originalSeries = [{ before: true, points: points.map((point) => [point.position, point.before]) },
       { points: points.map((point) => [point.position, point.after]) }];
-    const overlay = preview.parameter === "pitchDelta" ? pitchOverlay(notes, originalSeries, controlPoints) : null;
-    const series = overlay?.series || originalSeries, displayPoints = overlay ? overlay.controlPoints : controlPoints;
-    const pitch = nativePitch || Boolean(overlay);
+    // 原生音高用 MIDI、偏移用音分，但都不再投影到音符块中；改回独立参数轨。
+    const series = originalSeries, displayPoints = controlPoints, pitch = false;
     const values = series.flatMap((line) => line.points.map((point) => point[1]).filter(finite));
     if (displayPoints) values.push(...displayPoints.map((point) => point.value));
     if (pitch) values.push(...notes.map((note) => note.pitch));
@@ -339,14 +345,13 @@
     const unit = preview.unit || "参数值";
     canvas.dataset.curvePreview = "true"; canvas.setAttribute("role", "img");
     canvas.setAttribute("aria-label", `宿主曲线预览，${hasBefore ? "虚线为调整前，实线为调整后" : "仅展示调整后，原曲线未提供"}。${notes.length ? `包含 ${notes.length} 个乐谱音符矩形。` : ""}调整后起点 ${format(points[0].after)}，终点 ${format(points.at(-1).after)} ${unit}。完整数值见预览明细。`);
-    previewData.set(canvas, { series, range: [low, high], unit, notes, pitch, pitchReference: Boolean(overlay), label: preview.label,
+    previewData.set(canvas, { series, range: [low, high], unit, notes, pitch, label: preview.label,
       controlPoints: displayPoints, showPoints, startSeconds: preview.startSeconds, endSeconds: preview.endSeconds });
     // 同一预览也会留在已应用的历史建议卡中，不用“尚未写入”覆盖真实操作状态。
-    const pointsNote = showPoints ? controlPoints ? `圆点为${overlay ? "映射到音符的 " : "选区内 "}${displayPoints.length} 个宿主实际控制点。${overlay?.omittedPoints ? `另有 ${overlay.omittedPoints} 个节点位于音符间隙，未投射到音符上。` : ""}`
+    const pointsNote = showPoints ? controlPoints ? `圆点为选区内 ${displayPoints.length} 个宿主实际控制点。`
       : "此预览未提供实际控制点；使用新版桥接生成新预览后可显示节点。" : "";
-    const referenceNote = overlay ? "音高偏移按“乐谱音高 + 音分 / 100”叠加，与音符共用 MIDI 坐标；这是位置参考，不代表实际演唱音高。"
-      : preview.parameter === "pitchDelta" ? `因${notes.length ? "音符重叠" : "缺少音符"}，暂以独立音分轨显示偏移。` : "";
-    figure.append(canvas, node("figcaption", "field-help", `${hasBefore ? "虚线为调整前，实线为调整后。" : "实线为调整后；未提供原曲线。"}${pointsNote}${referenceNote}${notes.length ? `矩形为 ${notes.length} 个按音高排列的乐谱音符${pitch ? overlay ? "。" : "，与曲线共用 MIDI 坐标，不代表实际演唱音高。" : "；下方参数轨与上方音符共用时间轴，不代表实际演唱音高。"}` : "此预览未提供音符位置。"}应用状态见操作提示。`));
+    const referenceNote = "音符仅作乐谱参考；参数曲线独立显示，不代表实际演唱音高。";
+    figure.append(canvas, node("figcaption", "field-help", `${hasBefore ? "虚线为调整前，实线为调整后。" : "实线为调整后；未提供原曲线。"}${pointsNote}${referenceNote}${notes.length ? `矩形为 ${notes.length} 个按音高排列的乐谱音符；下方参数轨与上方音符共用时间轴。` : "此预览未提供音符位置。"}应用状态见操作提示。`));
     canvas.setAttribute("aria-label", `${canvas.getAttribute("aria-label") || "宿主曲线预览"}${referenceNote}${pointsNote}`);
     if (notes.length) {
       const noteDetails = node("details", "message-details curve-note-details"), list = node("ol", "curve-note-list");
@@ -360,6 +365,79 @@
       noteDetails.append(list); figure.append(noteDetails);
     }
     requestAnimationFrame(() => drawPreview(canvas));
+    return figure;
+  }
+
+  /**
+   * 同一方案的宿主预览共享时间轴，参数各自归一化后叠在下方轨道。
+   * 归一化仅改变显示坐标，图例和指针读数保留真实单位；不改变任何待应用数据。
+   * 相邻历史预览若选区不一致，明确拒绝混画，不能借当前音符补齐旧快照。
+   */
+  function createCombinedPreview(items) {
+    const entries = (Array.isArray(items) ? items.slice(0, 5) : []).flatMap((item, index) => {
+      const preview = item?.preview;
+      if (!Array.isArray(preview?.curvePreview)) return [];
+      const points = preview.curvePreview.filter((point) => finite(point?.position) && point.position >= 0 && point.position <= 1 && finite(point.after));
+      if (points.length < 2) return [];
+      const controls = Array.isArray(preview.controlPoints) ? preview.controlPoints.filter((point) =>
+        finite(point?.position) && point.position >= 0 && point.position <= 1 && finite(point.value)) : null;
+      const values = points.flatMap((point) => [point.before, point.after]).filter(finite);
+      if (controls) values.push(...controls.map((point) => point.value));
+      const low = Math.min(...values), high = Math.max(...values), padding = (high - low) * .08 || (preview.parameter === "pitchCurve" ? .5 : .1);
+      return [{ preview, points, controls, range: [low - padding, high + padding], visible: true,
+        label: item.label || preview.label || preview.parameter || "参数", unit: preview.unit || "参数值",
+        colorIndex: Number.isInteger(item.colorIndex) && item.colorIndex >= 0 && item.colorIndex < 5 ? item.colorIndex : index }];
+    });
+    if (!entries.length) return null;
+    const figure = node("figure", "curve-preview-figure curve-combined-figure"), first = entries[0].preview;
+    const sameTime = (value, other) => value === other || (finite(value) && finite(other) && Math.abs(value - other) < 1e-6);
+    const noteKey = (preview) => JSON.stringify(previewNotes(preview.notes));
+    if (entries.some(({ preview }) => (entries.length > 1 && (!finite(preview.startSeconds) || !finite(preview.endSeconds) || preview.endSeconds <= preview.startSeconds))
+        || !sameTime(preview.startSeconds, first.startSeconds) || !sameTime(preview.endSeconds, first.endSeconds) || noteKey(preview) !== noteKey(first))) {
+      figure.append(node("p", "field-help error", "历史预览的选区不一致，请重新生成组合预览后查看；未将不同音符或时间的曲线混画。"));
+      return figure;
+    }
+    const canvas = node("canvas", "curve-canvas curve-preview-canvas"), legend = node("div", "curve-legend"), notes = previewNotes(first.notes);
+    canvas.dataset.curvePreview = "true"; canvas.setAttribute("role", "img");
+    const multiple = entries.length > 1, beforeLabel = node("label", "curve-before-toggle"), beforeInput = node("input");
+    beforeInput.type = "checkbox"; beforeLabel.append(beforeInput, node("span", "", "显示调整前（虚线）"));
+    const readout = node("p", "field-help curve-readout", "移动指针查看各参数实际数值；完整数据见参数明细。" );
+    const rebuild = () => {
+      const series = entries.filter((entry) => entry.visible).flatMap((entry) => {
+        const normalize = (value) => !finite(value) ? null : multiple ? (value - entry.range[0]) / (entry.range[1] - entry.range[0]) * 100 : value;
+        const colorToken = `--curve-series-${entry.colorIndex + 1}`;
+        const after = { colorToken, points: entry.points.map((point) => [point.position, normalize(point.after)]) };
+        if (entry.preview.renderMode === "points" || entry.preview.representation === "automation-points") {
+          after.controlPoints = entry.controls?.map((point) => ({ position: point.position, value: normalize(point.value) }));
+        }
+        return [...(beforeInput.checked ? [{ before: true, colorToken, points: entry.points.map((point) => [point.position, normalize(point.before)]) }] : []), after];
+      });
+      previewData.set(canvas, { series, range: multiple ? [0, 100] : entries[0].range, unit: multiple ? "各自量程 %" : entries[0].unit,
+        notes, pitch: false, label: multiple ? "参数叠加 · 独立量程" : entries[0].label, startSeconds: first.startSeconds, endSeconds: first.endSeconds });
+      canvas.setAttribute("aria-label", `组合宿主预览。上方为 ${notes.length} 个乐谱音符，下方为 ${entries.filter((entry) => entry.visible).map((entry) => entry.label).join("、") || "已全部隐藏的参数"}。${multiple ? "参数按各自量程归一化显示，原始范围和单位见图例。" : "曲线保留原始单位。"}实线调整后，虚线调整前，圆点仅表示宿主实际控制点。`);
+      requestAnimationFrame(() => drawPreview(canvas));
+    };
+    for (const entry of entries) {
+      const label = node("label", "curve-legend-item"), checkbox = node("input"), swatch = node("span", "curve-swatch"), text = node("span");
+      checkbox.type = "checkbox"; checkbox.checked = true; checkbox.setAttribute("aria-label", `显示${entry.label}曲线`);
+      swatch.dataset.curveColor = String(entry.colorIndex + 1); swatch.setAttribute("aria-hidden", "true");
+      text.append(node("strong", "", entry.label), node("small", "", `${multiple ? "量程 " : ""}${format(entry.range[0])}–${format(entry.range[1])} ${entry.unit}`));
+      label.append(checkbox, swatch, text); legend.append(label);
+      checkbox.addEventListener("change", () => { entry.visible = checkbox.checked; rebuild(); });
+    }
+    beforeInput.addEventListener("change", rebuild);
+    canvas.addEventListener("pointermove", (event) => {
+      const rect = canvas.getBoundingClientRect(), left = notes.length ? 64 : 46;
+      const position = clamp((event.clientX - rect.left - left) / Math.max(1, rect.width - 12 - left), 0, 1);
+      const time = finite(first.startSeconds) && finite(first.endSeconds) ? `${format(first.startSeconds + position * (first.endSeconds - first.startSeconds))} 秒` : `${format(position * 100)}%`;
+      readout.textContent = [time, ...entries.filter((entry) => entry.visible).map((entry) => {
+        const value = sampleLine(entry.points.map((point) => [point.position, point.after]), position);
+        return `${entry.label} ${format(value)} ${entry.unit}`;
+      })].join(" · ");
+    });
+    figure.append(legend, beforeLabel, canvas, readout,
+      node("figcaption", "field-help", `${multiple ? "下方曲线按各自显示量程归一化到 0–100%，便于对照变化；不同参数的数值大小不可直接比较。" : "下方曲线使用图例标明的原始单位。"}上方音符按 MIDI 音高排列，与参数共用时间轴；这是乐谱参考，不代表实际演唱音高。${entries.some((entry) => entry.points.every((point) => !finite(point.before))) ? "部分参数未提供原曲线，不补造调整前数据。" : ""}`));
+    rebuild();
     return figure;
   }
   function drawPreview(canvas) {
@@ -559,5 +637,5 @@
     const observer = new ResizeObserver(() => document.querySelectorAll("canvas[data-curve-preview]").forEach(drawPreview));
     for (const target of document.querySelectorAll("#page-chat, #manual-inspector")) observer.observe(target);
   }
-  window.SynthVCurves = Object.freeze({ createEditor, createPreview, representation });
+  window.SynthVCurves = Object.freeze({ createEditor, createPreview, createCombinedPreview, representation });
 })();

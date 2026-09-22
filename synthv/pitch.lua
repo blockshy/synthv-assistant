@@ -344,6 +344,21 @@ local function assertZeroDelta(group, begin, finish)
   return fingerprint
 end
 
+function M.selectionAvailability(group, begin, finish)
+  -- 接口存在不代表当前选区可以使用绝对音高。先在只读目录阶段检查旧音高偏移，
+  -- 防止模型反复提出必然被预览拒绝的 pitchCurve；绝不删除、归零或猜测相减。
+  -- 保留 describe 的完整数据指纹，本函数仅补充选区限制及固定的机器可读原因。
+  if not finite(begin) or not finite(finish) or finish<=begin then return {available=true} end
+  local ok,result=pcall(assertZeroDelta,group,begin,finish)
+  if ok then return {available=true} end
+  if result=="选区内音高偏移并非零，无法确认原生音高叠加顺序；请先处理音高偏移曲线。" then
+    return {available=false,code="pitch-delta-nonzero",
+      message="选区内已有非零音高偏移，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）做小幅调整，或在宿主中处理旧音高后重新读取选区。"}
+  end
+  return {available=false,code="pitch-delta-unknown",
+    message="无法确认选区内音高偏移的兼容状态，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）或检查宿主曲线。"}
+end
+
 local function validateInput(args, ctx)
   if type(args)~="table" or args.parameter~="pitchCurve" then fail("原生音高参数必须为 pitchCurve。") end
   for key in pairs(args) do

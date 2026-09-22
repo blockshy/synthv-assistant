@@ -1,4 +1,4 @@
-"""隔离验证乐谱参考与浏览器音高草稿；不访问宿主、音频、模型或私有选区。"""
+"""隔离验证分轨与组合预览及浏览器音高草稿；不访问宿主、音频、模型或私有选区。"""
 
 from pathlib import Path
 import shutil
@@ -185,16 +185,20 @@ const automation = context.window.SynthVCurves.createPreview({...preview,paramet
   controlPoints:[{position:0,value:0},{position:.37,value:100},{position:1,value:0}],
   curvePreview:[{position:0,before:0,after:0},{position:1,before:0,after:0}]});
 assert.match(automation.children[1].textContent,/参考/);
-assert.match(automation.children[1].textContent,/合成|演唱/); // 明确是乐谱加偏移参考，不能冒充宿主生成基频。
+assert.match(automation.children[1].textContent,/演唱/); // 分轨只展示参数值，不能冒充宿主生成基频。
 assert(drawings[2].notes[0][1]>drawings[2].notes[1][1]);
 assert.equal(drawings[2].circles.length,3); // 真实节点仍为三个，不能替换成两个显示采样点。
 assert.equal(drawings[2].circles[0][0],drawings[2].notes[0][0]);
 assert(Math.abs(drawings[2].circles[1][0]-(64+.37*(480-12-64)))<1e-9);
-const noteCenter = rectangle => rectangle[1]+rectangle[3]/2;
-assert(Math.abs(drawings[2].circles[0][1]-noteCenter(drawings[2].notes[0]))<1e-9);
-assert(Math.abs(drawings[2].circles[2][1]-noteCenter(drawings[2].notes[1]))<1e-9);
-// 首音的 +100 音分节点应恰好位于 C4 与 D4 中间，而非落入独立的下方参数轨。
-assert(Math.abs(drawings[2].circles[1][1]-(noteCenter(drawings[2].notes[0])+noteCenter(drawings[2].notes[1]))/2)<1e-9);
+const notesBottom = Math.max(...drawings[2].notes.map(note=>note[1]+note[3]));
+assert(drawings[2].circles.every(circle=>circle[1]>notesBottom));
+assert(Math.abs(drawings[2].circles[0][1]-drawings[2].circles[2][1])<1e-9);
+// 不同音符下相同的零音分应保持同高；+100 音分仅上移参数轨节点，不叠加 MIDI 音高。
+assert(drawings[2].circles[1][1]<drawings[2].circles[0][1]);
+assert.equal(automation.children[0].height,440);
+assert.equal(figure.children[0].height,440); // 原生 MIDI 曲线也与乐谱分轨，仍保留自身 MIDI 单位。
+const nativeCurve=draw.lines.at(-1);
+assert(nativeCurve.every(point=>point[1]>Math.max(...draw.notes.map(note=>note[1]+note[3]))));
 const oldPoints = context.window.SynthVCurves.createPreview({...preview,parameter:'tension',renderMode:'points'});
 assert.equal(drawings[3].circles.length,0);
 assert.match(oldPoints.children[1].textContent,/未提供实际控制点/);
@@ -203,7 +207,7 @@ assert.equal(drawings[4].circles.length,0); // 绘制模式保持连续线条，
 const smoothAutomation = context.window.SynthVCurves.createPreview({...preview,parameter:'pitchDelta',unit:'音分',renderMode:'smooth',
   controlPoints:[{position:0,value:0},{position:1,value:0}],curvePreview:[{position:0,before:0,after:0},{position:1,before:0,after:0}]});
 assert.equal(drawings[5].circles.length,0);
-assert.equal(smoothAutomation.children[0].height,320); // 两种绘制模式都应共享单个钢琴卷帘。
+assert.equal(smoothAutomation.children[0].height,440); // 两种绘制模式使用同样的音符轨及独立参数轨。
 const tension = context.window.SynthVCurves.createPreview({...preview,parameter:'tension',unit:'参数值',renderMode:'points',
   controlPoints:[{position:0,value:.1},{position:1,value:.1}],curvePreview:[{position:0,before:0,after:.1},{position:1,before:0,after:.1}]});
 assert.match(tension.children[1].textContent,/共用时间轴/);
@@ -220,10 +224,116 @@ for (const [pitch,delta] of [[0,-100],[127,100]]) {
     curvePreview:[{position:0,before:0,after:delta},{position:1,before:0,after:delta}]});
   const edge=drawings.at(-1),clip=edge.clips.at(-1);
   assert.equal(edge.circles.length,2);
-  // MIDI 0 以下和 127 以上的参考节点仍完整落在绘图区，不能只在坐标换算后被 Canvas 裁掉。
+  // 边缘 MIDI 音符不改变音分轨的范围，完整 ±100 音分节点仍应留在参数绘图区。
   assert(edge.circles.every(circle=>circle[1]-circle[2]>=clip[1] && circle[1]+circle[2]<=clip[1]+clip[3]));
-  assert(delta<0 ? edge.circles[0][1]>noteCenter(edge.notes[0]) : edge.circles[0][1]<noteCenter(edge.notes[0]));
+  assert(edge.circles.every(circle=>circle[1]>edge.notes[0][1]+edge.notes[0][3]));
 }
+""")
+
+    def test_combined_preview_preserves_units_nodes_and_visible_series(self):
+        """多参数只共享显示比例；颜色、原始单位、真实节点和未知前值保持可辨。"""
+        self.run_script(r"""
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const drawings=[];
+// 记录生产 Canvas 的路径、颜色与节点；清屏重置当前帧，便于核对图例切换后的真实绘制结果。
+function element(tag) {
+  const item={tag,children:[],dataset:{},attrs:{},listeners:{},isConnected:true,checked:false,
+    classList:{toggle(){}},append(...children){this.children.push(...children);},
+    setAttribute(name,value){this.attrs[name]=value;},getAttribute(name){return this.attrs[name];},
+    addEventListener(name,callback){this.listeners[name]=callback;},
+    getBoundingClientRect:()=>({left:17,width:480})};
+  if(tag==='canvas'){
+    const drawing={paths:[],notes:[],circles:[]};drawings.push(drawing);
+    let path=[],dash=[];
+    const ctx={scale(){},clearRect(){drawing.paths=[];drawing.notes=[];drawing.circles=[];},
+      save(){},restore(){},rect(){},clip(){},fillRect(){},fillText(){},fill(){},
+      strokeRect(...rectangle){drawing.notes.push(rectangle);},setLineDash(value){dash=value.slice();},
+      beginPath(){path=[];},moveTo(...p){path.push({kind:'move',point:p});},lineTo(...p){path.push({kind:'line',point:p});},
+      arc(...circle){drawing.circles.push({color:this.strokeStyle,point:circle});},
+      stroke(){drawing.paths.push({color:this.strokeStyle,dash:dash.slice(),points:path.slice()});}};
+    item.getContext=()=>ctx;
+  }
+  return item;
+}
+const context={window:{addEventListener(){},devicePixelRatio:1},
+  document:{createElement:element,documentElement:{},getElementById(){},querySelectorAll:()=>[]},
+  getComputedStyle:()=>({getPropertyValue:token=>token}),requestAnimationFrame:callback=>callback()};
+vm.createContext(context);vm.runInContext(fs.readFileSync('web/curves.js','utf8'),context);
+const curves=context.window.SynthVCurves;
+const notes=[{startPosition:0,endPosition:.5,pitch:60},{startPosition:.5,endPosition:1,pitch:64}];
+const preview=(parameter,unit,values,before,extra={})=>({parameter,unit,startSeconds:10,endSeconds:12,notes,
+  curvePreview:values.map((value,index)=>({position:index/(values.length-1),before:before[index],after:value})),...extra});
+const items=[
+  {label:'原生音高',colorIndex:0,preview:preview('pitchCurve','MIDI 半音',[60,61,62],[null,null,null],
+    {renderMode:'smooth',controlPoints:[{position:.5,value:61}]})},
+  {label:'气声',colorIndex:2,preview:preview('breathiness','参数值',[-.5,0,.5],[-.5,null,.5],
+    {renderMode:'points',controlPoints:[{position:0,value:-.5},{position:.25,value:-.25},{position:1,value:.5},{position:2,value:1}]})},
+  {label:'响度',colorIndex:4,preview:preview('loudness','dB',[-6,0,6],[-6,0,6],{renderMode:'points'})},
+];
+const saved=JSON.stringify(items);
+const figure=curves.createCombinedPreview(items),[legend,beforeLabel,canvas,readout,caption]=figure.children;
+const draw=drawings[0],colored=()=>draw.paths.filter(path=>path.color.startsWith('--curve-series-'));
+const lines=()=>colored().filter(path=>path.points.length>0);
+assert.equal(canvas.height,440);
+assert.equal(draw.notes.length,2);
+assert(draw.notes[0][1]>draw.notes[1][1]);
+assert.match(caption.textContent,/不同参数的数值大小不可直接比较/);
+assert.match(caption.textContent,/未提供原曲线/);
+assert.equal(legend.children.length,3);
+assert.deepEqual(legend.children.map(item=>item.children[1].dataset.curveColor),['1','3','5']);
+assert.match(legend.children[0].children[2].children[1].textContent,/MIDI 半音/);
+assert.match(legend.children[2].children[2].children[1].textContent,/dB/);
+assert.deepEqual(lines().map(line=>line.color),['--curve-series-1','--curve-series-3','--curve-series-5']);
+// 数值量级差异大但相对变化完全相同，应归一化为同一条几何线，不能把 MIDI 或 dB 强塞进参数值域。
+const first=lines()[0].points.map(item=>item.point);
+for(const line of lines().slice(1))for(let i=0;i<first.length;i++){
+  assert(Math.abs(line.points[i].point[0]-first[i][0])<1e-9);
+  assert(Math.abs(line.points[i].point[1]-first[i][1])<1e-9);
+}
+assert(lines().every(line=>line.points.every(item=>item.point[1]>Math.max(...draw.notes.map(note=>note[1]+note[3])))));
+assert.equal(draw.circles.length,3); // 只有气声 points 模式的 3 个有效宿主节点；不能替其他采样或 smooth 添点。
+assert(draw.circles.every(circle=>circle.color==='--curve-series-3'));
+assert(Math.abs(draw.circles[1].point[0]-(64+.25*(480-12-64)))<1e-9);
+assert(lines().every(line=>line.dash.length===0));
+const beforeInput=beforeLabel.children[0];beforeInput.checked=true;beforeInput.listeners.change();
+const unavailable=colored().find(line=>line.color==='--curve-series-1'&&line.dash.length);
+assert(unavailable&&unavailable.points.length===0); // 全未知前值只保留空路径，不补零线。
+const interrupted=colored().find(line=>line.color==='--curve-series-3'&&line.dash.length);
+assert.equal(interrupted.points.length,2);
+assert(interrupted.points.every(point=>point.kind==='move')); // 中段未知时断开，不能跨过空值连接。
+assert.equal(draw.circles.length,3); // 显示调整前不会伪造额外节点。
+canvas.listeners.pointermove({clientX:17+64+.5*(480-12-64)});
+assert.match(readout.textContent,/11 秒/);
+assert.match(readout.textContent,/原生音高 61 MIDI 半音/);
+assert.match(readout.textContent,/气声 0 参数值/);
+assert.match(readout.textContent,/响度 0 dB/); // 指针始终显示原数值，而非归一化百分比。
+const originalPitch=lines().find(line=>line.color==='--curve-series-1'&&!line.dash.length).points;
+const breathinessToggle=legend.children[1].children[0];
+breathinessToggle.checked=false;breathinessToggle.listeners.change();
+assert(colored().every(line=>line.color!=='--curve-series-3'));
+assert.equal(draw.circles.length,0);
+assert.deepEqual(lines().find(line=>line.color==='--curve-series-1'&&!line.dash.length).points,originalPitch);
+assert.doesNotMatch(canvas.attrs['aria-label'],/气声/);
+canvas.listeners.pointermove({clientX:17+64+.5*(480-12-64)});
+assert.doesNotMatch(readout.textContent,/气声/);
+for(const row of legend.children){row.children[0].checked=false;row.children[0].listeners.change();}
+assert.equal(colored().length,0);assert.equal(draw.notes.length,2);
+assert.match(canvas.attrs['aria-label'],/已全部隐藏/);
+breathinessToggle.checked=true;breathinessToggle.listeners.change();
+assert.equal(draw.circles.length,3);
+assert(lines().every(line=>line.color==='--curve-series-3'));
+assert.equal(JSON.stringify(items),saved); // 显示缩放、筛选和指针操作都不得写回宿主预览协议。
+for(const changed of [{startSeconds:11},{endSeconds:13},{notes:[{startPosition:0,endPosition:1,pitch:60}]}]){
+  const rejected=curves.createCombinedPreview([items[0],{...items[1],preview:{...items[1].preview,...changed}}]);
+  assert.equal(rejected.children.some(child=>child.tag==='canvas'),false);
+  assert.match(rejected.children[0].textContent,/选区不一致/);
+}
+assert.equal(curves.createCombinedPreview([{preview:{curvePreview:[]}}]),null);
+// 只剩一个参数时保留原始单位，不把 ±6 dB 改写为百分比。
+const single=curves.createCombinedPreview([items[2]]);
+assert.match(single.children[2].attrs['aria-label'],/原始单位/);
+assert.match(single.children[4].textContent,/原始单位/);
+assert.equal(drawings.at(-1).circles.length,0);
 """)
 
     def test_editor_converts_piano_roll_strokes_back_to_parameter_units(self):

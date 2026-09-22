@@ -75,6 +75,22 @@ class ParameterTests(unittest.TestCase):
         for legacy in ({}, {"parameters": {}}, {"parameters": {"tension": {"range": [-1, 1], "pointCount": 0}}}):
             self.assertEqual(validate_change("tension", 0.1, selection=legacy)["delta"], 0.1)
 
+    def test_native_pitch_unavailability_reports_fixed_reason_and_is_excluded_from_model(self):
+        """原因只按代码映射，不能回显任意宿主字符串；模型仍可使用已有偏移参数。"""
+        self.selection["capabilities"]["nativePitch"] = False
+        definition = self.selection["parameters"]["pitchCurve"]
+        definition.update(available=False, unavailableCode="pitch-delta-nonzero", unavailableReason="private host details")
+        with self.assertRaisesRegex(ParameterError, "非零音高偏移") as caught:
+            validate_change("pitchCurve", curve=[[0, 60], [1, 64]], selection=self.selection)
+        self.assertNotIn("private", str(caught.exception))
+        public = public_parameter_catalog(self.selection)
+        self.assertNotIn("pitchCurve", public)
+        self.assertIn("pitchDelta", public)
+        self.assertEqual(validate_change("pitchDelta", 5, selection=self.selection)["delta"], 5)
+        definition["unavailableCode"] = "pitch-delta-unknown"
+        with self.assertRaisesRegex(ParameterError, "兼容状态"):
+            validate_change("pitchCurve", curve=[[0, 60], [1, 64]], selection=self.selection)
+
     def test_host_limit_can_tighten_but_cannot_expand_local_policy(self):
         self.selection["parameters"]["toneShift"]["maxDelta"] = 1000
         with self.assertRaises(ParameterError):

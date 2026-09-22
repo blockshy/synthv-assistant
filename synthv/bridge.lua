@@ -11,7 +11,7 @@ end
 
 local session = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock()*1000000))
 local writeProject = nil
-local previews, lastEdit = {}, nil
+local previews, lastEdit, previewBatch = {}, nil, nil
 local counter, ticks, playbackToken = 0, 0, 0
 local stopping=false
 -- 声库尚未使用的模式不一定出现在 getVoice 中。用户可按面板名称补充本组目录；
@@ -88,7 +88,7 @@ local function heartbeat()
   local info=SV:getHostInfo()
   writeFile("heartbeat.json", {session=session,timestamp=os.time(),hostVersion=info.hostVersion,
     projectFile=projectName(),writeEnabled=writeProject~=nil and writeProject==projectName(),protocol=2,
-    capabilities={curves=true,nativePitch=NativePitch~=nil}})
+    capabilities={curves=true,nativePitch=NativePitch~=nil,batchPreview=true}})
 end
 
 local function current()
@@ -171,6 +171,16 @@ local function selection()
       durationSeconds=axis:getSecondsFromBlick(finish)-axis:getSecondsFromBlick(onset)}
   end
   local curves,voiceFingerprint,modeCount=parameterCatalog(editor,ref,group)
+  if curves.pitchCurve and curves.pitchCurve.available and first and last then
+    -- begin/finish 必须换回音符组坐标；选区目录与真正预览复用同一零偏移校验。
+    -- 不修改参数指纹，避免把能力提示误当成工程数据发生了改变。
+    local availability=NativePitch.selectionAvailability(group,first-ref:getTimeOffset(),last-ref:getTimeOffset())
+    if not availability.available then
+      curves.pitchCurve.available=false
+      curves.pitchCurve.unavailableCode=availability.code
+      curves.pitchCurve.unavailableReason=availability.message
+    end
+  end
   local pitchOffset=0; pcall(function() pitchOffset=ref:getPitchOffset() end)
   local warnings={modeCount==0 and "宿主尚未返回声线模式；可按 SynthV 面板名称手动补充。" or
     "声线目录来自已保存设置及手动补充，不能保证包含声库所有模式；请以当前声库面板为准。"}
@@ -181,7 +191,7 @@ local function selection()
     groupOffset=ref:getTimeOffset(),groupPitchOffset=pitchOffset,notes=notes,noteCount=#notes,voiceFingerprint=voiceFingerprint,
     startSeconds=first and axis:getSecondsFromBlick(first) or nil,
     endSeconds=last and axis:getSecondsFromBlick(last) or nil,parameters=curves,
-    capabilities={curves=true,nativePitch=curves.pitchCurve~=nil and curves.pitchCurve.available},
+    capabilities={curves=true,nativePitch=curves.pitchCurve~=nil and curves.pitchCurve.available,batchPreview=true},
     capabilityWarnings=warnings}
 end
 
@@ -274,39 +284,70 @@ local function validateOutsideCurve(curve,original,points,begin,finish,method)
     error("当前曲线插值方式尚未通过边界校验支持，未生成可应用预览。")
   end
   if #points>MAX_CURVE_POINTS then error("预览曲线超过4000个控制点，请缩短选区或先简化曲线。") end
-  -- 克隆得到独立的 Automation，不挂接到任何音符组；模拟写入不改变用户工程。
-  local candidate=curve:clone()
-  candidate:removeAll()
-  for _,point in ipairs(points) do candidate:add(point[1],point[2]) end
-  if candidate:getInterpolationMethod()~=method then error("曲线克隆未保留插值方式，预览已拒绝。") end
-  -- 宿主可能将值量化为 float32，并对同位置控制点去重；以后续读回值作为写入目标。
-  local normalized=candidate:getAllPoints()
-  if #normalized>MAX_CURVE_POINTS then error("宿主规范化后的曲线超过控制点上限。") end
-  local unique={[begin]=begin,[finish]=finish}
-  for _,source in ipairs({original,normalized}) do
-    for _,point in ipairs(source) do unique[point[1]]=point[1] end
-  end
-  local breaks={}; for _,position in pairs(unique) do breaks[#breaks+1]=position end
-  table.sort(breaks)
-  -- 控制点两端的常值延伸也纳入检测，覆盖无原始控制点和单控制点的情况。
-  local span=math.max(1,breaks[#breaks]-breaks[1])
-  table.insert(breaks,1,breaks[1]-span)
-  breaks[#breaks+1]=breaks[#breaks]+span
-  for index=1,#breaks-1 do
-    local left,right=breaks[index],breaks[index+1]
-    if right<=begin or left>=finish then
-      -- 原/新断点并集内，两条三次曲线的差仍为三次多项式。
-      -- 每段检测端点及三个内部点；容差用于浮点舍入，任何外部变化均拒绝。
-      for fraction=0,4 do
-        local position=left+(right-left)*fraction/4
-        local before,after=curve:get(position),candidate:get(position)
-        if not finite(before) or not finite(after) or math.abs(before-after)>OUTSIDE_EPSILON then
-          error("候选曲线会影响选区以外的插值，已拒绝预览；请扩大选区或手动调整边界。")
+  -- 三次插值新增选区边界会改变相邻切线，即使区外旧控制点完全不动也可能漂移。
+  -- 只在独立克隆里对漂移区间补原曲线采样作为保护点；每轮重新校验所有区外段，
+  -- 不放宽误差阈值、不更改插值类型，也不把“新点值等于旧值”当作整段不变的证据。
+  local map={}; for _,point in ipairs(points) do map[point[1]]={point[1],point[2]} end
+  local guardCount=0
+  for attempt=1,10 do
+    local proposed={}; for _,point in pairs(map) do proposed[#proposed+1]=point end
+    if #proposed>MAX_CURVE_POINTS then error("候选曲线超过4000个控制点，请缩短选区。") end
+    table.sort(proposed,function(a,b) return a[1]<b[1] end)
+    local candidate=curve:clone()
+    candidate:removeAll()
+    for _,point in ipairs(proposed) do candidate:add(point[1],point[2]) end
+    if candidate:getInterpolationMethod()~=method then error("曲线克隆未保留插值方式，预览已拒绝。") end
+    -- 宿主可能量化为 float32；完整读回后的曲线才是最终候选，不能返回未量化输入。
+    local normalized=candidate:getAllPoints()
+    if #normalized>MAX_CURVE_POINTS then error("宿主规范化后的曲线超过控制点上限。") end
+    local unique={[begin]=begin,[finish]=finish}
+    for _,source in ipairs({original,normalized}) do
+      for _,point in ipairs(source) do unique[point[1]]=point[1] end
+    end
+    local breaks={}; for _,position in pairs(unique) do breaks[#breaks+1]=position end
+    table.sort(breaks)
+    -- 包括首尾常值延伸；空曲线、单点曲线也不能略过边界验证。
+    local span=math.max(1,breaks[#breaks]-breaks[1])
+    table.insert(breaks,1,breaks[1]-span)
+    breaks[#breaks+1]=breaks[#breaks]+span
+    local bad={}
+    for index=1,#breaks-1 do
+      local left,right=breaks[index],breaks[index+1]
+      if right<=begin or left>=finish then
+        local drift=false
+        for fraction=0,4 do
+          local position=left+(right-left)*fraction/4
+          local before,after=curve:get(position),candidate:get(position)
+          if not finite(before) or not finite(after) then
+            error("候选曲线会影响选区以外的插值，已拒绝预览；请扩大选区或手动调整边界。")
+          end
+          if math.abs(before-after)>OUTSIDE_EPSILON then drift=true end
+        end
+        if drift then bad[#bad+1]={left,right} end
+      end
+    end
+    if #bad==0 then return normalized,candidate,guardCount end
+    if interpolationKind~="cubic" or attempt==10 then break end
+    local added=0
+    for _,segment in ipairs(bad) do
+      -- 只补失败区间的四分点，位置保持整数 blick；已无可分辨位置时直接拒绝。
+      -- 这些点的目标全部读取原 Automation，不能混入待调教增量或区内变换值。
+      for fraction=1,3 do
+        local position=math.floor(segment[1]+(segment[2]-segment[1])*fraction/4+0.5)
+        if position>segment[1] and position<segment[2] and (position<begin or position>finish) and not map[position] then
+          local value=curve:get(position)
+          if not finite(value) then error("候选曲线会影响选区以外的插值，已拒绝预览；请扩大选区或手动调整边界。") end
+          map[position]={position,value}; added=added+1
         end
       end
     end
+    if added==0 then break end
+    guardCount=guardCount+added
+    -- 区外修复额外限制到 512 点，防止无法收敛的宿主实现产生很重的预览任务；
+    -- 超限仍拒绝而非放宽阈值，整条曲线的 4000 点上限也一直有效。
+    if guardCount>512 then break end
   end
-  return normalized,candidate
+  error("候选曲线会影响选区以外的插值，已拒绝预览；请扩大选区或手动调整边界。")
 end
 
 local function checkedCurve(args,limit)
@@ -357,6 +398,8 @@ local function simplifyPoints(points,tolerance,protected)
 end
 
 local function preview(args)
+  -- 无论单项预览最终是否成功，新的请求都不能留下上一批次可确认的入口。
+  previews={}; previewBatch=nil
   local name,delta=args.parameter,args.delta
   if type(name)~="string" then error("参数名称必须是字符串。") end
   local renderMode=args.renderMode==nil and "smooth" or args.renderMode
@@ -464,12 +507,12 @@ local function preview(args)
   if #points>MAX_CURVE_POINTS then error("候选曲线超过4000个控制点，请缩短选区。") end
   local denseCount=#points
   local tolerance=parameterSpecs[name] and parameterSpecs[name].tolerance or 0.15
-  local candidate,normalized,lastError
+  local candidate,normalized,lastError,outsideGuardCount
   -- 精简仅减少本次选区内的点；复杂插值若不能满足误差要求，逐步提高精度。
   -- 不调用真实组上的 simplify，也不改变整条自动化曲线的插值类型。
   for attempt=1,(renderMode=="smooth" and 10 or 1) do
     local proposed=renderMode=="smooth" and simplifyPoints(points,tolerance/2^attempt,protected) or points
-    local ok,result,copy=pcall(validateOutsideCurve,curve,original,proposed,begin,finish,interpolation)
+    local ok,result,copy,guards=pcall(validateOutsideCurve,curve,original,proposed,begin,finish,interpolation)
     if ok then
       local accurate=true
       local badSegments,segment={},1
@@ -493,12 +536,20 @@ local function preview(args)
           end
         end
       end
-      if accurate then normalized,candidate=result,copy; break end
+      if accurate then normalized,candidate,outsideGuardCount=result,copy,guards; break end
       for _,bad in pairs(badSegments) do protected[bad.left]=true; protected[bad.right]=true end
       lastError="精简曲线无法在当前插值方式下达到误差要求。"
-    else lastError=result end
+    else
+      lastError=result
+      -- 区外保护点已完成独立的自适应细分；进一步收紧区内精简阈值无法修好它。
+      if tostring(result):find("选区以外的插值",1,true) then break end
+    end
   end
-  if not candidate then error(tostring(lastError).." 未写入；可缩短选区或选择控制点模式。") end
+  if not candidate then
+    -- 边界漂移与点数模式无关，不能错误建议切换模式；精简精度问题才可建议保留节点。
+    if tostring(lastError):find("选区以外的插值",1,true) then error(lastError) end
+    error(tostring(lastError).." 未写入；可缩短选区或选择控制点模式。")
+  end
   points=normalized
   local view={}
   for index=0,96 do
@@ -522,6 +573,10 @@ local function preview(args)
     end
   end
   counter=counter+1; local id=session.."-"..counter
+  local warnings=clipped and {"部分目标值达到参数范围边界，预览已按宿主范围限制。"} or {}
+  if outsideGuardCount and outsideGuardCount>0 then
+    warnings[#warnings+1]="为保持选区外原曲线形状，候选中补充了 "..outsideGuardCount.." 个区外保护点；已通过原有严格误差校验，尚未写入。"
+  end
   -- 仅保留最近一次预览，避免长时间保留宿主对象及无界增长。
   previews={}
   previews[id]={kind="automation",signature=signature(s),parameter=name,before=original,after=points,interpolation=interpolation,created=os.time()}
@@ -530,7 +585,39 @@ local function preview(args)
     curve=knots,renderMode=renderMode,representation=renderMode=="smooth" and "automation-simplified" or "automation-points",
     label=descriptor.label,unit=descriptor.unit,beforePointCount=#original,pointCount=#points,
     pointReduction=math.max(0,denseCount-#points),curvePreview=view,controlPoints=controlPoints,notes=noteGuide,
-    capabilityWarnings=clipped and {"部分目标值达到参数范围边界，预览已按宿主范围限制。"} or {}}
+    capabilityWarnings=warnings}
+end
+
+local function previewMany(args)
+  -- 同一请求内逐项创建独立克隆，只保留本批成功项。预览失败不写工程，也不让
+  -- 前一轮候选重新获得确认权限；原始错误由 Python 固定白名单转换后再公开。
+  previews={}; previewBatch=nil
+  if type(args.batchId)~="string" or not args.batchId:match("^[0-9a-f]+$") or #args.batchId~=32
+      or type(args.actions)~="table" or #args.actions<1 or #args.actions>5 then error("组合预览请求无效。") end
+  local seen,parameters,count={},{},0
+  for key,item in pairs(args.actions) do
+    count=count+1
+    if type(key)~="number" or key%1~=0 or key<1 or key>#args.actions
+        or type(item)~="table" or type(item.actionId)~="string" or #item.actionId~=32
+        or not item.actionId:match("^[0-9a-f]+$") or seen[item.actionId]
+        or type(item.change)~="table" or type(item.change.parameter)~="string"
+        or parameters[item.change.parameter] then error("组合预览条目无效或参数重复。") end
+    seen[item.actionId]=true; parameters[item.change.parameter]=true
+  end
+  if count~=#args.actions then error("组合预览条目无效。") end
+  if parameters.pitchCurve and parameters.pitchDelta then error("原生音高与音高偏移不能同时应用。") end
+  local kept,items={},{}
+  for _,item in ipairs(args.actions) do
+    local ok,result=pcall(preview,item.change)
+    if ok then
+      local record=previews[result.previewId]
+      if not record then error("组合预览快照缺失。") end
+      record.batchId=args.batchId; kept[result.previewId]=record
+      items[#items+1]={actionId=item.actionId,ok=true,preview=result}
+    else items[#items+1]={actionId=item.actionId,ok=false,error=tostring(result)} end
+  end
+  previews=kept; previewBatch={id=args.batchId}
+  return {batchId=args.batchId,items=items}
 end
 
 local function writePoints(curve,points)
@@ -570,6 +657,7 @@ end
 local function apply(args)
   requireWrite()
   local p=previews[args.previewId]
+  if p and p.batchId then error("该参数属于组合预览，请确认并应用完整的预览成功项。") end
   if not p or os.time()-p.created>300 then error("预览不存在或已过期，请重新预览。") end
   local s=selection()
   if signature(s)~=p.signature then error("选区或音符已变化，请重新读取并预览。") end
@@ -602,6 +690,69 @@ local function apply(args)
     undoRecords=1,message="参数已应用，可在SynthV试听或撤销。"}
 end
 
+local function applyMany(args)
+  requireWrite()
+  if not previewBatch or args.batchId~=previewBatch.id or type(args.previewIds)~="table"
+      or #args.previewIds<1 or #args.previewIds>5 then error("组合预览不存在或已失效，请重新预览。") end
+  local s=selection()
+  local _,_,group=current(); assertUnshared(group:getUUID())
+  local records,targets,seen,parameters={},{},{},{}
+  local count=0
+  -- 所有目标先逐一检查完整原始快照，任何一项变化均在 newUndoRecord/写入前退出。
+  for key,id in pairs(args.previewIds) do
+    count=count+1
+    if type(key)~="number" or key%1~=0 or key<1 or key>#args.previewIds or type(id)~="string"
+        or seen[id] then error("组合确认条目无效。") end
+    seen[id]=true
+  end
+  if count~=#args.previewIds then error("组合确认条目无效。") end
+  for _,id in ipairs(args.previewIds) do
+    local p=previews[id]
+    if not p or p.batchId~=args.batchId or os.time()-p.created>300 then error("组合预览不存在或已过期，请重新预览。") end
+    if parameters[p.parameter] then error("组合确认参数重复。") end
+    parameters[p.parameter]=true
+    if signature(s)~=p.signature then error("选区或音符已变化，请重新读取并预览。") end
+    local target=editTarget(p,group)
+    if p.kind~="pitch" and target:getInterpolationMethod()~=p.interpolation then error("曲线插值方式已经改变，请重新预览。") end
+    if not sameSnapshot(p,target,p.before) then error("原参数曲线已经改变，请重新预览。") end
+    records[#records+1]=p; targets[#targets+1]=target
+  end
+  if parameters.pitchCurve and parameters.pitchDelta then error("原生音高与音高偏移不能同时应用。") end
+  local previousEdit=lastEdit
+  local edit={kind="batch",project=projectName(),uuid=group:getUUID(),voiceFingerprint=s.voiceFingerprint,
+    groupOffset=s.groupOffset,groupPitchOffset=s.groupPitchOffset,entries=records}
+  -- 确认凭据先消耗，哪怕宿主中途抛异常也不得重放。整批只有一条宿主撤销记录。
+  previews={}; previewBatch=nil
+  SV:getProject():newUndoRecord()
+  local attempted=0
+  local ok,err=pcall(function()
+    for index,p in ipairs(records) do attempted=index; writeSnapshot(p,targets[index],p.after) end
+    for index,p in ipairs(records) do if not sameSnapshot(p,targets[index],p.after) then error("组合写入后完整校验失败。") end end
+  end)
+  if not ok then
+    local recovered=true
+    for index=attempted,1,-1 do
+      if not pcall(writeSnapshot,records[index],targets[index],records[index].before) then recovered=false end
+    end
+    for index,p in ipairs(records) do
+      local checked,equal=pcall(sameSnapshot,p,targets[index],p.before)
+      if not checked or not equal then recovered=false end
+    end
+    if recovered then lastEdit=previousEdit; error("组合应用失败，已恢复并校验全部原始参数。") end
+    -- 若自动回滚也失败，保留每项当前真实残留快照；恢复入口仍会先检查用户未再修改。
+    for index,p in ipairs(records) do
+      local readable,remaining=pcall(captureSnapshot,p,targets[index]); p.after=readable and remaining or nil
+    end
+    edit.recoveryPending=true; lastEdit=edit
+    error("组合应用及恢复未完成，已保留恢复记录，请立即在 SynthV 撤销或使用恢复功能。")
+  end
+  lastEdit=edit
+  local results={}
+  for _,p in ipairs(records) do results[#results+1]={verified=true,parameter=p.parameter,
+    pointCount=p.kind=="pitch" and p.after.pointCount or #p.after,undoRecords=1,message="参数已作为组合应用，可整体撤销。"} end
+  return {verified=true,undoRecords=1,results=results,message="组合参数已应用，可在 SynthV 一次撤销。"}
+end
+
 local function restore()
   requireWrite()
   if not lastEdit or lastEdit.project~=projectName() then error("本会话没有可恢复的修改。") end
@@ -610,6 +761,30 @@ local function restore()
   assertUnshared(group:getUUID())
   local s=selection()
   if s.voiceFingerprint~=lastEdit.voiceFingerprint or s.groupOffset~=lastEdit.groupOffset or s.groupPitchOffset~=lastEdit.groupPitchOffset then error("声线设置或音符组偏移已变化，无法安全覆盖；请使用 SynthV 撤销。") end
+  if lastEdit.kind=="batch" then
+    local targets={}
+    -- 恢复同样先验证全部目标，不能恢复前两项后才发现第三项已被用户手动修改。
+    for index,p in ipairs(lastEdit.entries) do
+      local target=editTarget(p,group); targets[index]=target
+      if p.kind~="pitch" and target:getInterpolationMethod()~=p.interpolation then error("曲线插值方式已经改变，无法安全恢复。") end
+      if not p.after or not sameSnapshot(p,target,p.after) then error("组合参数已被手动修改或撤销，无法安全覆盖。") end
+    end
+    previews={}; previewBatch=nil
+    SV:getProject():newUndoRecord()
+    local ok=pcall(function()
+      for index=#lastEdit.entries,1,-1 do local p=lastEdit.entries[index]; writeSnapshot(p,targets[index],p.before) end
+      for index,p in ipairs(lastEdit.entries) do if not sameSnapshot(p,targets[index],p.before) then error("组合恢复后完整校验失败。") end end
+    end)
+    if not ok then
+      for index,p in ipairs(lastEdit.entries) do
+        local readable,remaining=pcall(captureSnapshot,p,targets[index]); p.after=readable and remaining or nil
+      end
+      lastEdit.recoveryPending=true
+      error("组合恢复未完成，已保留全部原始参数，请检查 SynthV 撤销历史。")
+    end
+    lastEdit=nil
+    return {verified=true,message="已恢复本助手上一批修改前的全部参数。"}
+  end
   local curve=editTarget(lastEdit,group)
   if lastEdit.kind~="pitch" and curve:getInterpolationMethod()~=lastEdit.interpolation then error("曲线插值方式已经改变，无法安全恢复。") end
   if not lastEdit.after then error("无法读取上次失败后的曲线状态，请直接在SynthV撤销。") end
@@ -632,7 +807,9 @@ local function dispatch(action,args)
   elseif action=="get_selection" then return selection()
   elseif action=="register_vocal_mode" then return registerVocalMode(args)
   elseif action=="preview" then return preview(args)
+  elseif action=="preview_batch" then return previewMany(args)
   elseif action=="apply" then return apply(args)
+  elseif action=="apply_batch" then return applyMany(args)
   elseif action=="restore" then return restore()
   elseif action=="write_mode" then
     local name=projectName()

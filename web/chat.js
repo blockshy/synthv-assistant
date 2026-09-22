@@ -12,7 +12,7 @@
   if (!bridge) return;
   const state = {
     conversations: [], conversation: null, loading: false, sending: false,
-    conversationRequest: 0, conversationListRequest: 0, actionBusy: "", activePreview: "", actionErrors: new Map(),
+    conversationRequest: 0, conversationListRequest: 0, actionBusy: "", activePreview: "", activeBatch: null, actionErrors: new Map(),
     attachments: [], assets: [], libraryDraft: new Set(), libraryLoading: false,
     uploading: false, libraryOpener: null, libraryRequest: 0,
     metadataBusy: false, renderModeSaving: false, assetBusy: "", assetEditor: null, assetDelete: "", assetDeleteMode: "trash",
@@ -122,6 +122,12 @@
     document.querySelectorAll("[data-action-apply]").forEach((button) => {
       button.disabled = busy || state.manualBusy || !connected || !state.status?.writeEnabled || button.dataset.actionApply !== state.activePreview;
     });
+    document.querySelectorAll("[data-batch-preview]").forEach((button) => {
+      button.disabled = busy || state.manualBusy || !connected;
+    });
+    document.querySelectorAll("[data-batch-apply]").forEach((button) => {
+      button.disabled = busy || state.manualBusy || !connected || !state.status?.writeEnabled || button.dataset.batchApply !== state.activeBatch?.id;
+    });
     document.querySelectorAll(".attachment-remove").forEach((button) => { button.disabled = state.sending; });
     document.querySelectorAll("[data-chat-restore]").forEach((button) => {
       button.disabled = busy || state.manualBusy || !connected || !state.status?.writeEnabled;
@@ -173,7 +179,7 @@
     $("conversation-editor").hidden = true; $("conversation-delete-confirm").hidden = true;
     $("edit-conversation").setAttribute("aria-expanded", "false");
     const request = ++state.conversationRequest;
-    state.loading = true; state.activePreview = ""; syncControls();
+    state.loading = true; clearPreviewAuthorization(); syncControls();
     feedback("chat-feedback", "正在读取会话…");
     try {
       const result = await bridge.api(`/api/conversations/${encodeURIComponent(id)}`);
@@ -189,7 +195,7 @@
     if (!window.SynthVPages.go("chat")) return;
     $("conversation-editor").hidden = true; $("conversation-delete-confirm").hidden = true;
     $("edit-conversation").setAttribute("aria-expanded", "false");
-    state.loading = true; state.activePreview = ""; syncControls();
+    state.loading = true; clearPreviewAuthorization(); syncControls();
     try {
       const result = await bridge.api("/api/conversations", {});
       state.attachments = []; $("chat-input").value = "";
@@ -237,7 +243,7 @@
       state.conversations = state.conversations.filter((item) => item.id !== id);
       // 临时发送快照不属于服务端历史；删除会话时一并释放，不能在恢复后重新冒出旧状态。
       state.localMessages = state.localMessages.filter((message) => message.conversationId !== id);
-      state.conversation = null; state.activePreview = "";
+      state.conversation = null; clearPreviewAuthorization();
       window.SynthVModels?.setConversation(null, { preserveDraft: true });
       $("conversation-editor").hidden = true; $("conversation-delete-confirm").hidden = true;
       $("chat-title").textContent = "新的调教会话";
@@ -249,24 +255,42 @@
     finally { state.metadataBusy = false; syncControls(); }
   }
 
+  /**
+   * 附件与正文共用消息气泡，默认只展示一行文件信息。
+   * 展开后才创建原生播放器；preload=none 保证展开本身不预读音频，播放仍由用户主动触发。
+   * 素材已删除或地址不符合本机白名单时不创建播放器，不让历史快照绕过素材可用性检查。
+   */
   function renderMessageAttachment(asset) {
-    const card = element("div", "message-audio");
-    card.append(decorativeIcon("message-audio-icon", "music"));
-    const content = element("div", "message-audio-content");
-    content.append(element("strong", "", assetName(asset)));
-    if (Number.isFinite(asset.durationSeconds)) content.append(element("span", "", `${number(asset.durationSeconds)} 秒`));
-    if (asset.available === false || asset.deleted || asset.permanent) content.append(element("span", "asset-unavailable", asset.permanent ? "音频已永久删除，无法恢复" : asset.deleted ? "音频已移到回收站，恢复后可继续试听" : "音频暂不可用，请检查素材库"));
     const url = localAudioUrl(asset);
-    if (url) {
-      const audio = element("audio"); audio.controls = true; audio.preload = "none"; audio.src = url;
-      audio.setAttribute("aria-label", `播放 ${assetName(asset)}`);
-      content.append(audio);
+    const card = element(url ? "details" : "div", "message-audio");
+    const heading = element(url ? "summary" : "div", "message-audio-heading");
+    const name = assetName(asset);
+    const title = element("strong", "message-audio-name", name); title.title = name;
+    heading.append(decorativeIcon("message-audio-icon", "music"), title);
+    if (Number.isFinite(asset.durationSeconds)) heading.append(element("span", "message-audio-duration", `${number(asset.durationSeconds)} 秒`));
+    card.append(heading);
+    if (!url) {
+      const unavailable = asset.permanent ? "音频已永久删除，无法恢复" : asset.deleted ? "音频已移到回收站，恢复后可继续试听" : "音频暂不可用，请检查素材库";
+      card.append(element("p", "asset-unavailable", unavailable)); return card;
     }
-    card.append(content); return card;
+    const toggleLabel = element("span", "message-audio-toggle", "试听"); heading.append(toggleLabel);
+    heading.title = `展开 ${name} 的播放控件`;
+    heading.setAttribute("aria-label", heading.title);
+    let audio = null;
+    card.addEventListener("toggle", () => {
+      toggleLabel.textContent = card.open ? "收起" : "试听";
+      heading.title = `${card.open ? "收起" : "展开"} ${name} 的播放控件`;
+      heading.setAttribute("aria-label", heading.title);
+      if (card.open && !audio) {
+        audio = element("audio"); audio.controls = true; audio.preload = "none"; audio.src = url;
+        audio.setAttribute("aria-label", `播放 ${name}`); card.append(audio);
+      } else if (!card.open && audio) audio.pause();
+    });
+    return card;
   }
 
   /** 预览信息直接呈现宿主返回的范围，不把模型推测值当作已读取的工程事实。 */
-  function renderAction(action) {
+  function renderAction(action, grouped = false) {
     const card = element("article", "assistant-action"); card.dataset.actionId = action.id;
     const heading = element("div", "action-heading");
     const preview = action.preview;
@@ -291,11 +315,11 @@
       for (const [label, value] of fields) { const group = element("div"); group.append(element("dt", "", label), element("dd", "", value)); scope.append(group); }
       card.append(scope);
       if (Number.isFinite(preview.beforePointCount) || Number.isFinite(preview.pointReduction)) card.append(element("p", "action-curve-summary", `${Number.isFinite(preview.beforePointCount) ? `原有 ${preview.beforePointCount} 点` : "原有点数未提供"}${Number.isFinite(preview.pointReduction) ? ` · 精简减少 ${preview.pointReduction} 点` : ""} · ${window.SynthVCurves.representation(preview.representation, preview.renderMode)}`));
-      const chart = window.SynthVCurves.createPreview(preview); if (chart) card.append(chart);
+      if (!grouped) { const chart = window.SynthVCurves.createPreview(preview); if (chart) card.append(chart); }
       card.append(details("完整预览明细", preview));
     }
     if (action.result) card.append(details("查看真实执行结果", action.result));
-    if (["proposed", "previewed", "applied"].includes(action.status)) {
+    if (!grouped && ["proposed", "previewed", "applied"].includes(action.status)) {
       const controls = element("div", "action-controls");
       const previewButton = element("button", "button button-secondary", action.status === "applied" ? "撤销后重新预览" : action.status === "previewed" ? "重新预览当前选区" : "预览当前选区");
       previewButton.type = "button"; previewButton.dataset.actionPreview = action.id;
@@ -313,6 +337,98 @@
     }
     if (state.actionErrors.has(action.id)) card.append(element("p", "inline-feedback error", state.actionErrors.get(action.id)));
     return card;
+  }
+
+  /** 组合图和确认入口只对应本条模型回复；参数明细折叠保存，不再每项复制一张图。 */
+  function renderActionGroup(message) {
+    const actions = message.actions, group = element("section", "message-actions assistant-action");
+    group.setAttribute("aria-label", "待确认的组合参数建议");
+    group.append(element("strong", "", `组合调教方案 · ${actions.length} 项参数`));
+    const batch = state.activeBatch?.messageId === message.id ? state.activeBatch : null;
+    const successful = batch ? actions.filter((action) => batch.actionIds.includes(action.id)) : [];
+    const errors = actions.filter((action) => state.actionErrors.has(action.id));
+    const canPreview = actions.some((action) => ["proposed", "previewed", "applied"].includes(action.status));
+    const controls = element("div", "batch-preview-controls");
+    if (canPreview) {
+      const preview = element("button", "button button-secondary", actions.some((action) => action.preview) ? "重新生成组合预览" : "生成组合预览");
+      preview.type = "button"; preview.dataset.batchPreview = message.id;
+      preview.addEventListener("click", () => executeBatch(message.id, "preview")); controls.append(preview);
+    }
+    if (batch && successful.length) {
+      const apply = element("button", "button button-primary", `确认应用 ${successful.length} 项参数`);
+      apply.type = "button"; apply.dataset.batchApply = batch.id;
+      apply.addEventListener("click", () => executeBatch(message.id, "apply")); controls.append(apply);
+    }
+    group.append(controls);
+    const label = (action) => action.label || action.preview?.label || parameterNames[action.parameter] || action.modeName || action.parameter;
+    group.append(element("p", "field-help batch-preview-status", batch
+      ? `待确认：${successful.map(label).join("、")}。${errors.length ? `${errors.length} 项未通过，不会应用。` : ""}${state.status?.writeEnabled ? "核对下方曲线后再确认应用。" : "开启“允许修改选区”后可确认应用。"}`
+      : "一次读取并预览整组参数；确认后应用本次预览成功的项目。历史图形仅供查看，重新预览后才能应用。"));
+    const chart = window.SynthVCurves.createCombinedPreview(actions.map((action, colorIndex) => ({ id: action.id, label: label(action), colorIndex, preview: action.preview })));
+    if (chart) group.append(chart);
+    if (errors.length) {
+      const list = element("ul", "field-help error");
+      for (const action of errors) list.append(element("li", "", `${label(action)}：${state.actionErrors.get(action.id)}`));
+      group.append(list);
+    }
+    const detail = element("details", "batch-action-details");
+    detail.append(element("summary", "", "查看逐项建议、状态与完整数值"));
+    for (const action of actions) detail.append(renderAction(action, true));
+    group.append(detail);
+    return group;
+  }
+
+  /** 新预览、切换会话或连接失效时，一并撤销单项和整批确认资格。 */
+  function clearPreviewAuthorization() {
+    state.activePreview = ""; state.activeBatch = null;
+  }
+
+  /**
+   * 组合预览只请求一次；确认应用前立即撤销本地票据，异常时不重发写请求。
+   * 服务端负责同一消息、选区和完整参数快照检查，前端不能自行拼装可应用批次。
+   */
+  async function executeBatch(messageId, operation) {
+    if (state.actionBusy || state.sending || state.manualBusy) return;
+    const message = state.conversation?.messages.find((item) => item.id === messageId);
+    if (!Array.isArray(message?.actions)) return;
+    const batch = state.activeBatch;
+    if (operation === "apply" && (!batch || batch.messageId !== messageId || !state.status?.writeEnabled)) return;
+    const requested = operation === "apply" ? batch.actionIds : message.actions.filter((action) => ["proposed", "previewed", "applied"].includes(action.status)).map((action) => action.id);
+    if (!requested.length) return;
+    state.actionBusy = messageId; clearPreviewAuthorization();
+    for (const action of message.actions) if (requested.includes(action.id)) {
+      state.actionErrors.delete(action.id);
+      if (operation === "apply") action.status = "unknown";
+      else if (action.status === "previewed") { action.status = "proposed"; delete action.preview; delete action.previewBatchId; }
+    }
+    bridge.clearManualPreview(); bridge.setAssistantBusy(true); renderHistory();
+    feedback("chat-feedback", operation === "preview" ? "正在生成组合预览，不会修改工程…" : "正在应用已确认的组合参数…");
+    try {
+      const response = await bridge.api(`/api/assistant/batches/${operation}`, operation === "preview" ? { actionIds: requested } : { batchId: batch.id });
+      if (!Array.isArray(response.actions) || response.actions.length !== requested.length
+          || response.actions.some((action) => !requested.includes(action.id) || !["proposed", "previewed", "applied", "unknown"].includes(action.status))
+          || new Set(response.actions.map((action) => action.id)).size !== response.actions.length) throw new Error("服务未返回完整可核实的组合状态，请重新读取会话核实；未自动重试。");
+      for (const updated of response.actions) Object.assign(findAction(updated.id), updated);
+      const errors = Array.isArray(response.errors) ? response.errors : [];
+      for (const error of errors) if (requested.includes(error.actionId) && typeof error.message === "string") {
+        state.actionErrors.set(error.actionId, error.message);
+        const action = findAction(error.actionId);
+        if (action?.status !== "applied" && action?.status !== "unknown") { action.status = "proposed"; delete action.preview; delete action.previewBatchId; }
+      }
+      const previewed = response.actions.filter((action) => action.status === "previewed" && action.previewBatchId === response.batchId);
+      if (operation === "preview" && previewed.length) {
+        if (typeof response.batchId !== "string" || !/^[0-9a-f]{32}$/.test(response.batchId) || previewed.some((action) => !action.preview?.previewId || errors.some((error) => error.actionId === action.id))) throw new Error("组合预览缺少有效确认凭据，请重新预览。");
+        state.activeBatch = { id: response.batchId, messageId, actionIds: previewed.map((action) => action.id) };
+      }
+      const applied = response.actions.filter((action) => action.status === "applied").length;
+      const failed = operation === "preview" ? errors.length || !previewed.length : applied !== requested.length;
+      feedback("chat-feedback", operation === "preview"
+        ? `已生成 ${previewed.length} 项预览${errors.length ? `，${errors.length} 项未通过，原因见方案卡` : ""}。尚未修改工程。`
+        : applied === requested.length ? `已确认应用 ${applied} 项参数；可恢复最近一次整组修改。` : "本次应用结果尚未全部确认，请检查工程与各参数状态，勿重复提交。", Boolean(failed));
+    } catch (error) {
+      feedback("chat-feedback", bridge.errorMessage(error), true);
+      for (const id of requested) state.actionErrors.set(id, bridge.errorMessage(error));
+    } finally { state.actionBusy = ""; bridge.setAssistantBusy(false); renderHistory(); }
   }
 
   /** 等待阶段来自本机任务进度；计时独立更新，在减少动态效果模式下仍可读。 */
@@ -424,7 +540,16 @@
       if (message.model && role !== "user") meta.append(element("span", "message-model", message.model));
       if (message.createdAt) meta.append(element("time", "", dateLabel(message.createdAt)));
       article.append(meta);
-      if (message.text) article.append(element("div", "message-text", message.text));
+      // 正文和附件属于同一条消息：用户气泡统一承载两者，发送状态与选区详情保留在气泡外。
+      const body = element("div", role === "user" ? "message-bubble" : "message-body");
+      if (message.text) body.append(element("div", "message-text", message.text));
+      if (Array.isArray(message.attachments) && message.attachments.length) {
+        const attachments = element("div", "message-attachments");
+        attachments.setAttribute("aria-label", "本条消息的音频附件");
+        for (const asset of message.attachments) attachments.append(renderMessageAttachment(asset));
+        body.append(attachments);
+      }
+      article.append(body);
       if (typeof message.reasoningSummary === "string" && message.reasoningSummary.trim()) {
         const summary = element("details", "message-details reasoning-summary");
         summary.append(element("summary", "", "思考摘要 · 模型实际返回"), element("pre", "", message.reasoningSummary)); article.append(summary);
@@ -439,14 +564,14 @@
       } else if (message.inputMode) {
         article.append(element("p", "message-context", message.inputMode === "audio" ? "本次请求包含音频附件；回复内容由模型返回。" : "文字与工程信息回复；本次未传入音频。"));
       }
-      if (Array.isArray(message.attachments)) for (const asset of message.attachments) article.append(renderMessageAttachment(asset));
       if (message.selection) article.append(details("发送时的选区摘要", message.selection));
       const actions = Array.isArray(message.actions) ? message.actions : [];
       if (actions.length) {
-        const group = element("section", "message-actions");
-        group.setAttribute("aria-label", "待确认的参数建议");
-        group.append(element("p", "action-group-note", "逐项预览与确认 · 仅最新预览有效 · 恢复仅针对最近一次修改"));
-        for (const action of actions) group.append(renderAction(action));
+        const group = actions.length > 1 ? renderActionGroup(message) : element("section", "message-actions");
+        if (actions.length === 1) {
+          group.setAttribute("aria-label", "待确认的参数建议");
+          group.append(element("p", "action-group-note", "先预览，再确认 · 仅最新预览有效"), renderAction(actions[0]));
+        }
         if (actions.some((action) => action.status === "applied")) {
           const restore = element("button", "button button-quiet chat-restore", "恢复最近一次修改");
           restore.type = "button"; restore.dataset.chatRestore = "true";
@@ -470,7 +595,7 @@
   }
 
   /**
-   * 每条建议都经过服务端单独预览与单独应用，没有“全部应用”路径。
+   * 此入口只负责单项预览与应用；多参数确认统一由 executeBatch 管理。
    * 发出应用请求前即撤销本地确认资格；网络结果不明时禁止同一请求重放。
    */
   async function executeAction(id, operation) {
@@ -479,7 +604,7 @@
     if (!action || !["proposed", "previewed", "applied"].includes(action.status)) return;
     // 已应用的提案只能向后端申请“撤销后重新预览”；旧预览不能直接恢复应用资格。
     if (operation === "apply" && (action.status !== "previewed" || state.activePreview !== id || !state.status?.writeEnabled)) return;
-    state.actionBusy = id; state.activePreview = ""; state.actionErrors.delete(id);
+    state.actionBusy = id; clearPreviewAuthorization(); state.actionErrors.delete(id);
     bridge.clearManualPreview(); bridge.setAssistantBusy(true);
     renderHistory(); feedback("chat-feedback", operation === "preview" ? "正在读取当前选区并生成预览，不会修改工程…" : "正在应用你已确认的单项修改…");
     try {
@@ -500,12 +625,12 @@
 
   async function restoreLatest() {
     if (state.actionBusy || state.manualBusy || state.sending || !state.status?.writeEnabled) return;
-    state.actionBusy = "restore"; state.activePreview = "";
+    state.actionBusy = "restore"; clearPreviewAuthorization();
     bridge.clearManualPreview(); bridge.setAssistantBusy(true); renderHistory();
     feedback("chat-feedback", "正在恢复最近一次修改…");
     try {
       const result = await bridge.api("/api/restore", {});
-      feedback("chat-feedback", `${typeof result.summary === "string" ? result.summary : "恢复请求已完成，请查看返回结果。"}如需再次应用，请在原建议卡点击“撤销后重新预览”。`);
+      feedback("chat-feedback", `${typeof result.summary === "string" ? result.summary : "恢复请求已完成，请查看返回结果。"}如需再次应用，请回到原建议卡重新预览并确认。`);
       const box = element("div", "chat-operation-result");
       box.append(element("strong", "", "恢复结果"), details("查看服务实际返回", result)); $("chat-history").append(box);
       $("chat-history").scrollTop = $("chat-history").scrollHeight;
@@ -539,7 +664,7 @@
       includeSelection: payload.includeSelection, renderMode: payload.renderMode, conversationId: state.conversation?.id || null,
       previousMessageIds: new Set((state.conversation?.messages || []).map((message) => message.id)), delivery: "preparing" };
     state.localMessages.push(local);
-    state.sending = true; state.activePreview = ""; syncControls();
+    state.sending = true; clearPreviewAuthorization(); syncControls();
     feedback("chat-feedback");
     startJobProgress(); renderHistory(true);
     let submitted = false;
@@ -921,12 +1046,12 @@
   });
   window.addEventListener("synthv:state", (event) => {
     const hadWrite = Boolean(state.status?.writeEnabled);
-    const hadPreview = Boolean(state.activePreview);
+    const hadPreview = Boolean(state.activePreview || state.activeBatch);
     // 保存公开状态的独立快照，避免另一模块原地更新 writeEnabled 后无法识别变化。
     state.status = event.detail.status ? structuredClone(event.detail.status) : null;
     state.manualBusy = event.detail.manualBusy; state.settingsSaving = event.detail.settingsSaving;
-    if (!state.status?.bridge?.connected) state.activePreview = "";
-    if ((hadWrite !== Boolean(state.status?.writeEnabled) || (hadPreview && !state.activePreview)) && state.conversation?.messages?.length) renderHistory();
+    if (!state.status?.bridge?.connected) clearPreviewAuthorization();
+    if ((hadWrite !== Boolean(state.status?.writeEnabled) || (hadPreview && !state.activePreview && !state.activeBatch)) && state.conversation?.messages?.length) renderHistory();
     else syncControls();
   });
   window.addEventListener("synthv:model-options", (event) => {
@@ -937,8 +1062,8 @@
     // 选项保存不重绘聊天正文，不覆盖用户正在编辑的文字或附件。
     if (event.detail?.id === state.conversation?.id) state.conversation.modelOptions = event.detail.modelOptions;
   });
-  window.addEventListener("synthv:preview-invalidated", () => { if (state.activePreview) { state.activePreview = ""; renderHistory(); } });
-  window.addEventListener("synthv:restored", (event) => { state.activePreview = ""; renderHistory(); feedback("chat-feedback", `${event.detail.summary || "手动工具已返回恢复结果，请查看右侧操作信息。"}如需再次应用，请先在原建议卡重新预览。`); });
+  window.addEventListener("synthv:preview-invalidated", () => { if (state.activePreview || state.activeBatch) { clearPreviewAuthorization(); renderHistory(); } });
+  window.addEventListener("synthv:restored", (event) => { clearPreviewAuthorization(); renderHistory(); feedback("chat-feedback", `${event.detail.summary || "手动工具已返回恢复结果，请查看右侧操作信息。"}如需再次应用，请先在原建议卡重新预览。`); });
   window.addEventListener("synthv:recordings", () => { if (window.SynthVPages.current === "library" && !state.uploading) loadLibrary(); });
 
   window.addEventListener("synthv:assets-changed", async (event) => {
