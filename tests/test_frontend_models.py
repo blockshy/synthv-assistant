@@ -23,9 +23,9 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => { let resolve; return {promise:new Promise((done) => {resolve=done;}), resolve:(value) => resolve(value)}; };
 
 /** 最小 DOM 替身只承载真实脚本读写的表单字段，所有结果均由模拟本机服务返回。 */
-function fixture() {
+function fixture(provider='openai', initialCache=[{id:'cached-model',label:'缓存模型'}]) {
   const nodes = new Map(), events = new Map(), calls = [];
-  let pendingCache = null, cache = [{id:'cached-model',label:'缓存模型'}];
+  let pendingCache = null, cache = initialCache;
   const node = (id) => {
     if (!nodes.has(id)) nodes.set(id, {value:'',children:[],listeners:new Map(),classList:{toggle(){}},
       addEventListener(name, fn){this.listeners.set(name,fn);}, setAttribute(){},
@@ -34,7 +34,7 @@ function fixture() {
   };
   const bridge = {errorMessage:(error) => error.message, api:async (path, body) => {
     calls.push({path,body});
-    if (path === '/api/model-platforms') return {items:[{id:'default',name:'测试平台',provider:'openai',model:'default-model',configured:true}],defaultPlatformId:'default'};
+    if (path === '/api/model-platforms') return {items:[{id:'default',name:'测试平台',provider,model:'default-model',configured:true}],defaultPlatformId:'default'};
     if (path === '/api/model-capabilities') return {reasoning:{options:[]}};
     if (path === '/api/model-platforms/default/models') {
       if (body !== undefined) {cache=[{id:'fresh-model',label:'刷新模型'}]; return {models:cache,cachedAt:'2026-09-22T00:00:00Z',cachePersisted:true};}
@@ -78,6 +78,16 @@ function fixture() {
   assert.equal(first.calls.filter((call) => call.path.endsWith('/models') && call.body !== undefined).length, 1);
   first.select('conversation-four'); await tick();
   assert.deepEqual(first.models(), ['fresh-model']);
+  // Qwen 初次使用的候选项是明确标记的本地官方预设，不能因此联网或覆盖手动模型。
+  const qwen=fixture('qwen',[]); await tick();
+  assert.deepEqual(qwen.models(), ['qwen3.8-flash','qwen3.8-max','qwen3.8-omni-flash']);
+  assert(qwen.nodes.get('chat-model-options').children.every(item=>item.label.includes('未验证账号权限')));
+  assert(!qwen.calls.some(call=>call.path.endsWith('/models') && call.body!==undefined));
+  qwen.select('qwen-conversation','qwen3.8-max'); await tick();
+  assert.equal(qwen.nodes.get('chat-model').value,'qwen3.8-max');
+  await qwen.refresh();
+  assert.deepEqual(qwen.models(),['fresh-model'], 'API 目录到达后使用实际目录，不将预设伪装成账号可用模型');
+  assert.equal(qwen.nodes.get('chat-model').value,'qwen3.8-max');
 })().catch((error) => {console.error(error);process.exitCode=1;});
 """
         result = subprocess.run([NODE, "-e", script], cwd=ROOT, capture_output=True,

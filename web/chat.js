@@ -19,7 +19,7 @@
     status: bridge.getStatus(), manualBusy: bridge.getManualBusy(), settingsSaving: false,
     modelState: window.SynthVModels?.getState(),
     jobProgress: { startedAt: 0, elapsedSeconds: 0, stage: "", text: "", reasoning: "", reasoningAvailable: false, receivedCharacters: 0 },
-    jobTimer: null,
+    jobTimer: null, localMessages: [],
   };
   const parameterNames = { breathiness: "气声", tension: "张力", loudness: "响度", gender: "性别", pitchDelta: "音高偏移", toneShift: "音色偏移", vibratoEnv: "颤音包络", pitchCurve: "原生音高曲线" };
   const parameterUnits = { breathiness: "参数值", tension: "参数值", loudness: "dB", gender: "参数值", pitchDelta: "音分", toneShift: "音分", vibratoEnv: "参数值", pitchCurve: "MIDI 半音" };
@@ -158,6 +158,7 @@
 
   function setConversation(conversation, scroll = true, preserveModelDraft = false) {
     if (!conversation?.id || !Array.isArray(conversation.messages)) throw new Error("本地服务未返回完整会话，请刷新列表后重新打开。");
+    reconcileLocalMessages(conversation);
     state.conversation = conversation;
     window.SynthVModels?.setConversation(conversation, { preserveDraft: preserveModelDraft });
     if (!preserveModelDraft) $("chat-render-mode").value = conversation.renderMode === "points" ? "points" : "smooth";
@@ -234,6 +235,8 @@
       const result = await bridge.api(`/api/conversations/${encodeURIComponent(id)}/${permanent ? "purge" : "delete"}`, permanent ? { confirm: true } : {});
       if (!result.deleted || (permanent && !result.permanent)) throw new Error("服务未确认删除成功，请刷新会话列表或回收站核实；未自动重试。");
       state.conversations = state.conversations.filter((item) => item.id !== id);
+      // 临时发送快照不属于服务端历史；删除会话时一并释放，不能在恢复后重新冒出旧状态。
+      state.localMessages = state.localMessages.filter((message) => message.conversationId !== id);
       state.conversation = null; state.activePreview = "";
       window.SynthVModels?.setConversation(null, { preserveDraft: true });
       $("conversation-editor").hidden = true; $("conversation-delete-confirm").hidden = true;
@@ -379,14 +382,42 @@
     $("chat-live-message")?.remove();
   }
 
+  /**
+   * 本地发送快照只用于当前页面的即时反馈，不写入 localStorage 或伪装成服务端消息。
+   * 仅匹配发送前不存在的用户记录，并核对正文、附件、选区意向和绘制模式；
+   * 相同正文的历史消息不能吞掉这次发送，一条服务记录也不能抵消两次发送快照。
+   */
+  function reconcileLocalMessages(conversation) {
+    const matched = new Set();
+    state.localMessages = state.localMessages.filter((local) => {
+      if (local.conversationId !== conversation.id || local.delivery === "failed") return true;
+      const attachmentKeys = (items) => (items || []).map(assetKey).sort().join("|");
+      const saved = conversation.messages.find((message) => message.role === "user" && message.id
+        && !local.previousMessageIds.has(message.id) && !matched.has(message.id)
+        && message.text === local.text && Boolean(message.selection) === local.includeSelection
+        && message.renderMode === local.renderMode
+        && attachmentKeys(message.attachments) === attachmentKeys(local.attachments));
+      if (!saved) return true;
+      matched.add(saved.id);
+      return false;
+    });
+  }
+
+  /** 发送中与失败快照始终绑定原会话；切换页面或会话不能把附件和正文带到另一段历史。 */
+  function visibleMessages() {
+    const id = state.conversation?.id || null;
+    return [...(state.conversation?.messages || []), ...state.localMessages.filter((message) => message.conversationId === id)];
+  }
+
   function renderHistory(scroll = false) {
     const history = $("chat-history"); const previousScroll = history.scrollTop;
     history.replaceChildren();
-    const messages = state.conversation?.messages || [];
+    const messages = visibleMessages();
     if (!messages.length && !state.sending) history.append(welcome);
     for (const message of messages) {
       const role = ["user", "assistant", "error"].includes(message.role) ? message.role : "assistant";
       const article = element("article", `chat-message message-${role}`);
+      if (message.delivery) article.dataset.delivery = message.delivery;
       const meta = element("header", "message-meta");
       meta.append(role === "assistant" ? decorativeIcon("message-avatar", "wave") : element("span", "message-avatar", role === "user" ? "你" : "!"));
       meta.append(element("strong", "", role === "user" ? "你" : role === "error" ? "服务消息" : "调教助手"));
@@ -400,7 +431,11 @@
       } else if (role === "assistant" || role === "error") article.append(element("p", "message-context", "本条回复未提供可展示的思考摘要。"));
       if (role === "user") {
         const count = Array.isArray(message.attachments) ? message.attachments.length : 0;
-        article.append(element("p", "message-context", `${count ? `已发送 ${count} 段所选音频` : "未发送音频"}${message.selection ? " · 含选区上下文" : " · 无选区上下文"}${message.renderMode ? ` · ${message.renderMode === "points" ? "控制点模式" : "绘制模式"}` : ""}`));
+        const delivery = { preparing: "正在准备发送", queued: "任务已入队，等待本机确认消息记录", failed: "未发送，原草稿已保留", unknown: "发送状态未确认，原草稿已保留；核实会话后再重发" };
+        const audio = count ? `${message.delivery ? "所选" : "已发送"} ${count} 段音频` : "未发送音频";
+        const selection = message.delivery ? message.includeSelection ? "拟附带选区" : "不附带选区" : message.selection ? "含选区上下文" : "无选区上下文";
+        article.append(element("p", `message-context${["failed", "unknown"].includes(message.delivery) ? " error" : ""}`,
+          `${message.delivery ? delivery[message.delivery] + " · " : ""}${audio} · ${selection}${message.renderMode ? ` · ${message.renderMode === "points" ? "控制点模式" : "绘制模式"}` : ""}`));
       } else if (message.inputMode) {
         article.append(element("p", "message-context", message.inputMode === "audio" ? "本次请求包含音频附件；回复内容由模型返回。" : "文字与工程信息回复；本次未传入音频。"));
       }
@@ -498,16 +533,30 @@
     if (text.length > 4000) { feedback("chat-feedback", "每条消息最多 4000 个字符，请缩短后再发送。", true); return; }
     const payload = { text, includeSelection: $("include-selection").checked, attachments: state.attachments.map(({ kind, id }) => ({ kind, id })),
       modelOptions: window.SynthVModels.snapshot(), renderMode: $("chat-render-mode").value };
+    // 在新建会话、保存模型设置和发送 POST 等任何等待之前显示用户输入。
+    // 附件只复制当前公开元数据；这里不读取文件、不虚构选区、不调用模型。
+    const local = { role: "user", text, createdAt: new Date().toISOString(), attachments: structuredClone(state.attachments),
+      includeSelection: payload.includeSelection, renderMode: payload.renderMode, conversationId: state.conversation?.id || null,
+      previousMessageIds: new Set((state.conversation?.messages || []).map((message) => message.id)), delivery: "preparing" };
+    state.localMessages.push(local);
     state.sending = true; state.activePreview = ""; syncControls();
     feedback("chat-feedback");
-    startJobProgress();
+    startJobProgress(); renderHistory(true);
+    let submitted = false;
     try {
-      if (!state.conversation) setConversation(await bridge.api("/api/conversations", {}), true, true);
+      if (!state.conversation) {
+        const conversation = await bridge.api("/api/conversations", {});
+        local.conversationId = conversation.id;
+        local.previousMessageIds = new Set((conversation.messages || []).map((message) => message.id));
+        setConversation(conversation, true, true);
+      }
       const id = state.conversation.id;
       await window.SynthVModels.ensureSaved();
       await persistRenderMode(payload.renderMode);
+      submitted = true;
       const job = await bridge.api(`/api/conversations/${encodeURIComponent(id)}/messages`, payload);
-      state.jobProgress.stage = "queued"; renderJobProgress();
+      local.delivery = "queued";
+      state.jobProgress.stage = "queued"; renderHistory();
       try { setConversation(await bridge.api(`/api/conversations/${encodeURIComponent(id)}`)); }
       catch { /* 中途读取失败不重发消息，继续等待已创建的后台任务。 */ }
       const result = await bridge.waitForJob(job.jobId, receiveJobProgress);
@@ -518,9 +567,16 @@
       await refreshConversations();
     } catch (error) {
       feedback("chat-feedback", bridge.errorMessage(error), true);
+      // POST 发出后连接超时并不证明请求未执行；保留明确的未知状态，禁止自动重发。
+      // 准备阶段失败则可明确说明未发送；后续只读同步若找到正式记录，会替换临时快照。
+      local.delivery = submitted ? "unknown" : "failed";
+      state.jobProgress.stage = "error"; renderHistory();
       // 失败消息若已被服务记录，应显示真实记录，而不是合成一条助手回复。
-      if (state.conversation?.id) {
-        try { setConversation(await bridge.api(`/api/conversations/${encodeURIComponent(state.conversation.id)}`)); }
+      if (local.conversationId && state.conversation?.id === local.conversationId) {
+        try {
+          const conversation = await bridge.api(`/api/conversations/${encodeURIComponent(local.conversationId)}`);
+          if (state.conversation?.id === local.conversationId) setConversation(conversation);
+        }
         catch { /* 原始失败信息继续保留。 */ }
       }
     } finally { state.sending = false; stopJobProgress(); syncControls(); syncLibrary(); if (window.SynthVPages.current === "chat") $("chat-input").focus(); }
@@ -656,7 +712,8 @@
     state.assets = state.assets.filter((item) => assetKey(item) !== key);
     state.attachments = state.attachments.filter((item) => assetKey(item) !== key);
     state.libraryDraft.delete(key);
-    for (const message of state.conversation?.messages || []) for (const item of message.attachments || []) {
+    // 失败后保留的发送快照也可能含附件，必须和持久历史同步撤销已删除素材的试听入口。
+    for (const message of [...(state.conversation?.messages || []), ...state.localMessages]) for (const item of message.attachments || []) {
       if (assetKey(item) === key) { item.available = false; item.deleted = true; item.permanent = permanent; }
     }
     renderAttachments(); renderLibrary(); renderHistory(false);

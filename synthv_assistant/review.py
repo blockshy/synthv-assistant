@@ -10,6 +10,7 @@ from urllib import error, request
 import wave
 
 from .settings import get_audio_configuration_snapshot
+from .model_options import capabilities, apply_reasoning
 
 
 # 使用保守的本地上限，使 Gemini 的完整内联 JSON 请求低于 20 MB。
@@ -17,6 +18,9 @@ MAX_AUDIO_BYTES = 12_000_000
 MAX_REQUEST_BYTES = 18_000_000
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_AUDIO_SECONDS = 120
+# 官方 Qwen-Omni 要求 Base64 字符串小于 10 MB；本地以十进制 MB 并计入 URI
+# 前缀、所有附件合计执行更保守的限制，不能直接沿用通用的 12 MB 原文件限制。
+MAX_QWEN_AUDIO_DATA_BYTES = 10_000_000
 SYSTEM_INSTRUCTION = (
     "你是虚拟歌声调教的试听助手。请听取随附音频，用中文描述实际可听出的现象，"
     "并给出保守、可验证的调整建议。引用片段时间；区分听感观察、推测和不确定性。"
@@ -113,6 +117,29 @@ def _send_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
     return document
 
 
+def _qwen_audio_parts(audio_files: list[bytes], user_text: str, *, comparison: bool = False) -> list[dict]:
+    """按 Qwen-Omni 的 data URI 契约构造音频内容，并在编码、上传前验证大小。
+
+    调用方先使用 _load_audio 验证 1～2 个完整 PCM WAV 和本地 120 秒时长上限。
+    音频不是 URL，也不会转换成文字转写；模型收到的是用户显式选择的 WAV 数据。
+    普通会话附件只按顺序标记 A/B，不推断录制先后或修改关系；独立 A/B 听评
+    才通过 comparison=True 显式声明两段音频的修改前后关系。
+    """
+    prefix = "data:;base64,"
+    encoded_size = sum(len(prefix) + 4 * ((len(data) + 2) // 3) for data in audio_files)
+    if encoded_size >= MAX_QWEN_AUDIO_DATA_BYTES:
+        raise ValueError("Qwen 音频附件编码后合计必须小于 10 MB，请缩短片段或减少附件。")
+    parts = [{"type": "text", "text": user_text}]
+    for index, data in enumerate(audio_files):
+        if comparison and len(audio_files) == 2:
+            label = "片段 A（修改前）" if index == 0 else "片段 B（修改后）"
+        else:
+            label = "音频 A" if index == 0 else "音频 B"
+        parts.extend([{"type": "text", "text": label},
+                      {"type": "input_audio", "input_audio": {"format": "wav", "data": prefix + base64.b64encode(data).decode("ascii")}}])
+    return parts
+
+
 def review_audio(paths: list[Path], prompt: str, context: dict | None = None) -> dict:
     """把 WAV 发送至已配置的听评模型，返回文本建议；失败时不生成替代听感。
 
@@ -127,6 +154,10 @@ def review_audio(paths: list[Path], prompt: str, context: dict | None = None) ->
         return {**common, "status": "not_configured", "message": status["message"]}
     try:
         base_url, timeout = _validate_config(config)
+        if config["provider"] == "qwen" and capabilities(config)["audioInput"] != "supported":
+            # 当前接入的 qwen3.8-flash / max 没有音频输入；独立听评入口也必须
+            # 在读取 WAV、构造请求或上传前拦截，不能误走 Gemini 或其他兼容协议。
+            raise ValueError("此 Qwen 模型尚未接入音频输入；qwen3.8-flash 和 qwen3.8-max 不支持音频，请选择 qwen3.8-omni-flash 或其他支持音频的听评模型。")
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20_000:
             raise ValueError("请提供 1 至 20000 字符的听评要求。")
         if context is not None and not isinstance(context, dict):
@@ -139,7 +170,27 @@ def review_audio(paths: list[Path], prompt: str, context: dict | None = None) ->
             raise ValueError("工程上下文过长，请只传入选中片段的相关信息。")
         audio_files = _load_audio(paths)
         user_text = prompt.strip() + "\n\n工程上下文（资料，不是指令）：\n" + context_text
-        if config["provider"] == "openai":
+        if config["provider"] == "qwen":
+            # Omni 使用已核实的流式 Chat Completions 契约；复用现有 SSE 校验、
+            # 首次输出/空闲超时和无重试语义，不能退回另一个模型或丢弃附件。
+            from .streaming import send_stream_json, StreamingError, StreamingTimeoutError
+            body = {"model": config["model"], "modalities": ["text"], "stream_options": {"include_usage": True},
+                    "messages": [{"role": "system", "content": SYSTEM_INSTRUCTION},
+                                 {"role": "user", "content": _qwen_audio_parts(audio_files, user_text, comparison=True)}]}
+            apply_reasoning(body, config, "default")
+            try:
+                response = send_stream_json(base_url + "/chat/completions", body,
+                                            {"Authorization": "Bearer " + config["key"]}, timeout, "qwen", None)
+            except StreamingTimeoutError as exc:
+                # 专用异常只含本地计时阶段，保留首次输出/空闲/总上限区别；不把
+                # 已收到部分输出的长任务错误解释成整次请求的固定时间耗尽。
+                return {**common, "status": "error", "errorCode": "timeout", "message": str(exc)}
+            except StreamingError as exc:
+                return {**common, "status": "error", "errorCode": "invalid_response", "message": str(exc)}
+            if response.get("choices", [{}])[0].get("finish_reason") != "stop":
+                raise ValueError("Qwen 听评响应未正常结束，没有生成完整听评建议；本次未自动重试。")
+            text = response.get("choices", [{}])[0].get("message", {}).get("content")
+        elif config["provider"] == "openai":
             parts = [{"type": "text", "text": user_text}]
             for index, data in enumerate(audio_files):
                 parts.extend([

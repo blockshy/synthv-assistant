@@ -56,6 +56,19 @@ def capabilities(config, model=None):
             note = "模型列表不提供完整推理能力；这里按兼容协议传递所选值，需平台支持。默认不额外传参。"
         elif supported:
             note = "按该模型已公布的推理档位传参；默认不额外传参。兼容平台的实际支持以响应为准。"
+    elif provider == "qwen":
+        # 百炼 Chat Completions 虽采用兼容消息结构，推理档位仍须按 Qwen
+        # 自己的契约校验。qwen3.8-flash / max 支持图像、文字和视频，不支持音频。
+        # 其他 Qwen 系列只开放默认文本请求，不擅自复用这些型号的音频或推理能力。
+        audio = "unsupported"
+        note = "当前 Qwen 接口仅接入文本调教；此型号的推理参数尚未适配，请使用模型默认。"
+        if name in {"qwen3.8-flash", "qwen3.8-max", "qwen3.8-omni-flash"}:
+            values, supported, kind = ["none", "low", "medium", "xhigh"], True, "qwen-effort"
+            audio = "supported" if name == "qwen3.8-omni-flash" else "unsupported"
+            note = "Qwen 使用 low / medium / xhigh 推理档位，关闭时传 reasoning_effort=none；默认不覆盖推理档位。"
+            # 音频可用性由独立的 audioInput 字段统一展示，避免与前端提示重复。
+            if audio == "supported":
+                note += "Omni 音频附件须符合本地大小限制。"
     elif provider == "gemini":
         # 不把图像或实时专用模型误当成普通 generateContent 调教模型。
         if re.match(r"gemini-3(?:[.-])", name) and not any(part in name for part in ("image", "live")):
@@ -88,6 +101,15 @@ def apply_reasoning(body, config, effort, *, include_summary=False):
     """映射供应商参数；default 始终省略强度，不用 0 或 none 冒充模型默认。"""
     info = validate_for_config(config, {"reasoningEffort": effort})
     if config["provider"] == "openai":
+        if effort != "default":
+            body["reasoning_effort"] = effort
+    elif config["provider"] == "qwen":
+        # 直接发送 HTTP JSON 时扩展字段位于顶层，不能照搬 Python SDK 的
+        # extra_body 包装。强度默认时省略该字段；官方 none 本身关闭思考。
+        # 本工作台仅保存有限公开摘要，不具备完整思考历史，因此关闭默认开启的
+        # preserve_thinking，避免把截断摘要当成下一轮所需的完整推理历史。
+        if info["reasoningKind"] == "qwen-effort":
+            body["preserve_thinking"] = False
         if effort != "default":
             body["reasoning_effort"] = effort
     elif info["reasoningKind"]:

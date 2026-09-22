@@ -83,10 +83,15 @@
     <div class="settings-source-row"><span id="settings-source" class="small-badge">正在读取设置</span><button id="reload-audio-settings" class="icon-button" type="button" data-ui-icon="refresh" aria-label="重新加载已保存设置" title="重新加载已保存设置"></button></div>
     <form id="audio-settings-form" autocomplete="off">
       <fieldset id="audio-settings-fields" class="settings-fields" disabled>
-        <label for="settings-provider">服务协议<select id="settings-provider"><option value="none">暂不启用模型服务</option><option value="openai">OpenAI / OpenAI 兼容服务</option><option value="gemini">Google Gemini</option></select></label>
-        <div class="settings-fields-grid"><label for="settings-model">模型名称<input id="settings-model" type="text" maxlength="200" placeholder="gpt-audio-1.5" autocomplete="off" spellcheck="false"></label><label for="settings-timeout"><span class="field-heading"><span>响应等待超时</span><span class="unit-label">秒</span></span><input id="settings-timeout" type="number" min="5" max="180" step="1" value="60" aria-describedby="settings-timeout-help" required></label></div>
-        <p id="settings-timeout-help" class="field-help">会话按连接、首次输出及两次有效输出之间的等待计时；持续回复会续期，单次最多 30 分钟。A/B 听评仍使用普通 HTTP 等待超时。</p>
+        <label for="settings-provider">服务协议<select id="settings-provider"><option value="none">暂不启用模型服务</option><option value="openai">OpenAI / OpenAI 兼容服务</option><option value="qwen">通义千问 Qwen / 百炼</option><option value="gemini">Google Gemini</option></select></label>
+        <div class="settings-fields-grid"><label for="settings-model">模型名称<input id="settings-model" type="text" maxlength="200" placeholder="gpt-audio-1.5" autocomplete="off" spellcheck="false" aria-describedby="settings-provider-help"></label><label for="settings-timeout"><span class="field-heading"><span>响应等待超时</span><span class="unit-label">秒</span></span><input id="settings-timeout" type="number" min="5" max="180" step="1" value="60" aria-describedby="settings-timeout-help" required></label></div>
+        <!-- 预设来自公开文档，只便于填写模型 ID，不表示当前地域或账户已开通。 -->
+        <datalist id="settings-qwen-models"><option value="qwen3.8-flash">文字调教 · 不支持音频</option><option value="qwen3.8-max">文字调教 · 不支持音频</option><option value="qwen3.8-omni-flash">支持音频输入</option></datalist>
+        <p id="settings-provider-help" class="field-help" hidden></p>
+        <p id="settings-timeout-help" class="field-help">会话按连接、首次输出及两次有效输出之间的等待计时；持续回复会续期，单次最多 30 分钟。Qwen Omni 的 A/B 听评同样按有效输出续期，其他非流式听评使用普通 HTTP 等待超时。</p>
         <label for="settings-base-url">HTTPS Base URL<input id="settings-base-url" type="url" maxlength="2048" placeholder="https://api.openai.com/v1" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="settings-endpoint-help"></label>
+        <!-- 同一模型在不同平台有独立凭据，地址候选只由用户主动选择，不自动转发或回退。 -->
+        <datalist id="settings-qwen-endpoints"><option value="https://maas.qianwenaiapi.com/compatible-mode/v1">千问 AI 平台（中国）</option><option value="https://maas.qwencloudapi.com/compatible-mode/v1">QwenCloud（国际）</option><option value="https://dashscope.aliyuncs.com/compatible-mode/v1">阿里云百炼（北京）</option><option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1">阿里云百炼（新加坡）</option></datalist>
         <p id="settings-endpoint-help" class="field-help">填写 API 根地址，不含具体方法、用户名密码、查询参数或片段。自定义服务会收到密钥，以及你发送的文字、勾选的选区和所选音频。</p>
         <label for="settings-api-key"><span class="field-heading"><span>API key</span><span id="settings-key-state" class="unit-label">未配置</span></span><input id="settings-api-key" type="password" maxlength="8192" placeholder="输入当前服务的 API key" autocomplete="new-password" autocapitalize="off" spellcheck="false" aria-describedby="settings-key-help"></label>
         <p id="settings-key-help" class="field-help">请选择服务，再填写对应密钥。保存前不会发送音频。</p>

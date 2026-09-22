@@ -444,17 +444,17 @@ def send_stream_json(url: str, body: dict, headers: dict, timeout: float, provid
     """单次发送并聚合 SSE；HTTPError 留给规划层映射为认证、限流等安全提示。
 
     Gemini 的 streamGenerateContent URL 和 includeThoughts 由调用层按配置构造。
-    本模块只为 OpenAI 请求增加 stream:true，不改变调用者持有的请求对象。
+    本模块为 OpenAI / Qwen 兼容请求增加 stream:true，不改变调用者持有的请求对象。
     timeout 约束首次有效输出及相邻有效输出间隔；持续输出可跨越该时间窗口。
     """
-    if provider not in {"openai", "gemini"} or not isinstance(body, dict) or not isinstance(headers, dict):
+    if provider not in {"openai", "gemini", "qwen"} or not isinstance(body, dict) or not isinstance(headers, dict):
         raise StreamingError("AI 流式请求配置无效。")
     if isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not 0 < timeout <= 180 or not math.isfinite(timeout):
         raise StreamingError("AI 流式请求超时配置无效。")
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise StreamingError("AI 流式接口必须使用有效的 HTTPS 地址。")
-    payload = {**body, "stream": True} if provider == "openai" else body
+    payload = {**body, "stream": True} if provider in {"openai", "qwen"} else body
     encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
     if len(encoded) > MAX_REQUEST_BYTES:
         raise StreamingError("完整模型请求超过本地大小限制。")
@@ -479,6 +479,8 @@ def send_stream_json(url: str, body: dict, headers: dict, timeout: float, provid
         if content_type and content_type != "text/event-stream":
             raise StreamingError("AI 服务未返回 SSE 流式响应，本次未自动回退或重试。")
         events = _sse_events(response, deadline)
-        result = _openai(events, progress) if provider == "openai" else _gemini(events, progress)
+        # Qwen 的正文与公开思考输出分别使用 delta.content / reasoning_content，
+        # 可共用现有聚合器、有效输出空闲计时和跨事件凭据脱敏，不另建超时规则。
+        result = _openai(events, progress) if provider in {"openai", "qwen"} else _gemini(events, progress)
         deadline.remaining()
         return result

@@ -25,6 +25,9 @@ from .operations import OperationBusyError, OperationLock
 DEFAULTS = {
     "openai": ("gpt-audio-1.5", "https://api.openai.com/v1", "OPENAI_API_KEY"),
     "gemini": ("gemini-3.8-flash", "https://generativelanguage.googleapis.com/v1beta", "GEMINI_API_KEY"),
+    # 百炼仍支持这一北京通用域名；有地域或业务空间要求时由用户显式填写对应地址，
+    # 不自动替换域名，以免将某地域的凭据发送到另一地域。
+    "qwen": ("qwen3.8-flash", "https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY"),
 }
 STORAGE = "windows-dpapi"
 MAX_SETTINGS_BYTES = 128 * 1024
@@ -130,8 +133,8 @@ def _normalize_base(value: object) -> str:
 
 def _validate_values(provider: object, model: object, base: object, timeout: object, key: object) -> dict:
     """所有输入错误都使用固定文本；校验失败不得更改原配置文件。"""
-    if not isinstance(provider, str) or provider not in {"none", "openai", "gemini"}:
-        raise SettingsError("请选择停用、OpenAI 或 Gemini 供应商。")
+    if not isinstance(provider, str) or provider not in {"none", "openai", "gemini", "qwen"}:
+        raise SettingsError("请选择停用、OpenAI、Gemini 或 Qwen 供应商。")
     if provider == "none":
         return {"provider": "none", "model": "", "base": "", "timeoutSeconds": 60.0, "key": ""}
     if not isinstance(model, str):
@@ -139,7 +142,7 @@ def _validate_values(provider: object, model: object, base: object, timeout: obj
     model = model.strip() or DEFAULTS[provider][0]
     # 兼容服务常使用 namespace/model 路由；OpenAI 的模型字段位于 JSON 中，
     # 可以接受分段 ID。Gemini 会拼入 URL，保持更严格的单段字符白名单。
-    pattern = r"[A-Za-z0-9][A-Za-z0-9_.:-]*(?:/[A-Za-z0-9][A-Za-z0-9_.:-]*)*" if provider == "openai" else r"[A-Za-z0-9_.-]{1,128}"
+    pattern = r"[A-Za-z0-9][A-Za-z0-9_.:-]*(?:/[A-Za-z0-9][A-Za-z0-9_.:-]*)*" if provider in {"openai", "qwen"} else r"[A-Za-z0-9_.-]{1,128}"
     if len(model) > 200 or not re.fullmatch(pattern, model):
         raise SettingsError("模型名称应为有效模型 ID，不包含 URL 或空格；Gemini 请勿填写 models/ 前缀。")
     if isinstance(base, str) and not base.strip():

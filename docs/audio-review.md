@@ -16,15 +16,17 @@
 
 会话输入区可以选择平台、填写模型 ID 和选择推理强度。这些选项随当前会话保存，不改写平台全局默认值或其他会话。模型留空使用该平台默认模型；推理选“模型默认”时完全省略额外强度参数，“关闭”则是部分模型支持的显式设置，两者不同。
 
+点击发送后，用户消息立即出现在对话中，无需等待模型结束。服务端保存的正式记录返回后会替换本地待发送展示，避免同一条消息出现两次。发送失败会保留明确状态，不自动重发请求；已有消息不代表模型已经完成回复或参数已经应用。
+
 设置页支持将已保存且已配置的平台“设为新会话默认”。偏好保存于平台注册表，后续创建会话时写入对应平台编号、空模型覆盖值和默认推理强度，已有会话不受影响。该偏好与原有 `default` 配置入口不同，独立 A/B 听评继续使用原配置。停用所选默认平台时，新会话偏好回退到原有 `default` 平台，界面显示实际结果。
 
-推理档位由本地规则按系列提供。OpenAI / 兼容协议使用 `reasoning_effort`，Gemini 按系列使用 `thinkingLevel` 或 `thinkingBudget`。已知不支持的档位会被拒绝；切换模型后，不兼容的旧档位需由用户重新选择，服务不自动降低强度。未知兼容模型的可选值只是协议尝试，实际是否支持取决于平台。明确不支持音频的模型会在加载和外发附件前被拒绝；未知能力不被当成已经验证。
+推理档位由本地规则按系列提供。OpenAI / 兼容协议及 Qwen 3.8 使用 `reasoning_effort`，Gemini 按系列使用 `thinkingLevel` 或 `thinkingBudget`。已知不支持的档位会被拒绝；切换模型后，不兼容的旧档位需由用户重新选择，服务不自动降低强度。未知兼容模型的可选值只是协议尝试，实际是否支持取决于平台。明确不支持音频的模型会在加载和外发附件前被拒绝；未知能力不被当成已经验证。
 
-网页聊天接收 SSE 流式回复，并显示实际阶段、等待时间和已接收字符数。OpenAI 兼容服务需支持对应 Chat Completions 流式响应；Gemini 使用 `streamGenerateContent?alt=sse`。不支持流式、超时或返回异常时会明确失败，不自动改用非流式或重新计费调用。独立 A/B 听评和旧 MCP 工具继续使用原有请求方式。
+网页聊天接收 SSE 流式回复，并显示实际阶段、等待时间和已接收字符数。OpenAI 兼容服务及 Qwen 需支持对应 Chat Completions 流式响应；Gemini 使用 `streamGenerateContent?alt=sse`。不支持流式、超时或返回异常时会明确失败，不自动改用非流式或重新计费调用。独立 A/B 听评和 MCP 听评按所选协议执行，并在完成后返回整段听评文字。
 
 平台中的“响应等待超时”（5～180 秒）用于流式会话的连接、首次有效输出和相邻有效输出之间的等待。收到新的非空正文或供应商公开思考摘要时重新计时，因此持续输出不会在 60 或 180 秒时被总时限截断；摘要达到本地展示上限后，后续有效摘要仍会续期。纯 SSE 心跳、注释和空事件不算模型输出。每次流式请求另有 30 分钟总上限，并保留响应大小限制，防止无限响应。错误会区分等待首次输出、输出中断及总上限；已收到的公开摘要会保留，但不完整响应不会变成可应用提案，也不会自动重试。
 
-网页持续查询同一个后台任务，直到服务端返回完成或失败，不再另设 10 分钟总等待上限。浏览器与本地服务的每次 HTTP 请求仍有连接等待保护；连接断开时显示错误，不重发模型任务。独立 A/B 听评及非流式调用仍将平台数值用作普通 HTTP 等待超时，不适用流式续期规则。
+网页持续查询同一个后台任务，直到服务端返回完成或失败，不再另设 10 分钟总等待上限。浏览器与本地服务的每次 HTTP 请求仍有连接等待保护；连接断开时显示错误，不重发模型任务。Qwen Omni 的独立 A/B 听评在内部聚合流式响应，同样按有效正文或思考内容续期并保留 30 分钟总上限，但不向网页逐字显示听评进度。其他非流式听评仍将平台数值用作普通 HTTP 等待超时。
 
 只有供应商实际返回可见思考摘要时，页面才展示摘要；支持的 Gemini 请求会请求 `includeThoughts`，其他平台是否返回相关字段取决于其实现。没有摘要时会说明未收到，工作台不会模拟思考、补写过程或声称能读取隐藏内容。摘要最多保留 12000 字符，经过密钥及跨事件凭据片段脱敏后用于本地展示；即使最终计划失败，已收到的安全摘要也可留在错误消息中。
 
@@ -57,7 +59,7 @@ RMS 对所有声道的平方采样值求平均，不先混合声道。RMS 不是
 
 ### 网页即时配置
 
-左侧设置与 A/B 音频评审入口打开同一个中央设置页面。页面可管理最多 20 个平台（包含默认平台），每个平台有名称、协议、默认模型、HTTPS API 根地址、API key 和 5～180 秒响应等待超时。会话的有效输出会续期，独立 A/B 听评仍使用普通 HTTP 等待超时；表单中的说明区分两种含义。可选择停用、OpenAI / OpenAI 兼容服务或 Gemini。更换协议会填入相应默认模型和地址，不会自动提交；纯文字使用时可以改为文字模型。离开设置页会清空尚未保存的密钥输入；已经保存的密钥仍由本机账户加密保护。
+左侧设置与 A/B 音频评审入口打开同一个中央设置页面。页面可管理最多 20 个平台（包含默认平台），每个平台有名称、协议、默认模型、HTTPS API 根地址、API key 和 5～180 秒响应等待超时。流式请求的有效输出会续期，非流式请求使用普通 HTTP 等待超时。可选择停用、OpenAI / OpenAI 兼容服务、Gemini 或通义千问 Qwen。更换协议会填入相应默认模型和地址，不会自动提交；纯文字使用时可以改为文字模型。离开设置页会清空尚未保存的密钥输入；已经保存的密钥仍由本机账户加密保护。
 
 原有配置固定为 `default` 平台，继续保存在 `data/audio-settings.json`，无需迁移。其他命名平台保存至 `data/model-platforms.json`，不会自动继承默认平台或环境中的密钥。两份文件均使用当前 Windows 账户的 DPAPI 加密完整配置。点击“保存并立即生效”后，下次启动保留，后续使用该平台的请求立即读取新设置，无需重启。独立 A/B 听评及 MCP `review_recordings` 仍使用默认平台，不会跟随网页当前会话的平台选择。保存动作不会连接供应商或发送录音，因此“已配置”不代表密钥有效、账户有权限或模型能够接收音频。
 
@@ -69,7 +71,7 @@ RMS 对所有声道的平方采样值求平均，不先混合声道。RMS 不是
 
 ### 模型目录缓存与显式刷新
 
-在会话模型输入框旁点击刷新按钮，才会调用本地 `POST /api/model-platforms/{id}/models`，由后端向所选平台的 `/models` 发送 GET。OpenAI 使用 Bearer 认证，Gemini 使用 `x-goog-api-key`；请求仅用于获取目录，不发送消息历史、歌词或录音。不跟随自动重定向，分页只在同一配置端点内进行；最多获取 5 页、500 个条目，每页不超过 2 MB，并使用不超过 30 秒的请求超时。
+在会话模型输入框旁点击刷新按钮，才会调用本地 `POST /api/model-platforms/{id}/models`。OpenAI 与 Gemini 向各自配置根路径下的 `/models` 发送 GET；Qwen 使用已确认官方域名下的原生 `/api/v1/models`，读取 `output.models` 并以 `page_no`、`page_size` 分页，不假设 OpenAI 兼容目录存在。OpenAI / Qwen 使用 Bearer 认证，Gemini 使用 `x-goog-api-key`；请求仅用于获取目录，不发送消息历史、歌词或录音。不跟随自动重定向，分页只在同一配置端点内进行；最多获取 5 页、500 个条目，每页不超过 2 MB，并使用不超过 30 秒的请求超时。未适配的 Qwen 自定义目录端点明确返回提示，可继续手填模型 ID，不自动将密钥转交其他域名。
 
 返回条目只包含模型 ID 与展示名称。Gemini 过滤不支持 `generateContent` 的条目，并移除 ID 的 `models/` 前缀；重复或不能安全填写的 ID 不进入候选列表。达到本地限制时目录可能不完整，接口失败时可继续手动填写模型 ID。目录里出现某个名称不证明它支持音频、流式回复、所有推理档位或当前账户可调用。
 
@@ -79,24 +81,70 @@ RMS 对所有声道的平方采样值求平均，不先混合声道。RMS 不是
 
 页面的能力提示通过本地规则查询，不会为探测能力而自动发送模型请求。目录读取、能力规则和实际生成属于不同证据：最终支持情况仍需在所选平台的真实调用中确认，项目尚未完成真实云端验收。
 
+### 通义千问 Qwen
+
+在网页平台协议中选择 Qwen，默认模型为 `qwen3.8-flash`，北京默认 Base URL 为 `https://dashscope.aliyuncs.com/compatible-mode/v1`。将百炼 API Key 填入网页密码框并保存即可；它与 OpenAI 密钥不能混用。该旧北京域名仍受官方支持，有业务空间 ID 时可按下表改用官方推荐的专属地址，需同时填写对应地域的密钥。地址只填 Base URL，不追加 `/chat/completions`。[官方服务地址与兼容协议](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions)
+
+如果密钥来自独立的千问AI平台或国际 QwenCloud，请使用该平台对应地址，不要把它直接填进百炼北京配置：
+
+| 密钥所属平台 | 按量 API Base URL |
+|---|---|
+| 阿里云百炼，北京 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| 中文千问AI平台 `platform.qianwenai.com` | `https://maas.qianwenaiapi.com/compatible-mode/v1` |
+| 国际 QwenCloud | `https://maas.qwencloudapi.com/compatible-mode/v1` |
+
+三种入口均选择本工作台的 Qwen 协议，平台、地址和密钥须对应；更换地址需要重新输入该平台密钥。中文与国际平台的按量 Chat 接口已列出 Qwen 3.8 型号与相同推理字段，不能仅凭模型同名推断账户权限互通。[中文千问 Chat](https://platform.qianwenai.com/docs/api-reference/chat/openai-chat)、[QwenCloud API Key 与地址](https://docs.qwencloud.com/api-reference/preparation/api-key)
+
+千问AI平台及 QwenCloud 的 OpenAI 兼容端点官方明确不提供 `GET /models`；本工作台保留预设与手填入口，不为它们猜测其他目录地址，也不会带着当前凭据回退请求百炼。百炼官方目录端点则可显式刷新并缓存。[中文平台目录说明](https://platform.qianwenai.com/docs/developer-guides/clients-and-developer-tools/deepseek-harness)、[国际平台目录说明](https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/deepseek-harness)
+
+以下为百炼业务空间专属地址：
+
+| 地域 | 业务空间 Base URL |
+|---|---|
+| 北京 | `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` |
+| 新加坡 | `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
+| 中国香港 | `https://{WorkspaceId}.cn-hongkong.maas.aliyuncs.com/compatible-mode/v1` |
+| 日本东京 | `https://{WorkspaceId}.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1` |
+| 德国法兰克福 | `https://{WorkspaceId}.eu-central-1.maas.aliyuncs.com/compatible-mode/v1` |
+| 美国弗吉尼亚 | `https://{WorkspaceId}.us-east-1.maas.aliyuncs.com/compatible-mode/v1` |
+
+`{WorkspaceId}` 必须替换为百炼控制台中的实际业务空间 ID。模型在该地域可用与账户是否已获调用权限需分别确认；本地保存配置不执行付费探测。
+
+| 模型 | 在本工作台的用途 | 音频附件 |
+|---|---|---|
+| `qwen3.8-flash` | 文字咨询、结合选区规划参数 | 不支持，发送前拒绝附件 |
+| `qwen3.8-max` | 文字咨询、结合选区规划参数 | 不支持，发送前拒绝附件 |
+| `qwen3.8-omni-flash` | 文字调教、音频理解及 A/B 听评 | 支持，输出文字 |
+
+Flash / Max 的官方输入模态包含文字、图片和视频，不包含音频；本工作台未因接入 Qwen 而新增图片或视频上传入口。Omni 是独立型号，不能省略名称中的 `omni`。依据：[Flash](https://help.aliyun.com/zh/model-studio/qwen3-8-flash)、[Max](https://help.aliyun.com/en/model-studio/qwen3-8-max)、[Omni Flash](https://help.aliyun.com/zh/model-studio/qwen3-8-omni-flash)。
+
+这三款提供“模型默认、关闭、低、中、极高”档位，分别对应不传额外强度、`none`、`low`、`medium`、`xhigh`。默认档位不代表关闭，服务端当前默认开启思考并使用 `xhigh`。请求只传 `reasoning_effort`，不同时设置 `thinking_budget`；工作台不把兼容映射的 `high` / `max` 伪装成不同推理能力。思考内容仍仅展示供应商实际返回的公开字段。项目不将展示摘要回灌为完整历史思考，因此显式关闭 `preserve_thinking`，文字历史正常保留。[官方推理参数](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions)
+
+Qwen Omni 的本地音频通过 `input_audio` 发送，`data` 使用 `data:;base64,...`，格式为工作台校验后的 WAV，输出模态固定为文字。官方要求单段编码后的 Base64 字符串小于 **10 MB**；项目还保留上述 60 秒上传、附件数量和合计字节限制，较宽松的供应商时长上限不会放宽本地上限。超出限制时先在本地拒绝，不悄悄裁剪或改传公网文件。A/B 听评也执行供应商限制。[Omni 本地文件与音频限制](https://help.aliyun.com/zh/model-studio/qwen-omni)
+
+百炼 Qwen 目录只在显式刷新时访问官方原生模型列表 API，成功后复用同一套本机缓存规则。目录出现型号不代表音频可用，附件能力仍以已适配模型规则校验。协议和错误分支已用模拟响应验证；尚未使用真实平台密钥完成云端文字、思考摘要或音频听评验收。[原生模型目录接口](https://help.aliyun.com/zh/model-studio/list-models)
+
 ### 环境变量后备
 
 仅在默认平台没有本机保存文件时，启动进程中的环境变量作为其后备配置。网页本机配置优先；本地文件损坏、无法读取或无法解密时停止相应模型请求，不回退到环境密钥。新增命名平台没有环境后备。环境变量自身的更改仍需重启进程，网页保存不需要重启。`.env.example` 是字段说明，程序不会自动读取 `.env`。不要把真实 API key 写入源文件、提示词、截图或版本控制。
 
 | 环境变量 | 含义 |
 |---|---|
-| `SYNTHV_AUDIO_PROVIDER` | `openai` 或 `gemini`；空值/`none` 禁用。单独存在 key 不会启用上传。 |
+| `SYNTHV_AUDIO_PROVIDER` | `openai`、`gemini` 或 `qwen`；空值/`none` 禁用。单独存在 key 不会启用上传。 |
 | `SYNTHV_AUDIO_MODEL` | 可选模型 ID；留空时使用 `settings.py` 中的默认值。请按所选服务及账户实际权限配置，默认值不保证可调用。 |
 | `OPENAI_API_KEY` | OpenAI key；仅选择 OpenAI 时读取使用。 |
 | `GEMINI_API_KEY` | Gemini key；仅选择 Gemini 时读取使用。 |
-| `SYNTHV_AUDIO_BASE_URL` | 可选 HTTPS API 根路径；默认 OpenAI `https://api.openai.com/v1`，Gemini `https://generativelanguage.googleapis.com/v1beta`。不填写完整方法地址。 |
-| `SYNTHV_AUDIO_TIMEOUT_SECONDS` | 默认 60 秒，范围 5～180 秒。流式会话用于连接、首次有效输出与有效输出间的等待；有效输出续期，另有 30 分钟总上限。A/B 听评及非流式调用仍为普通 HTTP 等待超时。 |
+| `DASHSCOPE_API_KEY` | 对应所填 Qwen 平台地址的 key；仅选择 Qwen 时读取使用，不继承 OpenAI / Gemini 密钥。 |
+| `SYNTHV_AUDIO_BASE_URL` | 可选 HTTPS API 根路径；默认 OpenAI `https://api.openai.com/v1`，Gemini `https://generativelanguage.googleapis.com/v1beta`，Qwen `https://dashscope.aliyuncs.com/compatible-mode/v1`。不填写完整方法地址。 |
+| `SYNTHV_AUDIO_TIMEOUT_SECONDS` | 默认 60 秒，范围 5～180 秒。流式会话及 Qwen Omni 流式听评用于连接、首次有效输出与有效输出间的等待；有效输出续期，另有 30 分钟总上限。其他非流式调用为普通 HTTP 等待超时。 |
 
 自定义根路径会接收供应商 key、本次文字与上下文，以及显式选择的音频，只应填写你信任的兼容服务。OpenAI 兼容服务在处理音频附件时必须支持 `input_audio`；纯文字分支不发送该字段。实现拒绝 HTTP 明文、URL 用户名密码、查询参数和自动重定向。普通状态接口不回显 key 或自定义根路径；受会话令牌保护的设置接口可返回用户填写的非秘密根路径供继续编辑，但始终不返回 key。
 
 ## 听评调用与边界
 
 A/B 评审使用默认平台的独立接口 `review_audio(paths, prompt, context=None)`，接受 1～2 个完整整数 PCM WAV，每个不超过 120 秒，所有文件合计不超过 12,000,000 字节，完整 JSON 请求不超过 18 MB。这个内部接口上限不改变网页上传入口的 60 秒限制。两个文件按顺序标记为 A（修改前）、B（修改后）。本版使用内联音频，不使用供应商 Files API，也不做实时音频传输；A/B 独立听评仍按完整响应返回文字。
+
+Qwen 平台的听评需选择 `qwen3.8-omni-flash`，Flash / Max 会明确拒绝音频请求。Omni 的供应商 SSE 在服务端内部收集为完整听评文字，正常文字与供应商思考输出都会续期等待时间；这不意味着 A/B 页面会实时显示逐字回复，也不改变其用户确认上传的流程。
 
 返回 `status`、`provider`、`model`、`review`、`message`；失败时另含 `errorCode`，HTTP 失败还含 `httpStatus`。`status` 为 `ok`、`not_configured` 或 `error`。只有 `ok` 才含模型听评文本。缺少配置、超时、静音判断困难或接口错误时，不生成虚构听感。错误不会回显供应商响应正文、认证头或完整 URL，计费请求不自动重试。
 

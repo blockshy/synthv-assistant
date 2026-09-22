@@ -21,6 +21,7 @@
   const audioDefaults = {
     none: { model: "", baseUrl: "" },
     openai: { model: "gpt-audio-1.5", baseUrl: "https://api.openai.com/v1" },
+    qwen: { model: "qwen3.8-flash", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
     gemini: { model: "gemini-3.8-flash", baseUrl: "https://generativelanguage.googleapis.com/v1beta" },
   };
 
@@ -218,6 +219,21 @@
     $("settings-platform-name").title = !settings.isNew && settings.selectedId === "default" ? "默认平台保留旧配置兼容入口，名称固定。其他平台可自定义名称。" : "此名称只用于本机辨认平台。";
     // 兼容服务可能使用 namespace/model 路由；Gemini 的模型标识由服务端进一步校验。
     $("settings-model").maxLength = $("settings-provider").value === "gemini" ? 128 : 200;
+    const qwen = $("settings-provider").value === "qwen";
+    // 只提供本地官方预设，不读取或校验用户密钥，也不隐式切换到可听音的另一模型。
+    if (qwen) {
+      $("settings-model").setAttribute("list", "settings-qwen-models");
+      $("settings-base-url").setAttribute("list", "settings-qwen-endpoints");
+    } else {
+      $("settings-model").removeAttribute("list");
+      $("settings-base-url").removeAttribute("list");
+    }
+    $("settings-model").placeholder = audioDefaults[$("settings-provider").value]?.model || "填写模型 ID";
+    $("settings-provider-help").hidden = !qwen;
+    $("settings-provider-help").textContent = qwen ? "qwen3.8-flash / qwen3.8-max 不支持音频输入；需要听音时可选择 qwen3.8-omni-flash。预设不代表已开通，实际可用性取决于账户和地域。" : "";
+    $("settings-endpoint-help").textContent = qwen
+      ? "预填百炼北京地址；千问 AI 和 QwenCloud 使用各自的独立入口，可在地址候选中选择。请以你的平台控制台为准，填写与密钥匹配的地域或业务空间 Base URL（以 /compatible-mode/v1 结尾），不含 /chat/completions；更换地址需重新填写密钥。"
+      : "填写 API 根地址，不含具体方法、用户名密码、查询参数或片段。自定义服务会收到密钥，以及你发送的文字、勾选的选区和所选音频。";
     $("audio-settings-fields").disabled = waiting || !settings.snapshot;
     for (const id of ["settings-model", "settings-base-url", "settings-api-key", "settings-timeout"]) $(id).disabled = !enabled;
     $("settings-model").required = enabled;

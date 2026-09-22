@@ -63,7 +63,7 @@
     $("chat-model-capability").textContent = state.capabilityLoading ? "正在读取本机能力规则…" : `${typeof note === "string" ? note : "默认推理不额外传参。"} ${audioNote} 模型 ID 可手动填写。`;
     // 技术能力说明移到悬停及辅助描述中；仅在实际阻止发送时由会话模块给出简短提示。
     const catalog = state.catalogMetadata.get(state.options.platformId);
-    const cacheNote = catalog?.cachedAt ? `已缓存模型目录${catalog.stale ? "（超过 7 天，可主动刷新）" : ""}。` : "首次使用可点击刷新获取模型列表。";
+    const cacheNote = catalog?.cachedAt ? `已缓存模型目录${catalog.stale ? "（超过 7 天，可主动刷新）" : ""}。` : platform?.provider === "qwen" ? "提供官方模型预设，尚未验证账号权限；可主动刷新目录。" : "首次使用可点击刷新获取模型列表。";
     $("chat-model").title = `可选择或填写模型 ID。${cacheNote}${audioNote}`;
     $("chat-model").setAttribute("aria-describedby", "chat-model-capability");
     $("chat-reasoning-label").title = state.capabilities?.reasoning?.supported === null ? "兼容平台能力未知；非默认强度需要平台支持，失败不会自动降级。" : "默认选项不额外指定推理参数。";
@@ -86,7 +86,11 @@
   }
   function renderCatalog() {
     const list = $("chat-model-options"); list.replaceChildren();
-    for (const model of state.catalogs.get(state.options.platformId) || []) list.append(new Option(model.label || model.id, model.id));
+    const models = state.catalogs.get(state.options.platformId) || [];
+    // Qwen 初次配置即可选择常用模型；预设与 API 实际目录区分，不能冒充账号授权结果。
+    const presets = selectedPlatform()?.provider === "qwen" && !models.length
+      ? ["qwen3.8-flash", "qwen3.8-max", "qwen3.8-omni-flash"].map((id) => ({ id, label: "官方预设 · 未验证账号权限" })) : [];
+    for (const model of models.length ? models : presets) list.append(new Option(model.label || model.id, model.id));
   }
   function renderReasoning() {
     const select = $("chat-reasoning"); select.replaceChildren();

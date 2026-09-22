@@ -17,7 +17,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from urllib import error, request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .config import DATA
 from .platforms import get_model_platform_snapshot
@@ -116,7 +116,7 @@ def get_cached_platform_models(identifier: str) -> dict:
     config = get_model_platform_snapshot(identifier)
     path = _cache_path(config["id"])
     if (not config.get("configured") or config.get("invalid") or not config.get("key")
-            or config.get("provider") not in {"openai", "gemini"}):
+            or config.get("provider") not in {"openai", "gemini", "qwen"}):
         return _cache_result(config)
     try:
         with path.open("rb") as source:
@@ -195,7 +195,9 @@ def _model_entry(raw: object, provider: str, key: str) -> dict | None:
         pattern = r"[A-Za-z0-9_.-]{1,128}"
         label = raw.get("displayName")
     else:
-        identifier = raw.get("id")
+        # 百炼原生目录使用 model，缓存仍统一保存 id / label；兼容缓存读取
+        # 的 id 回退只用于投影数据，不改变任何请求地址或模型能力判定。
+        identifier = raw.get("model", raw.get("id")) if provider == "qwen" else raw.get("id")
         pattern = r"[A-Za-z0-9][A-Za-z0-9_.:-]*(?:/[A-Za-z0-9][A-Za-z0-9_.:-]*)*"
         label = raw.get("name") or raw.get("displayName")
     if (not isinstance(identifier, str) or not 1 <= len(identifier) <= 200
@@ -209,6 +211,25 @@ def _model_entry(raw: object, provider: str, key: str) -> dict | None:
     return {"id": identifier, "label": label[:200] or identifier}
 
 
+def _qwen_catalog_base(base: str) -> str:
+    """仅为官方已确认的百炼根地址推导同源原生目录，禁止猜测自定义网关路由。
+
+    Qwen 的 /models 使用原生 /api/v1 协议，并非 Chat 的兼容路由。保持 scheme、
+    authority 完全不变，不因地区、业务空间或供应商下一页 URL 而转发认证头。
+    其他地址仍可发起用户配置的 Chat 请求，目录功能则明确提示手动填写模型。
+    """
+    parsed = urlsplit(base)
+    official = parsed.hostname in {"dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com",
+                                  "cn-hongkong.dashscope.aliyuncs.com"}
+    workspace = re.fullmatch(r"[a-z0-9][a-z0-9-]*\.(?:cn-beijing|ap-northeast-1|eu-central-1|us-east-1)\.maas\.aliyuncs\.com",
+                             parsed.hostname or "")
+    if (parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or parsed.path != "/compatible-mode/v1"
+            or not (official or workspace)):
+        raise ModelCatalogError("此 Qwen 地址的模型目录路径尚未适配，请手动填写模型 ID；未尝试其他地址。")
+    return urlunsplit((parsed.scheme, parsed.netloc, "/api/v1/models", "", ""))
+
+
 def list_platform_models(identifier: str) -> dict:
     """返回公开模型列表；只有显式调用此函数才产生外网 GET 请求。
 
@@ -218,27 +239,39 @@ def list_platform_models(identifier: str) -> dict:
     try:
         config = get_model_platform_snapshot(identifier)
         if (not config.get("configured") or config.get("invalid") or not config.get("key")
-                or config.get("provider") not in {"openai", "gemini"}):
+                or config.get("provider") not in {"openai", "gemini", "qwen"}):
             raise ModelCatalogError("此平台尚未配置或已停用，请先保存有效 API key 再刷新模型。")
         provider, key = config["provider"], config["key"]
-        headers = {"Authorization": "Bearer " + key} if provider == "openai" else {"x-goog-api-key": key}
-        base = config["base"] + "/models"
+        headers = {"x-goog-api-key": key} if provider == "gemini" else {"Authorization": "Bearer " + key}
+        base = _qwen_catalog_base(config["base"]) if provider == "qwen" else config["base"] + "/models"
         deadline = time.monotonic() + min(float(config["timeoutSeconds"]), MAX_REFRESH_SECONDS)
         models, model_ids, seen_cursors = [], set(), set()
-        cursor, truncated, pages = None, False, 0
+        cursor, truncated, pages, raw_count = None, False, 0, 0
         for page in range(MAX_PAGES):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
             # 只拼接同一个已配置端点的查询参数，绝不访问供应商返回的 next URL。
-            query = ({"pageSize": 100, **({"pageToken": cursor} if cursor else {})} if provider == "gemini"
+            query = ({"page_no": page + 1, "page_size": 100} if provider == "qwen" else
+                     {"pageSize": 100, **({"pageToken": cursor} if cursor else {})} if provider == "gemini"
                      else ({"after": cursor, "limit": 100} if cursor else {}))
             response = _get_json(base + ("?" + urlencode(query) if query else ""), headers, remaining)
             pages = page + 1
-            entries = response.get("data" if provider == "openai" else "models")
+            source = response.get("output") if provider == "qwen" else response
+            if not isinstance(source, dict):
+                raise ModelCatalogError("供应商没有返回有效的模型目录。")
+            entries = source.get("data" if provider == "openai" else "models")
             if not isinstance(entries, list):
                 raise ModelCatalogError("供应商没有返回有效的模型目录。")
-            if provider == "gemini":
+            if provider == "qwen":
+                # 页码从 1 开始，结束条件来自原生 output.total；按接收条目数
+                # 计数而非已过滤模型数，避免非法/重复 ID 造成多余分页或无限等待。
+                total = source.get("total")
+                raw_count += len(entries)
+                if type(total) is not int or total < 0 or (not entries and raw_count < total):
+                    raise ModelCatalogError("供应商模型目录的分页格式无效，请检查接口兼容性。")
+                next_cursor = str(page + 2) if raw_count < total else None
+            elif provider == "gemini":
                 next_cursor = response.get("nextPageToken")
             else:
                 next_cursor = (response.get("last_id") or (entries[-1].get("id") if entries and isinstance(entries[-1], dict) else None)) if response.get("has_more") is True else None

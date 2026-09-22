@@ -13,7 +13,7 @@ import re
 import socket
 from urllib import error
 
-from .review import _load_audio, _send_json
+from .review import _load_audio, _qwen_audio_parts, _send_json
 from .settings import get_audio_configuration_snapshot
 from .model_options import normalize_model_options, validate_for_config, apply_reasoning
 from .parameters import PARAMETER_LIMITS, ParameterError, supports_curves, validate_action, normalize_render_mode
@@ -308,7 +308,7 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
             config = dict(get_model_platform_snapshot(options["platformId"]))
         if options["model"]:
             config["model"] = options["model"]
-        if (not config.get("configured") or config.get("invalid") or config.get("provider") not in {"openai", "gemini"}
+        if (not config.get("configured") or config.get("invalid") or config.get("provider") not in {"openai", "gemini", "qwen"}
                 or not config.get("key")):
             raise PlannerError("AI 配置未启用、尚未填写密钥或已经损坏，请先在模型设置中保存有效配置。")
         try:
@@ -350,7 +350,10 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
             """只发送一次；流式失败不自动重试计费请求，不降级或更换模型。"""
             apply_reasoning(body, config, options["reasoningEffort"], include_summary=on_progress is not None)
             report("等待模型响应")
-            if on_progress is None:
+            # Omni 的已核实音频契约采用流式回复；HTTP/MCP 同步调用仍可在服务器
+            # 内聚合整条流，不能因调用方没有进度回调而改用未验证的非流式请求。
+            qwen_omni = config["provider"] == "qwen" and config["model"] == "qwen3.8-omni-flash"
+            if on_progress is None and not qwen_omni:
                 return _send_json(url, body, headers, config["timeoutSeconds"])
             from .streaming import send_stream_json, StreamingError, StreamingTimeoutError
             if config["provider"] == "gemini":
@@ -367,16 +370,27 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
         prompt = _build_user_text(text, selection, history, audio_paths, audio_context, config["key"])
         # 纯文本咨询绝不调用加载音频函数，也不要求模型支持音频输入。
         files = _load_audio(audio_paths) if audio_paths else []
-        if config["provider"] == "openai":
+        if config["provider"] in {"openai", "qwen"}:
             body = {"model": config["model"], "messages": [
                 {"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]}
             if files:
-                parts = [{"type": "text", "text": prompt}]
-                for index, data in enumerate(files):
-                    parts.extend([{"type": "text", "text": "音频 " + ("A" if index == 0 else "B")},
-                                  {"type": "input_audio", "input_audio": {"format": "wav", "data": base64.b64encode(data).decode("ascii")}}])
+                if config["provider"] == "qwen":
+                    try:
+                        parts = _qwen_audio_parts(files, prompt)
+                    except ValueError as exc:
+                        # 辅助函数只生成固定的本地大小提示，可向用户说明真实限制；
+                        # 不把供应商异常或含文件路径的错误经这一通道回显。
+                        raise PlannerError(str(exc)) from None
+                else:
+                    parts = [{"type": "text", "text": prompt}]
+                    for index, data in enumerate(files):
+                        parts.extend([{"type": "text", "text": "音频 " + ("A" if index == 0 else "B")},
+                                      {"type": "input_audio", "input_audio": {"format": "wav", "data": base64.b64encode(data).decode("ascii")}}])
                 body["messages"][1]["content"] = parts
                 body["modalities"] = ["text"]
+            if config["provider"] == "qwen" and config["model"] == "qwen3.8-omni-flash":
+                body["modalities"] = ["text"]
+                body["stream_options"] = {"include_usage": True}
             # 自定义兼容服务的 token 上限字段并不统一，本入口省略可选限制参数；
             # 使用服务端输出上限，并在本地严格限制响应字节及计划字符数。
             response = send(config["base"] + "/chat/completions", body,
