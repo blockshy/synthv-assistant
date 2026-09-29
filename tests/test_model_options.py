@@ -80,7 +80,9 @@ class ModelOptionsTests(unittest.TestCase):
     def test_streaming_summaries_are_real_redacted_and_never_raw_plan(self):
         updates = []
 
-        def stream(_url, _body, _headers, _timeout, _provider, callback):
+        def stream(_url, _body, _headers, _timeout, _provider, callback, *, max_text_characters):
+            # 规划正文采用自己的字符预算，不与协议包装和公开摘要共享传输额度。
+            self.assertEqual(max_text_characters, planner.MAX_RESPONSE_CHARACTERS)
             # 模拟密钥被拆到两个网络事件；首段不能泄露尚未凑齐的凭据前缀。
             callback({"reasoningDelta": "先检查上下文。test-secret-", "textDelta": ""})
             callback({"reasoningDelta": "never-real\n再比较目标。", "textDelta": '{"text":'})
@@ -140,7 +142,8 @@ class ModelOptionsTests(unittest.TestCase):
                     expected = message + "本次未自动重试，也未修改工程。"
                     updates = []
 
-                    def timeout_stream(_url, _body, _headers, _timeout, _provider, callback):
+                    def timeout_stream(_url, _body, _headers, _timeout, _provider, callback, *, max_text_characters):
+                        self.assertEqual(max_text_characters, planner.MAX_RESPONSE_CHARACTERS)
                         callback({"reasoningDelta": "已有的可见摘要", "textDelta": ""})
                         raise StreamingTimeoutError(expected)
 

@@ -74,7 +74,7 @@ class StreamingTests(unittest.TestCase):
     """断言完整聚合结果、进度字段与安全标志，避免只验证实现内部细节。"""
 
     def call(self, chunks, *, provider="openai", body=None, headers=None, callback=None,
-             content_type="text/event-stream", on_read=None, timeout=30):
+             content_type="text/event-stream", on_read=None, timeout=30, max_text_characters=24_000):
         self.response = FakeResponse(chunks, content_type, on_read)
         self.opener = Mock()
         self.opener.open.return_value = self.response
@@ -85,7 +85,7 @@ class StreamingTests(unittest.TestCase):
                 "https://mock.invalid/v1beta/models/fake:streamGenerateContent?alt=sse",
                 body if body is not None else {"model": "fake"},
                 headers if headers is not None else {"Authorization": "Bearer fake-secret-token"},
-                timeout, provider, callback or self.progress.append)
+                timeout, provider, callback or self.progress.append, max_text_characters=max_text_characters)
             self.assertIsInstance(build.call_args.args[0], streaming._NoRedirect)
         self.opener.open.assert_called_once()
         self.assertTrue(self.response.closed)
@@ -204,6 +204,133 @@ class StreamingTests(unittest.TestCase):
         with patch.object(streaming, "MAX_RESPONSE_BYTES", 100):
             with self.assertRaisesRegex(ValueError, "大小限制"):
                 self.call([b":" + b"x" * 100 + b"\n\n"])
+        self.assertTrue(self.response.closed)
+        self.opener.open.assert_called_once()
+
+    def test_long_reasoning_larger_than_old_wire_limit_still_returns_short_answer(self):
+        """真实长推理可超过旧 1 MB 传输预算；三种协议均应继续读到最终正文。"""
+        for provider in ("openai", "qwen", "gemini"):
+            with self.subTest(provider=provider):
+                if provider == "gemini":
+                    frames = [sse(gemini_event([{"thought": True, "text": "r" * 800}]))] * 1500
+                    frames.append(sse(gemini_event([{"text": "完整结果"}], "STOP")))
+                else:
+                    frames = [sse(openai_event({"reasoning_content": "r" * 800}))] * 1500
+                    frames.append(sse(openai_event({"content": "完整结果"}, "stop")))
+                self.assertGreater(sum(map(len, frames)), 1_000_000)
+                result = self.call(frames, provider=provider)
+                self.assertEqual("".join(item["textDelta"] for item in self.progress), "完整结果")
+                self.assertEqual(sum(len(item["reasoningDelta"]) for item in self.progress), 12_000)
+                self.assertIn("完整结果", json.dumps(result, ensure_ascii=False))
+
+    def test_repeated_protocol_metadata_does_not_consume_body_budget(self):
+        """逐 token 的供应商包装可以大于正文数百倍，不能按包装大小限制最终回答。"""
+        frame = {**openai_event({"reasoning": "思"}), "id": "protocol-metadata-" * 80}
+        frames = [sse(frame)] * 1000 + [sse(openai_event({"content": "ok"}, "stop"))]
+        self.assertGreater(sum(map(len, frames)), 1_000_000)
+        result = self.call(frames, max_text_characters=2)
+        self.assertEqual(result["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(result["choices"][0]["message"]["reasoning_content"], "思" * 1000)
+
+    def test_body_limit_uses_decoded_characters_for_all_supported_streams(self):
+        """中文的 UTF-8 编码长度不等于正文字符数，合法边界须能完整通过。"""
+        for provider in ("openai", "qwen", "gemini"):
+            with self.subTest(provider=provider):
+                frame = (gemini_event([{"text": "文" * 24_000}], "STOP") if provider == "gemini"
+                         else openai_event({"content": "文" * 24_000}, "stop"))
+                self.call([sse(frame)], provider=provider)
+                self.assertEqual("".join(item["textDelta"] for item in self.progress), "文" * 24_000)
+
+    def test_continuous_body_cannot_grow_past_independent_result_limit(self):
+        """总传输放宽后仍及时中止过长正文，不能静默截断成看似正常的回答。"""
+        for provider in ("openai", "qwen", "gemini"):
+            with self.subTest(provider=provider):
+                if provider == "gemini":
+                    frames = [sse(gemini_event([{"text": "x" * 1000}]))] * 24
+                    frames.append(sse(gemini_event([{"text": "!"}], "STOP")))
+                else:
+                    frames = [sse(openai_event({"content": "x" * 1000}))] * 24
+                    frames.append(sse(openai_event({"content": "!"}, "stop")))
+                with self.assertRaisesRegex(streaming.StreamingError, "正文.*24,000 字符"):
+                    self.call(frames, provider=provider)
+                self.assertEqual(sum(len(item["textDelta"]) for item in self.progress), 24_000)
+                self.assertTrue(self.response.closed)
+                self.opener.open.assert_called_once()
+
+    def test_body_limit_counts_original_text_before_secret_redaction(self):
+        """原始正文超限时即使脱敏后更短，也不能继续累计或重复发送。"""
+        secret = "private-secret"
+        with self.assertRaisesRegex(streaming.StreamingError, "正文.*20 字符"):
+            self.call([sse(openai_event({"content": secret})),
+                       sse(openai_event({"content": secret}, "stop"))],
+                      headers={"Authorization": "Bearer " + secret}, max_text_characters=20)
+        self.assertNotIn(secret, json.dumps(self.progress))
+        self.assertEqual("".join(item["textDelta"] for item in self.progress), "[已隐藏密钥]")
+        self.assertTrue(self.response.closed)
+        self.opener.open.assert_called_once()
+
+    def test_redaction_marker_cannot_expand_final_body_past_limit(self):
+        """短凭据替换成中文脱敏标记后可能变长，结果长度仍须受同一契约约束。"""
+        with self.assertRaisesRegex(streaming.StreamingError, "正文.*10 字符"):
+            self.call([sse(openai_event({"content": "xxxxx"}, "stop"))],
+                      headers={"x-api-key": "x"}, max_text_characters=10)
+        self.assertEqual(self.progress, [])
+        self.assertTrue(self.response.closed)
+
+    def test_invalid_body_budget_is_rejected_before_network_request(self):
+        """调用层只能降低正文预算；布尔值、浮点值和越界值不能绕过本地上限。"""
+        for limit in (0, -1, True, 1.5, "24000", None, 24_001):
+            with self.subTest(limit=limit), patch.object(streaming.request, "build_opener") as build:
+                with self.assertRaisesRegex(streaming.StreamingError, "正文大小配置无效"):
+                    streaming.send_stream_json("https://mock.invalid", {}, {}, 30, "openai", None,
+                                               max_text_characters=limit)
+                build.assert_not_called()
+
+    def test_oversized_single_line_is_bounded_even_without_line_ending(self):
+        """未闭合的 data、注释、元数据和中文行均不能累积到 32 MiB 总预算。"""
+        for prefix in (b"data: ", b":", b"event: "):
+            for ending in (b"", b"\n", b"\r\n"):
+                with self.subTest(prefix=prefix, ending=ending), patch.object(streaming, "MAX_LINE_BYTES", 128):
+                    payload = prefix + ("文" * 50).encode("utf-8") + ending
+                    with self.assertRaisesRegex(streaming.StreamingError, "单行.*大小限制"):
+                        self.call([payload[index:index + 7] for index in range(0, len(payload), 7)])
+                    self.assertEqual(self.progress, [])
+                    self.assertTrue(self.response.closed)
+                    self.opener.open.assert_called_once()
+
+    def test_oversized_multiline_event_is_bounded_without_blank_separator(self):
+        """小行拼成的大事件也必须受限，包括被忽略的 SSE 元数据和空 data 行。"""
+        for line in (b"data: x\n", b"data\r\n", b":comment\n", b"event: ping\n"):
+            with self.subTest(line=line), patch.object(streaming, "MAX_EVENT_BYTES", 128):
+                with self.assertRaisesRegex(streaming.StreamingError, "单个事件.*大小限制"):
+                    self.call([line] * 129)
+                self.assertEqual(self.progress, [])
+                self.assertTrue(self.response.closed)
+                self.opener.open.assert_called_once()
+
+    def test_multiline_event_budget_includes_unfinished_tail(self):
+        """完整 data 行后的半截尾行也计入事件预算，不能等下一次换行才检查。"""
+        with patch.object(streaming, "MAX_EVENT_BYTES", 128):
+            with self.assertRaisesRegex(streaming.StreamingError, "单个事件.*大小限制"):
+                self.call([b"data: " + b"a" * 90 + b"\n", b"data: " + b"b" * 40])
+        self.assertEqual(self.progress, [])
+        self.assertTrue(self.response.closed)
+
+    def test_event_budget_resets_on_crlf_blank_separator_across_network_chunks(self):
+        """CR/LF 和 UTF-8 拆在相邻网络块中时，事件边界应准确重置预算。"""
+        payload = (sse(openai_event({"reasoning": "想"}), "\r\n\r\n") * 8
+                   + sse(openai_event({"content": "ok"}, "stop"), "\r\n\r\n"))
+        with patch.object(streaming, "MAX_EVENT_BYTES", 140), patch.object(streaming, "MAX_LINE_BYTES", 140):
+            result = self.call([payload[index:index + 1] for index in range(len(payload))])
+        self.assertEqual(result["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(result["choices"][0]["message"]["reasoning_content"], "想" * 8)
+
+    def test_repeated_small_heartbeats_still_hit_total_wire_budget_without_retry(self):
+        """事件分隔符重置单事件计数，但心跳总量不能重置整个请求的传输预算。"""
+        with patch.object(streaming, "MAX_RESPONSE_BYTES", 100):
+            with self.assertRaisesRegex(streaming.StreamingError, "传输.*总大小限制"):
+                self.call([b":ping\r\n\r\n"] * 30)
+        self.assertEqual(self.progress, [])
         self.assertTrue(self.response.closed)
         self.opener.open.assert_called_once()
 

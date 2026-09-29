@@ -50,17 +50,12 @@ class ParameterMCPServer(FastMCP):
 def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
     """创建可测试的 MCP 服务器；不在导入模块时连接或修改 SynthV。"""
     assistant = service if service is not None else AssistantService()
+    # MCP 使用工具协议，不套用网页会话 JSON 格式；音乐证据和确认原则与其它
+    # AI 入口集中维护，避免工具说明与网页规划出现不同的参数单位或音频假设。
+    from .prompts import MCP_INSTRUCTION
     server = ParameterMCPServer(
         "SynthV Assistant",
-        instructions=(
-            "协助调教 Synthesizer V Studio 2。先读取状态和选区，再预览参数变更。"
-            "只有用户已授权编辑时才开启写入并应用预览。录音和模型听评返回 jobId，"
-            "请用 get_job 查询结果；不要重复启动尚未完成的工作。"
-            "review_recordings 会在配置供应商后上传所选音频及片段上下文，默认未配置。"
-            "get_recording_audio 返回真实 WAV audio 内容，客户端与模型必须支持音频输入；"
-            "只收到音频链接、指标或文件名不能称为已经听过音频。"
-            "本地 RMS/峰值指标不能代替听感评价。"
-        ),
+        instructions=MCP_INSTRUCTION,
         log_level="WARNING",
     )
     readonly = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -162,7 +157,8 @@ def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
 
         此操作配置供应商后会上传真实音频及片段上下文，可能产生 API 费用。
         默认供应商为 none，未配置时任务结果明确返回 not_configured，不伪造听感。
-        两段录音按修改前、修改后排序；模型仅建议，不自动改动 SynthV。
+        两段录音按传入顺序标记 A、B；如需前后对比，请在 prompt 中说明关系。
+        模型只给建议，不自动改动 SynthV；录音不可比时也可以不选优胜版本。
         """
         identifier = assistant.submit(assistant.review, recording_ids, prompt)
         return {"jobId": identifier, "message": "听评任务已提交；配置供应商后会上传所选音频，请用 get_job 获取结果。"}

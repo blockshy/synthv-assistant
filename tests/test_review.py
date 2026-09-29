@@ -99,10 +99,122 @@ class AudioReviewTests(unittest.TestCase):
         self.assertNotIn("test-secret", req.full_url)
         document = json.loads(req.data)
         parts = document["contents"][0]["parts"]
-        self.assertIn("修改前", parts[1]["text"])
-        self.assertIn("修改后", parts[3]["text"])
+        self.assertEqual(parts[1]["text"], "音频 A")
+        self.assertEqual(parts[3]["text"], "音频 B")
         self.assertEqual(parts[2]["inlineData"]["mimeType"], "audio/wav")
         self.assertEqual(base64.b64decode(parts[4]["inlineData"]["data"]), self.path.read_bytes())
+
+    def test_review_prompt_matches_validated_attachment_count_for_each_provider(self):
+        """从真实请求组装入口核对分支；重复合成 WAV 不代表修改前后关系。"""
+        for provider in ("openai", "gemini"):
+            for count in (1, 2):
+                with self.subTest(provider=provider, count=count):
+                    self.configure(provider)
+                    response = ({"choices": [{"message": {"content": "模拟听评。"}}]}
+                                if provider == "openai" else
+                                {"candidates": [{"content": {"parts": [{"text": "模拟听评。"}]}}]})
+                    self.respond(response)
+                    with patch.object(review, "build_review_instruction", return_value=f"附件数量：{count}") as builder:
+                        result = review.review_audio([self.path] * count, "比较参考风格，不假设前后关系")
+                    self.assertEqual(result["status"], "ok")
+                    builder.assert_called_once_with(count)
+                    document = json.loads(self.opener.open.call_args.args[0].data)
+                    if provider == "openai":
+                        instruction = document["messages"][0]["content"]
+                        parts = document["messages"][1]["content"]
+                    else:
+                        instruction = document["systemInstruction"]["parts"][0]["text"]
+                        parts = document["contents"][0]["parts"]
+                    self.assertEqual(instruction, f"附件数量：{count}")
+                    self.assertEqual([part["text"] for part in parts[1:] if "text" in part],
+                                     ["音频 A", "音频 B"][:count])
+
+    def test_explicit_incomplete_or_rejected_openai_responses_do_not_become_reviews(self):
+        """即使正文有内容也拒绝异常结束，不回显供应商附带的诊断或工具参数。"""
+        self.configure()
+        private = "test-secret-do-not-print private-provider-details"
+        responses = [{"choices": [{"finish_reason": reason, "message": {"content": private}}]}
+                     for reason in ("length", "content_filter", "tool_calls", "function_call", "unknown")]
+        responses += [{"choices": [{"finish_reason": "stop", "message": {"content": private, key: value}}]}
+                      for key, value in (("tool_calls", [{"function": {"arguments": private}}]),
+                                         ("function_call", {"arguments": private}), ("refusal", private))]
+        for document in responses:
+            with self.subTest(document=document):
+                self.respond(document)
+                result = review.review_audio([self.path], "评价")
+                self.assertEqual(result["errorCode"], "invalid_response")
+                self.assertIsNone(result["review"])
+                self.assertNotIn("private-provider-details", json.dumps(result))
+                self.assertNotIn("test-secret", json.dumps(result))
+
+    def test_explicit_incomplete_or_tool_gemini_responses_do_not_become_reviews(self):
+        """Gemini 的正常文本不能掩盖 MAX_TOKENS、过滤、工具或代码执行结果。"""
+        self.configure("gemini")
+        private = "test-secret-do-not-print private-provider-details"
+        responses = [{"candidates": [{"finishReason": reason, "content": {"parts": [{"text": private}]}}]}
+                     for reason in ("MAX_TOKENS", "SAFETY", "RECITATION", "OTHER")]
+        for key in ("functionCall", "functionResponse", "executableCode", "codeExecutionResult", "refusal"):
+            responses.append({"candidates": [{"finishReason": "STOP", "content": {"parts": [
+                {"text": private}, {key: {"text": private}}]}}]})
+        responses.append({"promptFeedback": {"blockReason": "SAFETY"},
+                          "candidates": [{"content": {"parts": [{"text": private}]}}]})
+        for document in responses:
+            with self.subTest(document=document):
+                self.respond(document)
+                result = review.review_audio([self.path], "评价")
+                self.assertEqual(result["errorCode"], "invalid_response")
+                self.assertIsNone(result["review"])
+                self.assertNotIn("private-provider-details", json.dumps(result))
+                self.assertNotIn("test-secret", json.dumps(result))
+
+    def test_visible_review_limit_preserves_exact_boundary_and_hides_oversized_text(self):
+        """正文上限独立于 HTTP 字节限制；仅按正式文本计数，不返回截断的听评。"""
+        for provider in ("openai", "gemini"):
+            for oversized in (False, True):
+                with self.subTest(provider=provider, oversized=oversized):
+                    self.configure(provider)
+                    text = "字" * review.MAX_REVIEW_CHARACTERS
+                    if oversized:
+                        text += "test-secret-do-not-print private-provider-details"
+                    response = ({"choices": [{"finish_reason": "stop", "message": {"content": text}}]}
+                                if provider == "openai" else {"candidates": [{"finishReason": "STOP",
+                                "content": {"parts": [{"text": "摘要" * 16000, "thought": True}, {"text": text}]}}]})
+                    self.respond(response)
+                    result = review.review_audio([self.path], "评价")
+                    if oversized:
+                        self.assertEqual(result["errorCode"], "invalid_response")
+                        self.assertIsNone(result["review"])
+                        self.assertNotIn("private-provider-details", json.dumps(result))
+                        self.assertNotIn("test-secret", json.dumps(result))
+                    else:
+                        self.assertEqual(result["status"], "ok")
+                        self.assertEqual(result["review"], text)
+
+    def test_redaction_expansion_cannot_exceed_visible_review_limit(self):
+        """兼容平台的短凭据可能让脱敏正文变长，最终返回仍须遵守 24000 字符预算。"""
+        for provider in ("openai", "gemini"):
+            for oversized in (False, True):
+                with self.subTest(provider=provider, oversized=oversized):
+                    self.configure(provider)
+                    # 全部配置和响应仅存在于测试环境；不读取用户真实密钥。
+                    os.environ["OPENAI_API_KEY" if provider == "openai" else "GEMINI_API_KEY"] = "x"
+                    marker = "[已隐藏密钥]"
+                    prefix = "字" * (review.MAX_REVIEW_CHARACTERS - len(marker))
+                    raw = prefix + "x" + ("字" if oversized else "")
+                    self.assertLessEqual(len(raw), review.MAX_REVIEW_CHARACTERS)
+                    response = ({"choices": [{"finish_reason": "stop", "message": {"content": raw}}]}
+                                if provider == "openai" else {"candidates": [{"finishReason": "STOP",
+                                "content": {"parts": [{"text": raw}]}}]})
+                    self.respond(response)
+                    result = review.review_audio([self.path], "评价")
+                    if oversized:
+                        self.assertEqual(result["errorCode"], "invalid_response")
+                        self.assertIsNone(result["review"])
+                        self.assertNotIn(prefix, json.dumps(result, ensure_ascii=False))
+                    else:
+                        self.assertEqual(result["status"], "ok")
+                        self.assertEqual(result["review"], prefix + marker)
+                        self.assertEqual(len(result["review"]), review.MAX_REVIEW_CHARACTERS)
 
     def test_http_errors_never_expose_server_details(self):
         self.configure()

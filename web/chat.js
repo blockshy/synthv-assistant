@@ -1084,7 +1084,9 @@
   $("confirm-delete-conversation").addEventListener("click", deleteConversation);
   for (const button of document.querySelectorAll("[data-prompt]")) button.addEventListener("click", () => {
     $("chat-input").value = button.dataset.prompt; $("chat-input").focus(); syncControls();
-    if (button.dataset.prompt.includes("两段音频")) openLibrary($("attach-audio"));
+    // 行为由显式标记决定，避免编辑提示文字后误开或漏开素材页；
+    // 打开页面本身不会选择附件、勾选选区或发送消息。
+    if (button.dataset.promptAction === "audio") openLibrary($("attach-audio"));
   });
   for (const id of ["open-audio-library", "attach-audio"]) $(id).addEventListener("click", (event) => openLibrary(event.currentTarget));
   for (const id of ["close-audio-library", "cancel-audio-library"]) $(id).addEventListener("click", closeLibrary);

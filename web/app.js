@@ -936,7 +936,10 @@
     runBusy("review", "review-feedback", async () => {
       $("review-result").hidden = true;
       feedback("review-feedback", "正在提交实际录音，等待音频模型评审…");
-      const job = await api("/api/review", { recordingIds: [state.selected.a, state.selected.b], prompt: $("review-prompt").value.trim() || "比较 A、B 两个歌声片段的自然度、咬字、气声和尾音，指出有依据的差异，并给出保守的后续调教建议。" });
+      // 空白输入采用不预设胜负的听评任务；时间始终相对各自录音，
+      // 避免把片段位置误当作工程时间，也不以音量较大直接判定效果较好。
+      const prompt = $("review-prompt").value.trim() || "先判断 A、B 是否为可比较的歌声片段，说明对齐、伴奏或音量差异对判断的影响，不预设 B 更好。区分听到的事实与推测，用各自片段内时间定位差异；围绕自然度、咬字、气声与尾音，给出最多 3 条有依据的优先建议和试听验证方式。无法判断的部分请明确说明。";
+      const job = await api("/api/review", { recordingIds: [state.selected.a, state.selected.b], prompt });
       const result = await waitForJob(job.jobId);
       const data = resultData(result);
       if (data?.status === "error" || data?.status === "not_configured") throw new Error(errorMessage(data));

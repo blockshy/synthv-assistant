@@ -17,7 +17,12 @@ from urllib.parse import urlsplit
 from .review import MAX_REQUEST_BYTES, _NoRedirect
 
 
-MAX_RESPONSE_BYTES = 1_000_000
+# SSE 会为每个 token 重复携带 JSON 字段；长推理的传输量远大于最终正文。
+# 分开限制传输、未结束事件与正文，不能用普通 JSON 响应的大小代替流式预算。
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_EVENT_BYTES = 1024 * 1024
+MAX_LINE_BYTES = 1024 * 1024
+MAX_TEXT_CHARACTERS = 24_000
 MAX_REASONING_CHARACTERS = 12_000
 READ_SIZE = 4096
 # 空闲计时可随有效输出续期；另设较长、独立的总上限，防止异常服务永久占用任务。
@@ -102,19 +107,21 @@ def _read_chunk(response, deadline: _StreamDeadline, size: int) -> bytes:
 def _sse_events(response, deadline: _StreamDeadline):
     """增量解码 UTF-8 和 SSE，支持跨网络分段的汉字、CRLF 与多行 data。
 
-    上限统计原始字节，包含注释和心跳，避免服务持续发送无用数据绕过限制。
-    单个未结束事件也受同一上限约束；EOF 仅补交已收到的数据，不补造完成标记。
+    总预算统计原始字节，包含注释、心跳和协议包装；单行、单个事件另有较小
+    预算。这样既允许正常长推理，也不会为没有换行或没有事件分隔符的数据
+    积累整个总预算。EOF 仅补交已收到的数据，不补造完成标记。
     """
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     buffer = ""
     data_lines: list[str] = []
     total = 0
+    event_bytes = 0
     first_text = True
     while True:
         chunk = _read_chunk(response, deadline, min(READ_SIZE, MAX_RESPONSE_BYTES + 1 - total))
         total += len(chunk)
         if total > MAX_RESPONSE_BYTES:
-            raise StreamingError("AI 流式响应超过本地大小限制。")
+            raise StreamingError("AI 流式传输超过本地总大小限制（32 MiB），已停止接收；请缩小请求范围或降低推理强度。")
         final = not chunk
         try:
             decoded = decoder.decode(chunk, final=final)
@@ -131,6 +138,7 @@ def _sse_events(response, deadline: _StreamDeadline):
                 if not final:
                     break
                 line, buffer = buffer, ""
+                consumed = 0
             else:
                 end = min(positions)
                 # 网络分段恰好停在 CR 时等下一段，避免把 CRLF 误认成两个换行。
@@ -138,16 +146,33 @@ def _sse_events(response, deadline: _StreamDeadline):
                     break
                 consumed = 2 if buffer[end:end + 2] == "\r\n" else 1
                 line, buffer = buffer[:end], buffer[end + consumed:]
+            # 按 UTF-8 字节而非 Python 字符计数；中文、CRLF、多行 data 和纯
+            # 元数据也必须受相同约束，避免换一种包装便绕过内存保护。
+            line_bytes = len(line.encode("utf-8")) + consumed
+            if line_bytes > MAX_LINE_BYTES:
+                raise StreamingError("AI 流式响应的单行超过本地大小限制（1 MiB），已停止接收。")
             if not line:
+                event_bytes = 0
                 if data_lines:
                     yield "\n".join(data_lines)
                     data_lines.clear()
-            elif line.startswith("data:"):
-                data = line[5:]
-                data_lines.append(data[1:] if data.startswith(" ") else data)
-            elif line == "data":
-                data_lines.append("")
+            else:
+                event_bytes += line_bytes
+                if event_bytes > MAX_EVENT_BYTES:
+                    raise StreamingError("AI 流式响应的单个事件超过本地大小限制（1 MiB），已停止接收。")
+                if line.startswith("data:"):
+                    data = line[5:]
+                    data_lines.append(data[1:] if data.startswith(" ") else data)
+                elif line == "data":
+                    data_lines.append("")
             # event/id/retry 和冒号注释属于传输元数据，不进入模型正文。
+        # 尚未收到行尾的缓冲也要立即检查。解码器暂存的 UTF-8 尾字节包含在
+        # 内，跨网络分段、跨 CRLF 或多字节字符都不能拖延单行/事件的限制。
+        pending_bytes = len(buffer.encode("utf-8")) + len(decoder.getstate()[0])
+        if pending_bytes > MAX_LINE_BYTES:
+            raise StreamingError("AI 流式响应的单行超过本地大小限制（1 MiB），已停止接收。")
+        if event_bytes + pending_bytes > MAX_EVENT_BYTES:
+            raise StreamingError("AI 流式响应的单个事件超过本地大小限制（1 MiB），已停止接收。")
         if final:
             if data_lines:
                 yield "\n".join(data_lines)
@@ -172,16 +197,22 @@ def _secrets(headers: dict) -> tuple[str, ...]:
 class _TextChannel:
     """跨 SSE 事件遮盖凭据，防止密钥分成几段后被逐段回调泄漏。"""
 
-    def __init__(self, secrets: tuple[str, ...], emit: Callable[[str], None], limit: int | None = None):
+    def __init__(self, secrets: tuple[str, ...], emit: Callable[[str], None], limit: int | None = None,
+                 *, reject_overflow: bool = False):
         self.secrets = secrets
         self.emit = emit
         self.limit = limit
+        self.reject_overflow = reject_overflow
         self.published_length = 0
         self.pending = ""
         self.parts: list[str] = []
 
     def _publish(self, text: str):
         if self.limit is not None:
+            if self.reject_overflow and self.published_length + len(text) > self.limit:
+                # 正文将交给 JSON/计划校验，绝不能像思考显示那样静默截断。
+                # 脱敏标记有时比原始短凭据更长，所以发布前也要核对长度。
+                raise StreamingError(f"AI 正文超过本地 {self.limit:,} 字符限制，已停止接收；请缩小本次请求范围。")
             text = text[:max(0, self.limit - self.published_length)]
         if text:
             self.published_length += len(text)
@@ -217,12 +248,16 @@ class _TextChannel:
 class _Progress:
     """正文与思考分通道累计；思考达到上限后继续读取正文，不猜测省略部分。"""
 
-    def __init__(self, headers: dict, callback: ProgressCallback | None, deadline: _StreamDeadline):
+    def __init__(self, headers: dict, callback: ProgressCallback | None, deadline: _StreamDeadline,
+                 max_text_characters: int):
         self.callback = callback
         self.deadline = deadline
         self.reasoning_length = 0
+        self.text_length = 0
+        self.max_text_characters = max_text_characters
         secrets = _secrets(headers)
-        self.text = _TextChannel(secrets, lambda text: self._emit("textDelta", text))
+        self.text = _TextChannel(secrets, lambda text: self._emit("textDelta", text),
+                                 max_text_characters, reject_overflow=True)
         self.reasoning = _TextChannel(secrets, lambda text: self._emit("reasoningDelta", text), MAX_REASONING_CHARACTERS)
 
     def _emit(self, field: str, value: str):
@@ -237,6 +272,11 @@ class _Progress:
         if text is not None:
             if not isinstance(text, str):
                 raise StreamingError("AI 流式正文格式无效。")
+            self.text_length += len(text)
+            if self.text_length > self.max_text_characters:
+                # 在拼接、脱敏和回调之前计数，重复输出凭据也不能靠脱敏后的
+                # 缩短文本绕过正文预算；有界最终正文不受长推理传输量影响。
+                raise StreamingError(f"AI 正文超过本地 {self.max_text_characters:,} 字符限制，已停止接收；请缩小本次请求范围。")
             if text:
                 self.deadline.activity()
             self.text.append(text)
@@ -440,17 +480,22 @@ def _gemini(events, progress: _Progress) -> dict:
 
 
 def send_stream_json(url: str, body: dict, headers: dict, timeout: float, provider: str,
-                     on_progress: ProgressCallback | None) -> dict:
+                     on_progress: ProgressCallback | None, *,
+                     max_text_characters: int = MAX_TEXT_CHARACTERS) -> dict:
     """单次发送并聚合 SSE；HTTPError 留给规划层映射为认证、限流等安全提示。
 
     Gemini 的 streamGenerateContent URL 和 includeThoughts 由调用层按配置构造。
     本模块为 OpenAI / Qwen 兼容请求增加 stream:true，不改变调用者持有的请求对象。
     timeout 约束首次有效输出及相邻有效输出间隔；持续输出可跨越该时间窗口。
+    max_text_characters 是最终正文的独立预算，调用者可按自己的结果契约调低；
+    思考摘要仅截断显示，不能耗尽正文预算或中止仍在输出的模型连接。
     """
     if provider not in {"openai", "gemini", "qwen"} or not isinstance(body, dict) or not isinstance(headers, dict):
         raise StreamingError("AI 流式请求配置无效。")
     if isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not 0 < timeout <= 180 or not math.isfinite(timeout):
         raise StreamingError("AI 流式请求超时配置无效。")
+    if isinstance(max_text_characters, bool) or not isinstance(max_text_characters, int) or not 1 <= max_text_characters <= MAX_TEXT_CHARACTERS:
+        raise StreamingError("AI 流式正文大小配置无效。")
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise StreamingError("AI 流式接口必须使用有效的 HTTPS 地址。")
@@ -461,7 +506,7 @@ def send_stream_json(url: str, body: dict, headers: dict, timeout: float, provid
     outbound = request.Request(url, data=encoded, headers={"Content-Type": "application/json", "Accept": "text/event-stream", **headers}, method="POST")
     opener = request.build_opener(_NoRedirect())
     deadline = _StreamDeadline(timeout)
-    progress = _Progress(headers, on_progress, deadline)
+    progress = _Progress(headers, on_progress, deadline, max_text_characters)
     try:
         response = opener.open(outbound, timeout=deadline.remaining())
     except TimeoutError:

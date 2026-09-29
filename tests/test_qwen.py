@@ -165,8 +165,8 @@ class QwenTests(unittest.TestCase):
             self.assertEqual(blob["format"], "wav")
         self.assertEqual(result["inputMode"], "audio")
 
-    def test_conversation_audio_labels_are_neutral_and_only_standalone_review_declares_before_after(self):
-        """从实际发出的请求检查语义，避免普通参考附件被误标为修改前后对照。"""
+    def test_conversation_and_standalone_audio_labels_do_not_invent_before_after_relationship(self):
+        """附件标签只标识顺序；用户对修改关系的说明保留在要求中，不自动推定。"""
         self.config["model"] = "qwen3.8-omni-flash"
         self.plan(audio_paths=[self.wav, self.wav])
         parts = self.stream.call_args.args[1]["messages"][1]["content"]
@@ -174,7 +174,22 @@ class QwenTests(unittest.TestCase):
         review.review_audio([self.wav, self.wav], "比较修改前后的听感")
         parts = self.stream.call_args.args[1]["messages"][1]["content"]
         self.assertEqual([part["text"] for part in parts[1:] if part["type"] == "text"],
-                         ["片段 A（修改前）", "片段 B（修改后）"])
+                         ["音频 A", "音频 B"])
+
+    def test_standalone_omni_review_builds_prompt_from_actual_attachment_count(self):
+        """Omni 与其它供应商调用同一个听评提示构造器，不用文本猜测附件数量。"""
+        self.config["model"] = "qwen3.8-omni-flash"
+        self.stream.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": "模拟听评。"}}]}
+        for count in (1, 2):
+            with self.subTest(count=count), \
+                 patch.object(review, "build_review_instruction", return_value=f"附件数量：{count}") as builder:
+                result = review.review_audio([self.wav] * count, "评价参考音频")
+                self.assertEqual(result["status"], "ok")
+                builder.assert_called_once_with(count)
+                document = self.stream.call_args.args[1]
+                self.assertEqual(document["messages"][0]["content"], f"附件数量：{count}")
+                self.assertEqual([part["text"] for part in document["messages"][1]["content"][1:] if "text" in part],
+                                 ["音频 A", "音频 B"][:count])
 
     def test_omni_encoded_total_limit_rejects_exact_boundary_without_upload(self):
         self.config["model"] = "qwen3.8-omni-flash"
@@ -207,6 +222,26 @@ class QwenTests(unittest.TestCase):
         self.assertEqual(result["message"], message)
         self.stream.assert_called_once()
         self.outbound.assert_not_called()
+
+    def test_standalone_omni_review_rejects_tools_refusal_and_oversized_visible_text(self):
+        """流聚合后的正文仍须校验，不能依赖 SSE 替身或兼容服务总会检查完成标记。"""
+        self.config["model"] = "qwen3.8-omni-flash"
+        private = self.key + " private-provider-details"
+        messages = [{"content": private, "tool_calls": [{"function": {"arguments": private}}]},
+                    {"content": private, "function_call": {"arguments": private}},
+                    {"content": private, "refusal": private},
+                    {"content": "字" * review.MAX_REVIEW_CHARACTERS + private}]
+        for message in messages:
+            with self.subTest(message_type=next(reversed(message))):
+                self.stream.return_value = {"choices": [{"finish_reason": "stop", "message": message}]}
+                result = review.review_audio([self.wav], "评价")
+                self.assertEqual(result["errorCode"], "invalid_response")
+                self.assertIsNone(result["review"])
+                self.assertNotIn(self.key, json.dumps(result))
+                self.assertNotIn("private-provider-details", json.dumps(result))
+        # 与 OpenAI 兼容协议一致：省略完成字段的旧响应仍可读取，但显式失败不行。
+        self.stream.return_value = {"choices": [{"message": {"content": "兼容旧响应。"}}]}
+        self.assertEqual(review.review_audio([self.wav], "评价")["review"], "兼容旧响应。")
 
     def test_native_catalog_paginates_same_origin_and_reuses_identity_bound_cache(self):
         pages = [{"output": {"total": 3, "models": [{"model": "qwen3.8-flash"}, {"model": "qwen3.8-max"}]}},
