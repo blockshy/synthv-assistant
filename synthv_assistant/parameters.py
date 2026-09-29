@@ -17,6 +17,9 @@ PARAMETER_LIMITS = {"breathiness": 0.3, "tension": 0.3, "gender": 0.3,
 MAX_CURVE_POINTS = 64
 MAX_PREVIEW_POINTS = 256
 MAX_PREVIEW_CONTROL_POINTS = 4000
+MAX_PARAMETER_CONTEXT_POINTS = 33
+MAX_SELECTION_CONTEXT_POINTS = 512
+MAX_COMPUTED_PITCH_POINTS = 97
 
 
 def normalize_render_mode(value="smooth") -> str:
@@ -211,12 +214,73 @@ def validate_preview_payload(payload: object) -> None:
             raise ParameterError("曲线必须是包含有限数字的控制点数组，不能使用字符串或布尔值。")
 
 
+def _public_current_values(value: object) -> dict | None:
+    """验证选区 Automation 采样并复制公开字段，不接收路径或其它宿主对象。
+
+    minimum/maximum 仅概括本次有限采样，必须与 samples 一致。它们不是连续
+    曲线的数学极值，更不是叠加声线默认值或合成之后的音高、响度测量。畸形摘要
+    整项省略，仍保留可用参数目录；缺失信息不能被伪造为零或最后一个有效值。
+    """
+    if not isinstance(value, dict):
+        return None
+    samples = value.get("samples")
+    if not isinstance(samples, list) or not 2 <= len(samples) <= MAX_PARAMETER_CONTEXT_POINTS:
+        return None
+    checked, previous = [], -1.0
+    for point in samples:
+        if (not isinstance(point, list) or len(point) != 2
+                or not finite(point[0], 0, 1) or point[0] <= previous
+                or not finite(point[1], -1_000_000_000, 1_000_000_000)):
+            return None
+        previous = float(point[0])
+        checked.append([previous, float(point[1])])
+    if checked[0][0] != 0 or checked[-1][0] != 1:
+        return None
+    minimum, maximum = value.get("minimum"), value.get("maximum")
+    if (not finite(minimum, -1_000_000_000, 1_000_000_000)
+            or not finite(maximum, -1_000_000_000, 1_000_000_000)
+            or minimum != min(point[1] for point in checked)
+            or maximum != max(point[1] for point in checked)):
+        return None
+    return {"samples": checked, "minimum": float(minimum), "maximum": float(maximum)}
+
+
+def public_computed_pitch(value: object) -> dict | None:
+    """公开宿主计算音高的有界只读摘要，并保留明确的缺帧和未就绪状态。
+
+    ready 表示宿主返回了一组采样位置，不保证每帧都有音高；None 必须原样保留。
+    pending/unavailable 只能携带空采样，分别表示等待计算与当前无法读取。未知或
+    矛盾数据整项过滤，不把空值补成零，也不使用此摘要反算参数或修改预览权限。
+    """
+    if (not isinstance(value, dict) or not isinstance(value.get("status"), str)
+            or value["status"] not in {"ready", "pending", "unavailable"}
+            or value.get("unit") != "MIDI" or not isinstance(value.get("samples"), list)):
+        return None
+    status, samples = value["status"], value["samples"]
+    if status != "ready":
+        return {"status": status, "unit": "MIDI", "samples": []} if not samples else None
+    if not 2 <= len(samples) <= MAX_COMPUTED_PITCH_POINTS:
+        return None
+    checked, previous = [], -1.0
+    for point in samples:
+        if (not isinstance(point, list) or len(point) != 2
+                or not finite(point[0], 0, 1) or point[0] <= previous
+                or (point[1] is not None and not finite(point[1], 0, 127))):
+            return None
+        previous = float(point[0])
+        checked.append([previous, None if point[1] is None else float(point[1])])
+    if checked[0][0] != 0 or checked[-1][0] != 1:
+        return None
+    return {"status": status, "unit": "MIDI", "samples": checked}
+
+
 def public_parameter_catalog(selection: dict) -> dict:
-    """仅公开经过目录策略检查的参数字段，私有 fingerprint 不发送给云模型。"""
+    """公开能力目录和有界通道采样，私有 fingerprint 不发送给云模型。"""
     catalog = selection.get("parameters")
     if not isinstance(catalog, dict):
         return {}
     result = {}
+    context_points = 0
     # 参数数量本身也有界，避免损坏桥接把任意庞大对象送往模型上下文。
     if len(catalog) > 128:
         raise ParameterError("宿主参数目录过大，请重新读取选区。")
@@ -246,6 +310,13 @@ def public_parameter_catalog(selection: dict) -> dict:
             public["available"] = definition["available"]
         if definition.get("source") in ("host", "user"):
             public["source"] = definition["source"]
+        if definition.get("kind") in ("automation", "vocalMode"):
+            current = _public_current_values(definition.get("currentValues"))
+            # Python 再执行与桥接一致的总采样预算，避免伪造目录或旧桥接扩张
+            # 单次模型上下文。原生音高不会进入此分支，也不会借用自动化摘要。
+            if current is not None and context_points + len(current["samples"]) <= MAX_SELECTION_CONTEXT_POINTS:
+                public["currentValues"] = current
+                context_points += len(current["samples"])
         result[name] = public
     return result
 

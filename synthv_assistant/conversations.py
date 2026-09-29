@@ -25,7 +25,8 @@ from .operations import BUSY_MESSAGE, OperationBusyError, OperationLock
 from .metadata import LibraryMetadata, MetadataError
 from .model_options import normalize_model_options, validate_for_config
 from .parameters import (ParameterError, public_parameter_catalog, public_preview, validate_action,
-                         normalize_render_mode, selection_preview_notes)
+                         normalize_render_mode, selection_preview_notes, public_computed_pitch)
+from .note_curves import compile_note_curves
 
 
 def _default_platform_id() -> str:
@@ -100,6 +101,11 @@ def _safe_selection(selection: dict) -> dict:
     result["notes"] = [{key: value for key, value in note.items() if key in note_fields}
                        for note in selection["notes"]]
     result["parameters"] = public_parameter_catalog(selection)
+    # 合成线程返回的计算音高只作本次参考资料；读取状态及缺帧显式保留。
+    # 它不参与选区身份/写入守卫，也不成为替代乐谱或重写整段音高的授权。
+    computed_pitch = public_computed_pitch(selection.get("computedPitch"))
+    if computed_pitch is not None:
+        result["computedPitch"] = computed_pitch
     capabilities = selection.get("capabilities")
     if isinstance(capabilities, dict):
         result["capabilities"] = {key: capabilities[key] for key in ("curves", "nativePitch")
@@ -538,6 +544,14 @@ class ConversationManager:
         actions = plan.get("actions", [])
         if not isinstance(actions, list) or len(actions) > 5:
             raise ConversationError("模型提案数量无效。")
+        # 这是规划器在验证模型输出后生成的本地元数据，不是模型可提交的新字段。
+        # 持久层仍逐项重编译并核对公开曲线，避免来源与实际可应用动作发生分离。
+        note_sources = plan.get("noteCurveSources", {})
+        parameters = {item.get("parameter") for item in actions
+                      if isinstance(item, dict) and isinstance(item.get("parameter"), str)}
+        if (not isinstance(note_sources, dict) or set(note_sources) - parameters
+                or (selection is None and note_sources)):
+            raise ConversationError("逐音符包络的来源资料与提案不匹配，无法保存该计划。")
         reply = self._message("assistant", plan["text"])
         for key in ("inputMode", "provider", "model", "platformId", "reasoningEffort"):
             if isinstance(plan.get(key), str) and len(plan[key]) <= 200:
@@ -558,6 +572,13 @@ class ConversationManager:
             if parameter in seen:
                 raise ConversationError("同一提案不能包含重复参数，请将分段变化合并为一条曲线。")
             seen.add(parameter)
+            if parameter in note_sources:
+                try:
+                    compiled = compile_note_curves(parameter, note_sources[parameter], selection)
+                except ParameterError as exc:
+                    raise ConversationError(str(exc)) from None
+                if normalized.get("curve") != compiled:
+                    raise ConversationError("逐音符包络的来源资料与实际曲线不一致，无法保存该计划。")
             action = {"id": uuid.uuid4().hex, **normalized, "status": "proposed"}
             # 展示标签来自捕获时的宿主目录，而非模型任意字段或之后切换的声库。
             definition = selection.get("parameters", {}).get(parameter, {})
@@ -570,6 +591,9 @@ class ConversationManager:
                                      "parameter": _parameter_identity(selection, parameter),
                                      "proposalSelection": _proposal_selection_identity(selection),
                                      "targetScope": _target_scope(selection)}
+            if parameter in note_sources:
+                # 独立拷贝只放私有守卫，公开消息及下一次模型历史不额外携带来源。
+                guards[action["id"]]["noteCurves"] = json.loads(_encoded(note_sources[parameter]))
         return reply, guards
 
     @staticmethod
@@ -660,7 +684,8 @@ class ConversationManager:
         """将用户明确选择的方案复制到当前选区，始终创建新的待预览动作。
 
         此入口既不请求模型，也不读取/上传原消息音频，更不写工程。音高曲线
-        要求音符旋律及相对节奏相符；通用增量包络按当前选区时长缩放。新的
+        要求音符旋律及相对节奏相符；逐音符增量按对应序号重新定位，旧通用
+        增量包络按当前选区时长缩放。新的
         目标基线由当前参数定义，不能携带旧 previewId、结果或确认票据。
         """
         identifier, message_id = _identifier(identifier), _identifier(message_id)
@@ -678,7 +703,7 @@ class ConversationManager:
                 raise ConversationError("单个会话最多 100 条消息，请新建会话。")
             selection, session = self._capture_selection()
             current_scope = _target_scope(selection)
-            normalized, excluded = [], []
+            normalized, excluded, note_sources = [], [], {}
             for action in actions:
                 guard = document["_private"].get("actions", {}).get(action.get("id"))
                 if not isinstance(guard, dict):
@@ -698,6 +723,17 @@ class ConversationManager:
                         raise ConversationError("当前选区与已应用方案的原选区重叠，不能再次复制叠加；请先撤销，再使用原建议的重新预览。")
                 try:
                     proposal = {key: action[key] for key in ("parameter", "delta", "curve", "renderMode", "reason") if key in action}
+                    if "noteCurves" in guard:
+                        # 局部意图必须持续保留：节奏改变后不能把“末音的包络”按
+                        # 全句比例缩放到首音。缺资料或序号歧义时拒绝该项，绝不
+                        # 静默退回旧曲线缩放；旧提案没有此字段时仍走原有流程。
+                        if (not isinstance(original, dict) or not isinstance(original.get("notes"), list)
+                                or len(original["notes"]) != len(selection["notes"])):
+                            raise ConversationError("逐音符方案的原选区资料缺失或音符数量不一致，无法确定对应序号。")
+                        source_curve = compile_note_curves(action["parameter"], guard["noteCurves"], original)
+                        if proposal.get("curve") != source_curve:
+                            raise ConversationError("逐音符方案的来源与原曲线不一致，不能按整段曲线复用。")
+                        proposal["curve"] = compile_note_curves(action["parameter"], guard["noteCurves"], selection)
                     checked = validate_action(proposal, selection)
                     if checked["parameter"] in {"pitchCurve", "pitchDelta"} and "curve" in checked:
                         if original is None:
@@ -710,15 +746,20 @@ class ConversationManager:
                         from .pitch_shapes import validate_note_alignment
                         validate_note_alignment(checked.get("curve"), selection)
                     normalized.append(checked)
+                    if "noteCurves" in guard:
+                        note_sources[checked["parameter"]] = guard["noteCurves"]
                 except (ParameterError, ConversationError) as error:
                     excluded.append(f"{action.get('label') or action['parameter']}：{error}")
             if not normalized:
                 raise ConversationError("没有适用于当前选区的参数。" + "；".join(excluded))
             text = (f"已在本地复用 {len(normalized)} 项参数建议到当前选区，未再次调用模型或发送音频。"
-                    "曲线按当前选区时长缩放，并基于当前参数生成新预览；尚未修改工程，请核对新范围与效果后确认。")
+                    + ("逐音符包络按对应音符重新定位，其余曲线按当前选区时长缩放；" if note_sources else
+                       "曲线按当前选区时长缩放；")
+                    + "基于当前参数生成新预览，尚未修改工程，请核对新范围与效果后确认。")
             if excluded:
                 text += "\n\n未复用的参数：\n" + "\n".join(excluded)
-            reply, guards = self._planned_message({"text": text, "actions": normalized}, selection, session)
+            reply, guards = self._planned_message({"text": text, "actions": normalized,
+                                                  "noteCurveSources": note_sources}, selection, session)
             reply.update(origin="reuse", selection=_safe_selection(selection))
             # 复制建议本身不会删除原消息及应用记录，但必须撤销所有旧预览确认资格。
             # 使用同一 document 实例，避免从磁盘读回旧副本覆盖本次新增消息。

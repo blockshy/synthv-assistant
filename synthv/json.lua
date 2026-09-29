@@ -22,7 +22,9 @@
 -- SOFTWARE.
 --
 
-local json = { _version = "0.1.2" }
+-- 本地兼容扩展：唯一哨兵用于在数组中显式编码 JSON null。Lua 的 nil 会删除
+-- 数组元素，无法表达音高采样中的缺帧；此扩展只影响编码，不改变上游解码语义。
+local json = { _version = "0.1.2", null = {} }
 
 -------------------------------------------------------------------------------
 -- Encode
@@ -122,6 +124,7 @@ local type_func_map = {
 
 
 encode = function(val, stack)
+  if val == json.null then return "null" end
   local t = type(val)
   local f = type_func_map[t]
   if f then

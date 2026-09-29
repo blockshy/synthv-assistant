@@ -156,6 +156,98 @@ local function parameterCatalog(editor,ref,group)
   return catalog,voiceFingerprint,#names
 end
 
+local function sampleParameterContext(catalog,group,ref,axis,first,last,noteCount)
+  -- 模型需要知道当前自动化通道的实际状态，才能在已有调教上提出增量。
+  -- 这里只读取 Automation:get：它不含声线默认设置，也不是合成后的声学测量；
+  -- 原生音高控件不可据此解释为最终音高，所以完全不采样 pitchCurve。
+  if noteCount<1 or noteCount>128 or not finite(first) or not finite(last) or last<=first then return end
+  local ok,startSec,endSec=pcall(function()
+    return axis:getSecondsFromBlick(first),axis:getSecondsFromBlick(last)
+  end)
+  if not ok or not finite(startSec) or not finite(endSec) or endSec<=startSec or endSec-startSec>30 then return end
+  local names={}
+  for name,descriptor in pairs(catalog) do
+    if descriptor.available and (descriptor.kind=="automation" or descriptor.kind=="vocalMode") then
+      names[#names+1]=name
+    end
+  end
+  table.sort(names)
+  if #names==0 then return end
+  -- 最多 33 点/通道、512 点/选区。大量声线模式共用固定预算，不能随目录大小
+  -- 无限扩张模型上下文；最低保留首尾。最低/最高仅指这些有限采样，不代表极值。
+  local steps=math.min(32,math.floor(512/#names)-1)
+  if steps<1 then return end
+  for _,name in ipairs(names) do
+    local readable,summary=pcall(function()
+      local curve=group:getParameter(name)
+      local offset=ref:getTimeOffset()
+      if not finite(offset) then error("音符组时间偏移无效。") end
+      local samples,minimum,maximum={},math.huge,-math.huge
+      for index=0,steps do
+        local ratio=index/steps
+        local seconds=startSec+(endSec-startSec)*ratio
+        -- 时间比例按真实秒数建立，经过速度图转回组内 blick 后才读取通道。
+        -- 首尾采用原始边界，避免往返浮点误差读到选区之外。
+        local position=index==0 and first-offset or (index==steps and last-offset
+          or axis:getBlickFromSeconds(seconds)-offset)
+        if not finite(position) then error("参数采样的时间坐标无效。") end
+        local value=curve:get(position)
+        if not finite(value) or math.abs(value)>1000000000 then error("参数采样值无效。") end
+        samples[#samples+1]={ratio,value}
+        minimum=math.min(minimum,value); maximum=math.max(maximum,value)
+      end
+      return {samples=samples,minimum=minimum,maximum=maximum}
+    end)
+    -- 读取中任一点失败即省略整项摘要，不能用零值、部分曲线或异常文本代替。
+    -- 能力目录和原有编辑指纹保持原样，摘要不会增加写权限或改变工程状态。
+    if readable then catalog[name].currentValues=summary end
+  end
+end
+
+local function sampleComputedPitch(ref,axis,first,last,noteCount)
+  -- 官方 getComputedPitchForGroup 接收当前 NoteGroupReference 与工程绝对 blick。
+  -- 返回的是宿主已计算音高；它和乐谱 MIDI、PitchControlCurve 控制值以及
+  -- Automation 音高偏移各有不同含义，不能混算或据此自动反推、覆盖旧调教。
+  local unavailable={status="unavailable",unit="MIDI",samples={}}
+  if noteCount<1 or noteCount>128 or not finite(first) or not finite(last) or last<=first then return unavailable end
+  local readable,result=pcall(function()
+    local startSec,endSec=axis:getSecondsFromBlick(first),axis:getSecondsFromBlick(last)
+    if not finite(startSec) or not finite(endSec) or endSec<=startSec or endSec-startSec>30
+        or type(SV.getComputedPitchForGroup)~="function" then return unavailable end
+    -- 不超过 97 帧；极短区间减少帧数，避免相邻位置小于一个 blick。
+    -- 官方接口按 blick 等距，公开位置则逐点通过速度图换为真实秒比例。
+    local frames=math.min(97,math.floor(last-first)+1)
+    if frames<2 then return unavailable end
+    local interval=(last-first)/(frames-1)
+    local values=SV:getComputedPitchForGroup(ref,first,interval,frames)
+    if type(values)~="table" or values==json.null then return unavailable end
+    -- 空数组表示尚未完成计算。只报告状态，绝不循环等待或阻塞宿主脚本线程。
+    if next(values)==nil then return {status="pending",unit="MIDI",samples={}} end
+    -- Lua 数组遇 nil 帧会形成空洞，#values 和 ipairs 都不能给出可靠长度。
+    -- 先核对所有已返回键，再按本次请求的帧数逐一索引，保留中间及末尾缺帧。
+    local returned=0
+    for index,value in pairs(values) do
+      returned=returned+1
+      if returned>frames or not finite(index) or index%1~=0 or index<1 or index>frames
+          or (value~=json.null and (not finite(value) or value<0 or value>127)) then return unavailable end
+    end
+    local samples,previous={},-1
+    for index=1,frames do
+      local blick=first+(index-1)*interval
+      local seconds=axis:getSecondsFromBlick(blick)
+      local position=index==1 and 0 or (index==frames and 1 or (seconds-startSec)/(endSec-startSec))
+      if not finite(seconds) or not finite(position) or position<0 or position>1 or position<=previous then return unavailable end
+      local value=values[index]
+      -- nil 是缺帧而非零音高。显式哨兵保证 JSON 二元数组不会被缩短或错位。
+      samples[#samples+1]={position,value==nil and json.null or value}
+      previous=position
+    end
+    return {status="ready",unit="MIDI",samples=samples}
+  end)
+  -- API 缺失、异常类型和读取错误都不回显底层内容；不能把出错误报成等待计算。
+  return readable and result or unavailable
+end
+
 local function selection()
   local editor,ref,group,axis=current()
   local notes, first, last = {}, nil, nil
@@ -171,6 +263,8 @@ local function selection()
       durationSeconds=axis:getSecondsFromBlick(finish)-axis:getSecondsFromBlick(onset)}
   end
   local curves,voiceFingerprint,modeCount=parameterCatalog(editor,ref,group)
+  sampleParameterContext(curves,group,ref,axis,first,last,#notes)
+  local computedPitch=sampleComputedPitch(ref,axis,first,last,#notes)
   local pitchWarning=nil
   if curves.pitchCurve and curves.pitchCurve.available and first and last then
     -- begin/finish 必须换回音符组坐标；目录与预览采用相同的完整依赖读取检查。
@@ -193,7 +287,7 @@ local function selection()
   return {projectFile=projectName(),groupName=group:getName(),groupUUID=group:getUUID(),
     groupOffset=ref:getTimeOffset(),groupPitchOffset=pitchOffset,notes=notes,noteCount=#notes,voiceFingerprint=voiceFingerprint,
     startSeconds=first and axis:getSecondsFromBlick(first) or nil,
-    endSeconds=last and axis:getSecondsFromBlick(last) or nil,parameters=curves,
+    endSeconds=last and axis:getSecondsFromBlick(last) or nil,parameters=curves,computedPitch=computedPitch,
     capabilities={curves=true,nativePitch=curves.pitchCurve~=nil and curves.pitchCurve.available,batchPreview=true},
     capabilityWarnings=warnings}
 end
