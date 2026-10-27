@@ -1,0 +1,25 @@
+name: synthv_desktop
+description: "面向 Synthesizer V Studio 2 Pro 的原生 Windows 调教工作台。"
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.13.5
+
+dependencies:
+  audioplayers: 6.8.1
+  file_selector: 1.1.0
+  flutter:
+    sdk: flutter
+  flutter_markdown_plus: ^1.0.12
+  shared_preferences: ^2.5.6
+  screen_retriever: 0.2.2
+  window_manager: 0.5.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

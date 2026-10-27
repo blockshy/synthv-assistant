@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", choices=("127.0.0.1", "localhost"), default="127.0.0.1", help="仅允许本机回环地址")
     serve.add_argument("--port", type=_port, default=8765, help="本机控制台端口，默认 8765")
     commands.add_parser("mcp", help="以 stdio 方式提供 MCP 工具，stdout 仅包含协议消息")
+    commands.add_parser("desktop", help="供 Flutter 启动器管理的私有本机 API；stdout 输出握手，stdin 控制生存期")
     script = commands.add_parser("build-script", help="生成单文件 Lua 桥接，不自动安装到 SynthV")
     script.add_argument("--output", type=Path, help="可选的生成文件位置；默认 data/install/SynthVAssistant.lua")
     commands.add_parser("build-capture", help="使用本机 .NET SDK 构建 Windows 进程音频采集器")
@@ -40,7 +41,11 @@ def main(argv: list[str] | None = None) -> int:
     """按子命令延迟导入依赖；缺少 MCP 依赖不会影响脚本生成等离线操作。"""
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "mcp":
+        if args.command == "desktop":
+            # 桌面入口必须先设置用户数据目录，再导入持有路径常量的业务模块。
+            from .desktop_runtime import run_desktop
+            run_desktop()
+        elif args.command == "mcp":
             from .mcp_server import run_mcp
             run_mcp()
         elif args.command == "build-script":

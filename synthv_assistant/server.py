@@ -27,13 +27,21 @@ def _unique_json_object(pairs):
     return result
 
 
-def make_server(port: int = 8765, service: AssistantService | None = None) -> ThreadingHTTPServer:
+def make_server(port: int = 8765, service: AssistantService | None = None, *, desktop_runtime=None) -> ThreadingHTTPServer:
+    """创建网页或桌面 API 服务；桌面随机端口必须按实际绑定结果校验 Host。"""
     service = service or AssistantService()
     token = secrets.token_urlsafe(32)
     hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     origins = {"http://" + host for host in hosts}
 
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            if desktop_runtime is not None:
+                # 桌面父进程离开后的收尾不能被未完成的 HTTP 请求永久拖住。
+                # 这是请求头/请求体的本地读取预算，不限制后台模型任务的寿命。
+                self.connection.settimeout(30)
+
         def log_message(self, *_args):
             """安静运行；stdout 可供 CLI 展示必要诊断，不输出请求参数。"""
 
@@ -93,7 +101,46 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
             except Exception:
                 return self.response_json({"error": "工作台操作未完成，请检查本机服务状态后重试。"}, 500)
 
+        def _desktop_request(self, dispatch):
+            """桌面路由统一认证及生命周期登记，避免漏保护音频或只读工程接口。"""
+            if desktop_runtime is None:
+                return dispatch()
+            if not self.allowed_request() or not self.allowed_token():
+                return
+            path = urlsplit(self.path).path
+            if path == "/api/bootstrap":
+                # 令牌只能由父进程握手取得，不向能访问本机端口的任意网页公开。
+                return self.response_json({"error": "桌面服务不提供网页引导接口。"}, 404)
+            if path == "/api/desktop/status" and self.command == "GET":
+                return self.response_json(desktop_runtime.status())
+            if path == "/api/desktop/shutdown" and self.command == "POST":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if self.headers.get("Transfer-Encoding") or not 0 < length <= 64:
+                        raise ValueError
+                    body = json.loads(self.rfile.read(length), object_pairs_hook=_unique_json_object)
+                    if body != {}:
+                        raise ValueError
+                except (ValueError, OSError):
+                    return self.response_json({"error": "退出请求只接受空 JSON 对象。"}, 400)
+                accepted, state = desktop_runtime.request_shutdown()
+                return self.response_json(state, 200 if accepted else 409)
+            if not (path.startswith("/api/") or path.startswith("/audio/") or path.startswith("/uploads/")):
+                return self.response_json({"error": "桌面后台仅提供本机 API。"}, 404)
+            if not desktop_runtime.begin_request():
+                return self.response_json({"error": "桌面后台正在退出，请稍后重新打开应用。"}, 503)
+            try:
+                return dispatch()
+            finally:
+                desktop_runtime.end_request()
+
         def do_GET(self):
+            return self._desktop_request(self._do_GET)
+
+        def do_POST(self):
+            return self._desktop_request(self._do_POST)
+
+        def _do_GET(self):
             if not self.allowed_request():
                 return
             path = urlsplit(self.path).path
@@ -153,6 +200,8 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
                 elif path.startswith("/uploads/") and path.endswith(".wav"):
                     file, data = service.read_audio("upload", path[9:-4])
                 else:
+                    if desktop_runtime is not None:
+                        return self.response_json({"error": "接口不存在。"}, 404)
                     # 静态资源使用显式白名单；共享 UI 模块和页面脚本遵循同源 CSP，不开放任意文件读取。
                     name = {"/": "index.html", "/index.html": "index.html", "/ui.js": "ui.js", "/curves.js": "curves.js", "/app.js": "app.js", "/chat.js": "chat.js", "/models.js": "models.js", "/layout.js": "layout.js", "/pages.js": "pages.js", "/style.css": "style.css"}.get(path)
                     if not name:
@@ -187,7 +236,7 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
             except (ValueError, RuntimeError) as error:
                 self.response_json({"error": str(error)}, 400)
 
-        def do_POST(self):
+        def _do_POST(self):
             if not self.allowed_request():
                 return
             if not self.allowed_token():
@@ -317,4 +366,17 @@ def make_server(port: int = 8765, service: AssistantService | None = None) -> Th
             except (ValueError, RuntimeError, OSError, TypeError) as error:
                 self.response_json({"error": str(error)}, 400)
 
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    if port == 0:
+        # 绑定之前无法预知随机端口；闭包集合就地更新，所有后续请求都会检查
+        # 操作系统实际分配的端口，不接受 :0 或其他本机服务的 Host/Origin。
+        hosts.clear()
+        hosts.update({f"127.0.0.1:{server.server_port}", f"localhost:{server.server_port}"})
+        origins.clear()
+        origins.update({"http://" + host for host in hosts})
+    if desktop_runtime is not None:
+        server.desktop_token = token
+        # 标准 ThreadingHTTPServer 默认使用守护请求线程；桌面关闭必须等待
+        # 最后一次 shutdown 响应发送完，不能让主进程先退出而丢失成功回执。
+        server.daemon_threads = False
+    return server

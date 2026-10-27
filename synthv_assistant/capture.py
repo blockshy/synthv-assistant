@@ -17,8 +17,10 @@ from typing import Any
 import uuid
 import wave
 
+from .config import ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+PROJECT_ROOT = ROOT
 NATIVE_PROJECT = PROJECT_ROOT / "native" / "ProcessAudioCapture" / "ProcessAudioCapture.csproj"
 
 
@@ -34,6 +36,8 @@ def _creation_flags() -> int:
 def find_capture_executable() -> Path:
     """定位已构建的本地采集器，找不到时给出可执行的构建指引。"""
     candidates = (
+        # Windows 安装包随附自包含采集器，不要求终端用户安装 .NET SDK。
+        PROJECT_ROOT / "native" / "ProcessAudioCapture" / "ProcessAudioCapture.exe",
         NATIVE_PROJECT.parent / "bin" / "Release" / "net10.0-windows" / "ProcessAudioCapture.exe",
         NATIVE_PROJECT.parent / "bin" / "Release" / "net10.0-windows" / "win-x64" / "publish" / "ProcessAudioCapture.exe",
     )
