@@ -5,11 +5,13 @@ import 'package:flutter/material.dart';
 
 import '../core/api.dart';
 import '../widgets/curve_preview.dart';
+import 'page_chrome.dart';
 
 /// 工程检查器只在用户点击读取时取得选区。状态轮询不读取完整工程、模型配置或音频。
 class Inspector extends StatefulWidget {
-  const Inspector({super.key, required this.api});
+  const Inspector({super.key, required this.api, this.onConnection});
   final WorkbenchApi api;
+  final VoidCallback? onConnection;
   @override
   State<Inspector> createState() => _InspectorState();
 }
@@ -18,7 +20,7 @@ class _InspectorState extends State<Inspector> {
   JsonMap _status = {}, _selection = {}, _preview = {};
   String? _parameter, _message;
   String _renderMode = 'smooth';
-  bool _curve = false, _error = false;
+  bool _curve = false, _error = false, _refreshing = false;
   int _previewEpoch = -1;
   Timer? _timer;
   final _delta = TextEditingController(text: '0.05');
@@ -104,19 +106,38 @@ class _InspectorState extends State<Inspector> {
   }
 
   Future<void> _refreshStatus() async {
+    // 请求未结束时不追加轮询，避免离线/退出阶段累计大量等待中的请求。
+    if (_refreshing || !mounted) return;
+    _refreshing = true;
     try {
       final status = Map<String, dynamic>.from(
         await widget.api.getJson('/api/status') as Map,
       );
       if (!mounted) return;
-      if (_connected && (status['bridge'] as Map?)?['connected'] != true) {
+      final oldBridge = _status['bridge'] as Map? ?? {};
+      final newBridge = status['bridge'] as Map? ?? {};
+      final targetChanged =
+          oldBridge.isNotEmpty &&
+          (oldBridge['session'] != newBridge['session'] ||
+              oldBridge['ipcDirectory'] != newBridge['ipcDirectory']);
+      if (targetChanged || _connected && newBridge['connected'] != true) {
         widget.api.invalidatePreviews();
+        _selection = {};
+        _preview = {};
+        _parameter = null;
       }
       setState(() => _status = status);
     } catch (_) {
       if (!mounted) return;
       if (_connected) widget.api.invalidatePreviews();
-      setState(() => _status = {});
+      setState(() {
+        _status = {};
+        _selection = {};
+        _preview = {};
+        _parameter = null;
+      });
+    } finally {
+      _refreshing = false;
     }
   }
 
@@ -386,27 +407,19 @@ class _InspectorState extends State<Inspector> {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 8, 12),
-            child: Row(
-              children: [
-                const Icon(Icons.tune, size: 18),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text('工程检查器', style: theme.textTheme.titleSmall),
-                ),
-                IconButton(
-                  tooltip: '刷新桥接状态',
-                  onPressed: busy ? null : _refreshStatus,
-                  icon: const Icon(Icons.refresh, size: 18),
-                ),
-              ],
-            ),
+          PageToolbar(
+            title: '工程检查器',
+            actions: [
+              IconButton(
+                tooltip: '刷新桥接状态',
+                onPressed: busy ? null : _refreshStatus,
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+            ],
           ),
-          const Divider(height: 1),
           Expanded(
             child: ListView(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(12),
               children: [
                 Row(
                   children: [
@@ -414,7 +427,7 @@ class _InspectorState extends State<Inspector> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        _connected ? 'SynthV 已连接' : '等待 SynthV 桥接',
+                        _connected ? 'SynthV 已连接' : 'SynthV 未连接',
                         style: theme.textTheme.bodyMedium,
                       ),
                     ),
@@ -422,9 +435,10 @@ class _InspectorState extends State<Inspector> {
                 ),
                 const SizedBox(height: 8),
                 if (!_connected)
-                  Text(
-                    '在 SynthV 脚本菜单启动 SynthV Assistant 后，再读取选区。',
-                    style: theme.textTheme.bodySmall,
+                  OutlinedButton.icon(
+                    onPressed: widget.onConnection,
+                    icon: const Icon(Icons.cable_outlined, size: 16),
+                    label: const Text('诊断与修复连接'),
                   ),
                 SwitchListTile.adaptive(
                   contentPadding: EdgeInsets.zero,
@@ -447,224 +461,242 @@ class _InspectorState extends State<Inspector> {
                     ),
                   ),
                 const SizedBox(height: 18),
-                Text('参数编辑', style: theme.textTheme.titleSmall),
-                const SizedBox(height: 10),
-                DropdownButtonFormField<String>(
-                  key: ValueKey('parameter:$selected'),
-                  initialValue: selected,
-                  isExpanded: true,
-                  decoration: const InputDecoration(labelText: '参数 / 声线'),
-                  items: [
-                    for (final entry in catalog.entries)
-                      DropdownMenuItem(
-                        value: entry.key,
-                        child: Text(
-                          '${entry.value['label'] ?? entry.key}',
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                  ],
-                  onChanged: busy
-                      ? null
-                      : (value) {
-                          _invalidate();
-                          setState(() {
-                            _parameter = value;
-                            _resetDraft();
-                          });
-                        },
-                ),
-                if (selected != null) ...[
-                  const SizedBox(height: 10),
+                if (!validSelection)
                   Text(
-                    _nativePitch
-                        ? '绝对 MIDI · ${curveNumber(_bounds[0])}–${curveNumber(_bounds[1])}'
-                        : '增量范围 ±${curveNumber(_bounds[1])} ${_definition['unit'] ?? ''}',
+                    _connected ? '读取选区后显示可编辑参数。' : '连接后可读取选区和声库参数。',
                     style: theme.textTheme.bodySmall,
                   ),
+                if (validSelection) ...[
+                  Text('参数编辑', style: theme.textTheme.titleSmall),
                   const SizedBox(height: 10),
-                  if (_supportsCurves) ...[
-                    DropdownButtonFormField<String>(
-                      key: ValueKey('input:$_parameter:$_curve'),
-                      initialValue: _nativePitch
-                          ? 'curve'
-                          : _curve
-                          ? 'curve'
-                          : 'delta',
-                      decoration: const InputDecoration(labelText: '输入方式'),
-                      items: [
-                        if (!_nativePitch)
-                          const DropdownMenuItem(
-                            value: 'delta',
-                            child: Text('整体增量'),
-                          ),
-                        const DropdownMenuItem(
-                          value: 'curve',
-                          child: Text('绘制曲线'),
-                        ),
-                      ],
-                      onChanged: busy || _nativePitch
-                          ? null
-                          : (value) {
-                              _invalidate();
-                              setState(() => _curve = value == 'curve');
-                            },
-                    ),
-                    const SizedBox(height: 10),
-                    DropdownButtonFormField<String>(
-                      key: ValueKey('render:$_parameter:$_renderMode'),
-                      initialValue: _renderMode,
-                      decoration: const InputDecoration(labelText: '宿主表示方式'),
-                      items: const [
+                  DropdownButtonFormField<String>(
+                    key: ValueKey('parameter:$selected'),
+                    initialValue: selected,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: '参数 / 声线'),
+                    items: [
+                      for (final entry in catalog.entries)
                         DropdownMenuItem(
-                          value: 'smooth',
-                          child: Text('绘制模式 · 精简曲线'),
+                          value: entry.key,
+                          child: Text(
+                            '${entry.value['label'] ?? entry.key}',
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
-                        DropdownMenuItem(value: 'points', child: Text('控制点模式')),
-                      ],
-                      onChanged: busy || _nativePitch
-                          ? null
-                          : (value) {
-                              _invalidate();
-                              setState(() => _renderMode = value!);
-                            },
-                    ),
-                  ],
-                  const SizedBox(height: 12),
-                  if (_curve || _nativePitch) ...[
-                    if (draft.isNotEmpty)
-                      SizedBox(
-                        height: 145,
-                        child: _DraftPad(
-                          points: draft,
-                          bounds: _bounds,
-                          enabled: !busy,
-                          onChanged: (points) {
+                    ],
+                    onChanged: busy
+                        ? null
+                        : (value) {
                             _invalidate();
-                            setState(
-                              () => _points.text = points
-                                  .map(
-                                    (p) =>
-                                        '${p[0].toStringAsFixed(6)} ${p[1].toStringAsFixed(6)}',
-                                  )
-                                  .join('\n'),
-                            );
+                            setState(() {
+                              _parameter = value;
+                              _resetDraft();
+                            });
                           },
-                        ),
-                      ),
-                    const SizedBox(height: 8),
+                  ),
+                  if (selected != null) ...[
+                    const SizedBox(height: 10),
                     Text(
                       _nativePitch
-                          ? '拖动绘制绝对 MIDI 音高；原生曲线会替换该段生成音高。首尾覆盖选区，手绘自动精简。'
-                          : '拖动绘制增量；首尾保持覆盖选区，手绘自动精简。',
+                          ? '绝对 MIDI · ${curveNumber(_bounds[0])}–${curveNumber(_bounds[1])}'
+                          : '增量范围 ±${curveNumber(_bounds[1])} ${_definition['unit'] ?? ''}',
                       style: theme.textTheme.bodySmall,
                     ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _points,
-                      enabled: !busy,
-                      minLines: 3,
-                      maxLines: 7,
-                      style: const TextStyle(
-                        fontFamily: 'Consolas',
-                        fontSize: 11,
+                    const SizedBox(height: 10),
+                    if (_supportsCurves) ...[
+                      DropdownButtonFormField<String>(
+                        key: ValueKey('input:$_parameter:$_curve'),
+                        initialValue: _nativePitch
+                            ? 'curve'
+                            : _curve
+                            ? 'curve'
+                            : 'delta',
+                        decoration: const InputDecoration(labelText: '输入方式'),
+                        items: [
+                          if (!_nativePitch)
+                            const DropdownMenuItem(
+                              value: 'delta',
+                              child: Text('整体增量'),
+                            ),
+                          const DropdownMenuItem(
+                            value: 'curve',
+                            child: Text('绘制曲线'),
+                          ),
+                        ],
+                        onChanged: busy || _nativePitch
+                            ? null
+                            : (value) {
+                                _invalidate();
+                                setState(() => _curve = value == 'curve');
+                              },
                       ),
-                      decoration: const InputDecoration(
-                        labelText: '曲线节点 · 每行 位置 数值',
-                        alignLabelWithHint: true,
-                      ),
-                      onChanged: (_) => _invalidate(),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '${draft.length} / 64 个草稿点',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                  ] else
-                    TextField(
-                      controller: _delta,
-                      enabled: !busy,
-                      decoration: const InputDecoration(labelText: '调整增量'),
-                      onChanged: (_) => _invalidate(),
-                    ),
-                  const SizedBox(height: 12),
-                  FilledButton.icon(
-                    onPressed: busy || !_connected || !validSelection
-                        ? null
-                        : _previewChange,
-                    icon: const Icon(Icons.visibility_outlined, size: 16),
-                    label: const Text('生成宿主预览'),
-                  ),
-                ],
-                if (_supportsCurves) ...[
-                  const SizedBox(height: 12),
-                  ExpansionTile(
-                    tilePadding: EdgeInsets.zero,
-                    title: const Text(
-                      '补充声库专属参数',
-                      style: TextStyle(fontSize: 12),
-                    ),
-                    children: [
-                      TextField(
-                        controller: _modeName,
-                        enabled: !busy,
-                        decoration: const InputDecoration(
-                          labelText: '声线面板原名，如 Airy',
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        '请核对当前声库面板，补充目录不会修改工程。',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: TextButton(
-                          onPressed: busy ? null : _addMode,
-                          child: const Text('补充参数'),
-                        ),
+                      const SizedBox(height: 10),
+                      DropdownButtonFormField<String>(
+                        key: ValueKey('render:$_parameter:$_renderMode'),
+                        initialValue: _renderMode,
+                        decoration: const InputDecoration(labelText: '宿主表示方式'),
+                        items: const [
+                          DropdownMenuItem(
+                            value: 'smooth',
+                            child: Text('绘制模式 · 精简曲线'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'points',
+                            child: Text('控制点模式'),
+                          ),
+                        ],
+                        onChanged: busy || _nativePitch
+                            ? null
+                            : (value) {
+                                _invalidate();
+                                setState(() => _renderMode = value!);
+                              },
                       ),
                     ],
-                  ),
-                ],
-                if (_preview.isNotEmpty) ...[
-                  const Divider(height: 28),
-                  Text('宿主实际预览', style: theme.textTheme.titleSmall),
-                  const SizedBox(height: 10),
-                  CurvePreview(previews: [_preview]),
-                  const SizedBox(height: 8),
-                  Text(
-                    '原有 ${_preview['beforePointCount'] ?? '—'} 点 → ${_preview['pointCount'] ?? '—'} 点，精简 ${_preview['pointReduction'] ?? '—'} 点',
-                    style: theme.textTheme.bodySmall,
-                  ),
-                  if (_preview['capabilityWarnings'] is List)
-                    for (final warning
-                        in (_preview['capabilityWarnings'] as List)
-                            .whereType<String>())
-                      Padding(
-                        padding: const EdgeInsets.only(top: 6),
-                        child: Text(warning, style: theme.textTheme.bodySmall),
+                    const SizedBox(height: 12),
+                    if (_curve || _nativePitch) ...[
+                      if (draft.isNotEmpty)
+                        SizedBox(
+                          height: 145,
+                          child: _DraftPad(
+                            points: draft,
+                            bounds: _bounds,
+                            enabled: !busy,
+                            onChanged: (points) {
+                              _invalidate();
+                              setState(
+                                () => _points.text = points
+                                    .map(
+                                      (p) =>
+                                          '${p[0].toStringAsFixed(6)} ${p[1].toStringAsFixed(6)}',
+                                    )
+                                    .join('\n'),
+                              );
+                            },
+                          ),
+                        ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _nativePitch
+                            ? '拖动绘制绝对 MIDI 音高；原生曲线会替换该段生成音高。首尾覆盖选区，手绘自动精简。'
+                            : '拖动绘制增量；首尾保持覆盖选区，手绘自动精简。',
+                        style: theme.textTheme.bodySmall,
                       ),
-                  const SizedBox(height: 10),
-                  FilledButton.icon(
-                    onPressed:
-                        busy ||
-                            !_writeEnabled ||
-                            _previewEpoch != widget.api.previewEpoch
+                      const SizedBox(height: 8),
+                      ExpansionTile(
+                        key: ValueKey('nodes:$_parameter'),
+                        tilePadding: EdgeInsets.zero,
+                        title: Text(
+                          '精确节点 · ${draft.length} / 64',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                        children: [
+                          TextField(
+                            controller: _points,
+                            enabled: !busy,
+                            minLines: 3,
+                            maxLines: 7,
+                            style: const TextStyle(
+                              fontFamily: 'Consolas',
+                              fontSize: 11,
+                            ),
+                            decoration: const InputDecoration(
+                              labelText: '曲线节点 · 每行 位置 数值',
+                              alignLabelWithHint: true,
+                            ),
+                            onChanged: (_) => _invalidate(),
+                          ),
+                        ],
+                      ),
+                    ] else
+                      TextField(
+                        controller: _delta,
+                        enabled: !busy,
+                        decoration: const InputDecoration(labelText: '调整增量'),
+                        onChanged: (_) => _invalidate(),
+                      ),
+                    const SizedBox(height: 12),
+                    FilledButton.icon(
+                      onPressed: busy || !_connected || !validSelection
+                          ? null
+                          : _previewChange,
+                      icon: const Icon(Icons.visibility_outlined, size: 16),
+                      label: const Text('生成宿主预览'),
+                    ),
+                  ],
+                  if (_supportsCurves) ...[
+                    const SizedBox(height: 12),
+                    ExpansionTile(
+                      tilePadding: EdgeInsets.zero,
+                      title: const Text(
+                        '补充声库专属参数',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                      children: [
+                        TextField(
+                          controller: _modeName,
+                          enabled: !busy,
+                          decoration: const InputDecoration(
+                            labelText: '声线面板原名，如 Airy',
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          '请核对当前声库面板，补充目录不会修改工程。',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton(
+                            onPressed: busy ? null : _addMode,
+                            child: const Text('补充参数'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  if (_preview.isNotEmpty) ...[
+                    const Divider(height: 28),
+                    Text('宿主实际预览', style: theme.textTheme.titleSmall),
+                    const SizedBox(height: 10),
+                    CurvePreview(previews: [_preview]),
+                    const SizedBox(height: 8),
+                    Text(
+                      '原有 ${_preview['beforePointCount'] ?? '—'} 点 → ${_preview['pointCount'] ?? '—'} 点，精简 ${_preview['pointReduction'] ?? '—'} 点',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                    if (_preview['capabilityWarnings'] is List)
+                      for (final warning
+                          in (_preview['capabilityWarnings'] as List)
+                              .whereType<String>())
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            warning,
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        ),
+                    const SizedBox(height: 10),
+                    FilledButton.icon(
+                      onPressed:
+                          busy ||
+                              !_writeEnabled ||
+                              _previewEpoch != widget.api.previewEpoch
+                          ? null
+                          : _applyChange,
+                      icon: const Icon(Icons.check, size: 16),
+                      label: const Text('确认应用此预览'),
+                    ),
+                  ],
+                  const SizedBox(height: 16),
+                  OutlinedButton.icon(
+                    onPressed: busy || !_connected || !_writeEnabled
                         ? null
-                        : _applyChange,
-                    icon: const Icon(Icons.check, size: 16),
-                    label: const Text('确认应用此预览'),
+                        : _restore,
+                    icon: const Icon(Icons.undo, size: 16),
+                    label: const Text('恢复最近一次修改'),
                   ),
                 ],
-                const SizedBox(height: 16),
-                OutlinedButton.icon(
-                  onPressed: busy || !_connected || !_writeEnabled
-                      ? null
-                      : _restore,
-                  icon: const Icon(Icons.undo, size: 16),
-                  label: const Text('恢复最近一次修改'),
-                ),
                 if (_message != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 14),

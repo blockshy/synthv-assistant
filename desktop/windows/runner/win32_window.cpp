@@ -150,7 +150,10 @@ bool Win32Window::Create(const std::wstring& title,
 }
 
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
+  // Flutter 首帧回调晚于 Dart 侧的显示与最大化配置。这里只显示窗口并保留
+  // 当前状态；SW_SHOWNORMAL 会把已经最大化的工作台恢复到初始尺寸，导致
+  // 高 DPI 或较矮屏幕上的标题栏、底部操作区移出可见工作区。
+  return ShowWindow(window_handle_, SW_SHOW);
 }
 
 // static

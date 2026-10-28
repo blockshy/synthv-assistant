@@ -8,7 +8,7 @@
 
 1. 解压完整发行包，保留 `synthv_desktop.exe` 同目录的资源、DLL 和 `backend` 等运行文件。
 2. 双击 `synthv_desktop.exe`。客户端会启动自己的本机后台，无需另外安装 Python 或 .NET 运行时，也不用先启动旧网页服务。
-3. 按 [首次连接 SynthV](../docs/desktop-workbench.md#首次连接-synthv) 完成桥接准备；纯文字咨询和素材管理不要求先开启工程修改权限。
+3. 打开“连接管理”检查脚本和目录；已有脚本在线时可直接连接，缺少脚本时可备份并安装。具体步骤见 [首次连接 SynthV](../docs/desktop-workbench.md#首次连接-synthv)；纯文字咨询和素材管理不要求先开启工程修改权限。
 4. 在“模型设置”中保存平台、模型、地址和 API 密钥。保存不会调用模型；新会话默认平台需显式选择。
 
 发行包默认使用 `%LOCALAPPDATA%\SynthV Assistant\data` 保存会话、素材及加密设置。源码开发默认沿用仓库 `data/`；可通过 `SYNTHV_ASSISTANT_DATA` 指定同一个已有目录。切换目录不会自动搬运数据，桥接也必须重新绑定对应目录。

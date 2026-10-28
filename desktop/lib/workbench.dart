@@ -11,6 +11,7 @@ import 'core/api.dart';
 import 'core/workbench_model.dart';
 import 'main.dart' show DesktopTitleBar;
 import 'pages/inspector.dart';
+import 'pages/connection_page.dart';
 import 'pages/library_page.dart';
 import 'pages/recording_page.dart';
 import 'pages/settings_page.dart';
@@ -49,6 +50,13 @@ class _WorkbenchState extends State<Workbench> {
   Timer? _statusTimer, _capabilityTimer, _saveTimer;
   bool _loadingStatus = false;
   int _libraryGeneration = 0;
+  int _bridgeGeneration = 0;
+
+  /// 显式切换连接后立即销毁旧检查器草稿，不等待下一次心跳轮询才失效。
+  Future<void> _connectionChanged() async {
+    if (mounted) setState(() => _bridgeGeneration++);
+    await model.refreshStatus();
+  }
 
   @override
   void initState() {
@@ -126,6 +134,11 @@ class _WorkbenchState extends State<Workbench> {
       page = target;
       if (target == 1) _libraryGeneration++;
     });
+  }
+
+  void _openConnection() {
+    _scaffoldKey.currentState?.closeEndDrawer();
+    _navigate(5);
   }
 
   void _attach(List<JsonMap> clips) {
@@ -267,6 +280,7 @@ class _WorkbenchState extends State<Workbench> {
       final wide = bounds.maxWidth >= 1160;
       final left = leftVisible && bounds.maxWidth >= 940;
       final right = rightVisible && wide;
+      final rightContext = page == 0 || page == 2;
       final actualLeft = math.min(leftWidth, bounds.maxWidth * .23);
       final actualRight = math.min(rightWidth, bounds.maxWidth * .28);
       return Scaffold(
@@ -274,7 +288,13 @@ class _WorkbenchState extends State<Workbench> {
         drawer: Drawer(width: 260, child: _sidebar()),
         endDrawer: SizedBox(
           width: 340,
-          child: Drawer(child: Inspector(api: widget.api)),
+          child: Drawer(
+            child: Inspector(
+              key: ValueKey(_bridgeGeneration),
+              api: widget.api,
+              onConnection: _openConnection,
+            ),
+          ),
         ),
         body: Column(
           children: [
@@ -316,17 +336,18 @@ class _WorkbenchState extends State<Workbench> {
                       PopupMenuItem(value: ThemeMode.dark, child: Text('深色')),
                     ],
                   ),
-                  IconButton(
-                    tooltip: right ? '收起工程检查器' : '打开工程检查器',
-                    onPressed: () {
-                      if (wide) {
-                        setState(() => rightVisible = !rightVisible);
-                      } else {
-                        _scaffoldKey.currentState?.openEndDrawer();
-                      }
-                    },
-                    icon: const Icon(Icons.tune_rounded),
-                  ),
+                  if (rightContext)
+                    IconButton(
+                      tooltip: right ? '收起工程检查器' : '打开工程检查器',
+                      onPressed: () {
+                        if (wide) {
+                          setState(() => rightVisible = !rightVisible);
+                        } else {
+                          _scaffoldKey.currentState?.openEndDrawer();
+                        }
+                      },
+                      icon: const Icon(Icons.tune_rounded),
+                    ),
                   const SizedBox(width: 12),
                 ],
               ),
@@ -355,29 +376,45 @@ class _WorkbenchState extends State<Workbench> {
                       },
                     ),
                   Expanded(child: ClipRect(child: _page())),
+                  // 属性面板仅在工程相关页面占用宽度；隐藏时保留已读选区与草稿。
                   if (right)
-                    _ResizeHandle(
-                      label: '调整检查器宽度',
-                      onDelta: (delta) {
-                        setState(
-                          () =>
-                              rightWidth = (rightWidth - delta).clamp(260, 430),
-                        );
-                        _saveLayout();
-                      },
-                      onReset: () {
-                        setState(() => rightWidth = 302);
-                        _saveLayout();
-                      },
-                    ),
-                  if (right)
-                    SizedBox(
-                      width: actualRight,
-                      child: Inspector(api: widget.api),
+                    Visibility(
+                      visible: rightContext,
+                      maintainState: true,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _ResizeHandle(
+                            label: '调整检查器宽度',
+                            onDelta: (delta) {
+                              setState(
+                                () => rightWidth = (rightWidth - delta).clamp(
+                                  260,
+                                  430,
+                                ),
+                              );
+                              _saveLayout();
+                            },
+                            onReset: () {
+                              setState(() => rightWidth = 302);
+                              _saveLayout();
+                            },
+                          ),
+                          SizedBox(
+                            width: actualRight,
+                            child: Inspector(
+                              key: ValueKey(_bridgeGeneration),
+                              api: widget.api,
+                              onConnection: _openConnection,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                 ],
               ),
             ),
+            _statusBar(),
           ],
         ),
       );
@@ -399,7 +436,7 @@ class _WorkbenchState extends State<Workbench> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.all(14),
+            padding: const EdgeInsets.all(10),
             child: OutlinedButton.icon(
               onPressed:
                   widget.api.busy ||
@@ -419,8 +456,9 @@ class _WorkbenchState extends State<Workbench> {
           _nav(0, Icons.chat_bubble_outline_rounded, '当前会话'),
           _nav(1, Icons.audio_file_outlined, '音频素材'),
           _nav(2, Icons.mic_none_rounded, '录音与听评'),
+          _nav(5, Icons.cable_outlined, '连接管理'),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 24, 12, 10),
+            padding: const EdgeInsets.fromLTRB(14, 12, 8, 4),
             child: Row(
               children: [
                 Text(
@@ -471,7 +509,7 @@ class _WorkbenchState extends State<Workbench> {
                 ? Padding(
                     padding: const EdgeInsets.all(20),
                     child: Text(
-                      search.isEmpty ? '从一句调教想法开始' : '没有匹配的会话',
+                      search.isEmpty ? '暂无会话' : '没有匹配的会话',
                       style: TextStyle(
                         fontSize: 12,
                         color: colors.onSurfaceVariant,
@@ -489,10 +527,10 @@ class _WorkbenchState extends State<Workbench> {
                           color: page == 0 && model.conversationId == item['id']
                               ? colors.surfaceContainerHighest
                               : Colors.transparent,
-                          borderRadius: BorderRadius.circular(8),
+                          borderRadius: BorderRadius.circular(3),
                           child: ListTile(
                             dense: true,
-                            minTileHeight: 42,
+                            minTileHeight: 34,
                             contentPadding: const EdgeInsets.symmetric(
                               horizontal: 10,
                             ),
@@ -534,33 +572,64 @@ class _WorkbenchState extends State<Workbench> {
           const SizedBox(height: 8),
           _nav(3, Icons.delete_outline_rounded, '回收站'),
           _nav(4, Icons.settings_outlined, '设置'),
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                Icon(
-                  model.status['bridge']?['connected'] == true
-                      ? Icons.link_rounded
-                      : Icons.link_off_rounded,
-                  size: 15,
-                  color: colors.onSurfaceVariant,
-                ),
-                const SizedBox(width: 7),
-                Expanded(
-                  child: Text(
-                    model.status['bridge']?['connected'] == true
-                        ? 'SynthV 已连接'
-                        : '等待 SynthV 桥接',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: colors.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
+          const SizedBox(height: 8),
         ],
+      ),
+    );
+  }
+
+  /// 连接与全局工作状态集中到底栏，避免侧栏、会话头和输入区重复提示。
+  /// 状态文字也是诊断入口；未连接时用户不必猜测该去哪个设置页面。
+  Widget _statusBar() {
+    final colors = Theme.of(context).colorScheme;
+    final connected = model.status['bridge']?['connected'] == true;
+    // HTTP 中断后的任务结果未知不等于空闲，底栏与会话恢复入口保持同一语义。
+    final needsCheck = model.submissionUnknown || model.pendingJobId != null;
+    return Container(
+      height: 28,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: colors.surfaceContainerLow,
+        border: Border(top: BorderSide(color: colors.outlineVariant)),
+      ),
+      child: DefaultTextStyle(
+        style: TextStyle(fontSize: 11, color: colors.onSurfaceVariant),
+        child: Row(
+          children: [
+            Tooltip(
+              message: '打开连接管理与诊断',
+              child: InkWell(
+                onTap: () => _navigate(5),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(connected ? Icons.link : Icons.link_off, size: 14),
+                    const SizedBox(width: 6),
+                    Text(connected ? 'SynthV 已连接' : 'SynthV 未连接'),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Text(model.status['writeEnabled'] == true ? '选区可写 · 应用需确认' : '只读'),
+            const Spacer(),
+            if (widget.api.busy) ...[
+              const SizedBox(
+                width: 10,
+                height: 10,
+                child: CircularProgressIndicator(strokeWidth: 1.5),
+              ),
+              const SizedBox(width: 7),
+            ],
+            Text(
+              widget.api.busy
+                  ? '任务执行中'
+                  : needsCheck
+                  ? '任务状态待核对'
+                  : '就绪',
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -571,10 +640,10 @@ class _WorkbenchState extends State<Workbench> {
       color: page == target
           ? Theme.of(context).colorScheme.surfaceContainerHighest
           : Colors.transparent,
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.circular(3),
       child: ListTile(
         dense: true,
-        minTileHeight: 38,
+        minTileHeight: 34,
         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
         leading: Icon(icon, size: 18),
         horizontalTitleGap: 10,
@@ -588,6 +657,7 @@ class _WorkbenchState extends State<Workbench> {
   );
 
   Widget _page() => switch (page) {
+    5 => ConnectionPage(api: widget.api, onChanged: _connectionChanged),
     1 => LibraryPage(
       key: ValueKey(_libraryGeneration),
       api: widget.api,
@@ -618,36 +688,22 @@ class _WorkbenchState extends State<Workbench> {
     return Column(
       children: [
         Container(
-          height: 70,
-          padding: const EdgeInsets.symmetric(horizontal: 24),
+          height: 48,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
           decoration: BoxDecoration(
             border: Border(bottom: BorderSide(color: colors.outlineVariant)),
           ),
           child: Row(
             children: [
               Expanded(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      model.conversation?['title']?.toString() ?? '新调教会话',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w600,
-                        fontSize: 16,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '先讨论与预览，再确认每一次修改',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: colors.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
+                child: Text(
+                  model.conversation?['title']?.toString() ?? '新调教会话',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                  ),
                 ),
               ),
               IconButton(
@@ -686,7 +742,7 @@ class _WorkbenchState extends State<Workbench> {
               : SelectionArea(
                   child: ListView(
                     controller: _scroll,
-                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+                    padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
                     children: [
                       for (final message in allMessages) _message(message),
                       if (model.sending) _progress(),
@@ -727,34 +783,29 @@ class _WorkbenchState extends State<Workbench> {
     );
   }
 
+  /// 空会话只提供可执行的起点，避免大幅欢迎区与工程面板争夺注意力。
   Widget _welcome() => Center(
     child: SingleChildScrollView(
       padding: const EdgeInsets.all(28),
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 680),
+        constraints: const BoxConstraints(maxWidth: 520),
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(
-              Icons.graphic_eq_rounded,
-              size: 42,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-            const SizedBox(height: 22),
             const Text(
-              '一起把这句唱得更好。',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 27, fontWeight: FontWeight.w500),
+              '调教会话',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w500),
             ),
             const SizedBox(height: 12),
             Text(
-              '描述你的想法，或附上音频与选区。',
+              '输入调教目标。参数方案先预览，确认后才写入工程。',
               style: TextStyle(
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
                 fontSize: 13,
               ),
             ),
-            const SizedBox(height: 30),
+            const SizedBox(height: 20),
             LayoutBuilder(
               builder: (context, size) => Wrap(
                 spacing: 10,
@@ -764,19 +815,19 @@ class _WorkbenchState extends State<Workbench> {
                     Icons.music_note_outlined,
                     '看看当前这句',
                     '根据我附带的选区，先分析哪些地方值得调整，并说明依据。',
-                    math.max(170, (size.maxWidth - 20) / 3),
+                    size.maxWidth,
                   ),
                   _starter(
                     Icons.auto_awesome_outlined,
                     '让声音更自然',
                     '保留现有音高与演唱细节，结合我附带的选区提出少量局部修饰，先说明目标。',
-                    math.max(170, (size.maxWidth - 20) / 3),
+                    size.maxWidth,
                   ),
                   _starter(
                     Icons.headphones_outlined,
                     '听一听 A / B',
                     '请先判断两段音频是否可比，再结合我的目标比较同一位置的差异，不预设 B 更好。',
-                    math.max(170, (size.maxWidth - 20) / 3),
+                    size.maxWidth,
                     audio: true,
                   ),
                 ],
@@ -796,31 +847,25 @@ class _WorkbenchState extends State<Workbench> {
     bool audio = false,
   }) => SizedBox(
     width: width,
-    child: Card(
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: () {
-          setState(() {
-            model.draft = prompt;
-            _draft.text = prompt;
-            if (audio) {
-              page = 1;
-              _libraryGeneration++;
-            }
-          });
-          _composerFocus.requestFocus();
-        },
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Icon(icon, size: 22),
-              const SizedBox(height: 16),
-              Text(title, style: const TextStyle(fontSize: 13)),
-            ],
-          ),
-        ),
+    child: TextButton(
+      onPressed: () {
+        setState(() {
+          model.draft = prompt;
+          _draft.text = prompt;
+          if (audio) {
+            page = 1;
+            _libraryGeneration++;
+          }
+        });
+        _composerFocus.requestFocus();
+      },
+      child: Row(
+        children: [
+          Icon(icon, size: 17),
+          const SizedBox(width: 10),
+          Expanded(child: Text(title)),
+          const Icon(Icons.chevron_right, size: 16),
+        ],
       ),
     ),
   );
@@ -830,66 +875,72 @@ class _WorkbenchState extends State<Workbench> {
     final error = message['role'] == 'error';
     final colors = Theme.of(context).colorScheme;
     return Align(
-      alignment: user ? Alignment.centerRight : Alignment.centerLeft,
+      alignment: Alignment.centerLeft,
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 860),
+        constraints: const BoxConstraints(maxWidth: 1040),
         child: Padding(
-          padding: const EdgeInsets.only(bottom: 28),
+          padding: const EdgeInsets.only(bottom: 20),
           child: Column(
-            crossAxisAlignment: user
-                ? CrossAxisAlignment.end
-                : CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              if (!user)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: Row(
-                    children: [
-                      Icon(
-                        error
-                            ? Icons.error_outline_rounded
-                            : Icons.graphic_eq_rounded,
-                        size: 18,
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  children: [
+                    Icon(
+                      user
+                          ? Icons.person_outline
+                          : error
+                          ? Icons.error_outline_rounded
+                          : Icons.graphic_eq_rounded,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      user
+                          ? '用户'
+                          : error
+                          ? '请求未完成'
+                          : '调教助手',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
                       ),
-                      const SizedBox(width: 8),
-                      Text(
-                        error ? '请求未完成' : '调教助手',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        message['model']?.toString() ?? '',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: colors.onSurfaceVariant,
                         ),
                       ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          message['model']?.toString() ?? '',
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: colors.onSurfaceVariant,
-                          ),
-                        ),
+                    ),
+                    IconButton(
+                      tooltip: user ? '复制消息' : '复制回复',
+                      onPressed: () => Clipboard.setData(
+                        ClipboardData(text: message['text']?.toString() ?? ''),
                       ),
-                      IconButton(
-                        tooltip: '复制回复',
-                        onPressed: () => Clipboard.setData(
-                          ClipboardData(
-                            text: message['text']?.toString() ?? '',
-                          ),
-                        ),
-                        icon: const Icon(Icons.copy_outlined, size: 15),
-                      ),
-                    ],
-                  ),
+                      icon: const Icon(Icons.copy_outlined, size: 15),
+                    ),
+                  ],
                 ),
+              ),
               Container(
                 padding: user
-                    ? const EdgeInsets.symmetric(horizontal: 18, vertical: 14)
+                    ? const EdgeInsets.symmetric(horizontal: 12, vertical: 10)
                     : EdgeInsets.zero,
                 decoration: user
                     ? BoxDecoration(
-                        color: colors.surfaceContainerHighest,
-                        borderRadius: BorderRadius.circular(16),
+                        color: colors.surfaceContainerLow,
+                        border: Border(
+                          left: BorderSide(
+                            color: colors.outlineVariant,
+                            width: 2,
+                          ),
+                        ),
                       )
                     : null,
                 child: Column(
@@ -898,7 +949,7 @@ class _WorkbenchState extends State<Workbench> {
                     if (user)
                       SelectableText(
                         message['text']?.toString() ?? '',
-                        style: const TextStyle(fontSize: 14, height: 1.6),
+                        style: const TextStyle(fontSize: 13, height: 1.6),
                       )
                     else
                       MarkdownBody(
@@ -909,8 +960,8 @@ class _WorkbenchState extends State<Workbench> {
                                 .copyWith(
                                   p: TextStyle(
                                     color: colors.onSurface,
-                                    fontSize: 14,
-                                    height: 1.7,
+                                    fontSize: 13,
+                                    height: 1.6,
                                   ),
                                 ),
                         imageBuilder: (uri, title, alt) => Text(
@@ -1070,21 +1121,20 @@ class _WorkbenchState extends State<Workbench> {
         model.pendingJobId != null;
     final colors = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 18),
+      padding: EdgeInsets.zero,
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 960),
+        constraints: const BoxConstraints(maxWidth: double.infinity),
         child: Container(
           decoration: BoxDecoration(
             color: colors.surfaceContainerLow,
-            border: Border.all(color: colors.outlineVariant),
-            borderRadius: BorderRadius.circular(16),
+            border: Border(top: BorderSide(color: colors.outlineVariant)),
           ),
-          padding: const EdgeInsets.all(14),
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               _modelControls(disabled),
-              const SizedBox(height: 10),
+              const SizedBox(height: 8),
               CallbackShortcuts(
                 bindings: {
                   const SingleActivator(
@@ -1101,10 +1151,10 @@ class _WorkbenchState extends State<Workbench> {
                   controller: _draft,
                   focusNode: _composerFocus,
                   minLines: 2,
-                  maxLines: 5,
+                  maxLines: 4,
                   enabled: !disabled,
                   onChanged: (value) => setState(() => model.draft = value),
-                  style: const TextStyle(fontSize: 14, height: 1.5),
+                  style: const TextStyle(fontSize: 13, height: 1.5),
                   decoration: const InputDecoration(
                     hintText: '描述希望怎样演唱，或讨论这段调教…',
                     border: InputBorder.none,
@@ -1140,7 +1190,7 @@ class _WorkbenchState extends State<Workbench> {
                   IconButton(
                     tooltip: '选择音频附件',
                     onPressed: disabled ? null : () => _navigate(1),
-                    icon: const Icon(Icons.add_rounded),
+                    icon: const Icon(Icons.attach_file_rounded),
                   ),
                   const SizedBox(width: 4),
                   SizedBox(
@@ -1215,7 +1265,7 @@ class _WorkbenchState extends State<Workbench> {
                 ),
               ),
             ),
-            SizedBox(height: 36, child: child),
+            SizedBox(height: 34, child: child),
           ],
         ),
       );
@@ -1229,7 +1279,7 @@ class _WorkbenchState extends State<Workbench> {
           border: Border.all(
             color: Theme.of(context).colorScheme.outlineVariant,
           ),
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(4),
         ),
         child: DropdownButtonHideUnderline(
           child: DropdownButton<String>(
@@ -1284,7 +1334,7 @@ class _WorkbenchState extends State<Workbench> {
                       hintText: '平台默认',
                       contentPadding: const EdgeInsets.symmetric(
                         horizontal: 9,
-                        vertical: 9,
+                        vertical: 8,
                       ),
                       suffixIconConstraints: const BoxConstraints(
                         maxWidth: 28,

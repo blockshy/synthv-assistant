@@ -15,6 +15,7 @@ from .config import ROOT
 from .service import AssistantService
 from .settings import SettingsConflictError
 from .metadata import validate_purge_confirmation
+from .bridge_setup import BridgeSetupConflict
 
 
 def _unique_json_object(pairs):
@@ -101,6 +102,17 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
             except Exception:
                 return self.response_json({"error": "工作台操作未完成，请检查本机服务状态后重试。"}, 500)
 
+        def bridge_setup_response(self, operation, *args):
+            """认证后的桥接管理只回显固定验证信息，不暴露磁盘或宿主异常正文。"""
+            try:
+                return self.response_json(operation(*args))
+            except BridgeSetupConflict as error:
+                return self.response_json({"error": str(error)}, 409)
+            except ValueError as error:
+                return self.response_json({"error": str(error)}, 400)
+            except Exception:
+                return self.response_json({"error": "桥接配置未完成，请检查本机脚本目录权限后刷新诊断。"}, 500)
+
         def _desktop_request(self, dispatch):
             """桌面路由统一认证及生命周期登记，避免漏保护音频或只读工程接口。"""
             if desktop_runtime is None:
@@ -147,6 +159,10 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
             try:
                 if path == "/api/bootstrap":
                     return self.response_json({"token": token})
+                if path == "/api/bridge/diagnostics":
+                    if not self.allowed_token():
+                        return
+                    return self.bridge_setup_response(service.bridge_diagnostics)
                 if path == "/api/audio-settings":
                     if not self.allowed_token():
                         return
@@ -180,7 +196,7 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                         return self.workbench_response(service.get_conversation, match[1])
                     return self.response_json({"error": "会话不存在。"}, 404)
                 if path == "/api/status":
-                    return self.response_json(service.status())
+                    return self.response_json(service.status(include_bridge_location=True) if desktop_runtime is not None else service.status())
                 if path == "/api/project":
                     return self.response_json(service.get_project())
                 if path == "/api/selection":
@@ -261,6 +277,10 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                 args = json.loads(self.rfile.read(length), object_pairs_hook=_unique_json_object)
                 if not isinstance(args, dict):
                     raise ValueError("请求必须是 JSON 对象。")
+                if path == "/api/bridge/connect":
+                    return self.bridge_setup_response(service.connect_bridge, args)
+                if path == "/api/bridge/install":
+                    return self.bridge_setup_response(service.install_bridge, args)
                 if path == "/api/audio-settings":
                     return self.settings_response(service.update_audio_settings, args)
                 elif path == "/api/model-platforms":

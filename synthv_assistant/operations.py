@@ -96,7 +96,7 @@ def operation_busy(path: str | Path) -> bool:
         return True
 
 
-def exclusive_operation(path_for_service: Callable) -> Callable[[Function], Function]:
+def exclusive_operation(path_for_service: Callable, *, guard_for_service: Callable | None = None) -> Callable[[Function], Function]:
     """为业务入口增加完整调用周期的跨进程锁，保留原方法与内部 RLock。
 
     路径在每次调用时解析，便于测试将 DATA 指向隔离目录。装饰器覆盖 record
@@ -105,7 +105,16 @@ def exclusive_operation(path_for_service: Callable) -> Callable[[Function], Func
     def decorate(function: Function) -> Function:
         @wraps(function)
         def protected(service, *args, **kwargs):
-            with OperationLock(path_for_service(service)):
-                return function(service, *args, **kwargs)
+            # 可选绑定锁必须先于路径求值取得；否则连接切换可能发生在计算
+            # 旧锁路径与实际宿主调用之间，造成“锁旧目录、写新目录”的竞态。
+            guard = guard_for_service(service) if guard_for_service is not None else None
+            if guard is not None and not guard.acquire(blocking=False):
+                raise OperationBusyError(BUSY_MESSAGE)
+            try:
+                with OperationLock(path_for_service(service)):
+                    return function(service, *args, **kwargs)
+            finally:
+                if guard is not None:
+                    guard.release()
         return protected
     return decorate

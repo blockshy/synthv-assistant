@@ -82,7 +82,7 @@ void main() {
         );
         await tester.pumpAndSettle();
         expect(tester.takeException(), isNull);
-        expect(find.text('一起把这句唱得更好。'), findsOneWidget);
+        expect(find.text('调教会话'), findsOneWidget);
         final composer = find.widgetWithText(TextField, '描述希望怎样演唱，或讨论这段调教…');
         await tester.enterText(composer, '未发送的测试草稿');
         await tester.pump();

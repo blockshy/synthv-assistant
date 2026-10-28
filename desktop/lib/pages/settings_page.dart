@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/api.dart';
+import 'page_chrome.dart';
 
 /// 平台配置使用完整主页面与固定保存栏。密钥只存在密码框短暂内存中，
 /// 每次保存（包括失败）后清空，由 Python 层负责 Windows DPAPI 加密。
@@ -29,6 +30,7 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _loading = true;
   bool _dirty = false;
   int _catalogRequest = 0;
+  int _selectorRevision = 0;
 
   static const _protocols = {
     'openai': 'OpenAI / 兼容 API',
@@ -121,7 +123,12 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _select(String? id) async {
-    if (!await _canLeaveDraft() || !mounted) return;
+    if (!await _canLeaveDraft() || !mounted) {
+      // 下拉框先更新内部显示再调用 onChanged。取消离开草稿时重建选择器，
+      // 避免它显示新平台、实际表单仍保留旧平台，导致用户误判保存目标。
+      if (mounted) setState(() => _selectorRevision++);
+      return;
+    }
     setState(() {
       _fill(id == null ? null : _items.firstWhere((item) => item['id'] == id));
       _feedback = null;
@@ -230,6 +237,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (confirmed == true && mounted) await _save(disable: true);
   }
 
+  /// 固定属性名与输入框分离；密码框不回填，辅助说明按需展开。
   Widget _field(
     String title,
     TextEditingController controller, {
@@ -237,9 +245,10 @@ class _SettingsPageState extends State<SettingsPage> {
     bool password = false,
     bool enabled = true,
     String? Function(String?)? validator,
-  }) => Padding(
-    padding: const EdgeInsets.only(bottom: 16),
+  }) => PageProperty(
+    label: title,
     child: TextFormField(
+      key: ValueKey('field:$title'),
       controller: controller,
       enabled: enabled && !widget.api.busy,
       obscureText: password,
@@ -248,11 +257,7 @@ class _SettingsPageState extends State<SettingsPage> {
       maxLength: password ? null : 512,
       onChanged: (_) => setState(() => _dirty = true),
       validator: validator,
-      decoration: InputDecoration(
-        labelText: title,
-        hintText: hint,
-        counterText: '',
-      ),
+      decoration: InputDecoration(hintText: hint, counterText: ''),
     ),
   );
 
@@ -266,252 +271,276 @@ class _SettingsPageState extends State<SettingsPage> {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Padding(
-            padding: const EdgeInsets.all(24),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '模型设置',
-                        style: Theme.of(context).textTheme.headlineSmall,
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '平台配置保存在此 Windows 账户中。',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  tooltip: '重新加载平台配置',
-                  onPressed: busy || _loading
-                      ? null
-                      : () async {
-                          if (await _canLeaveDraft()) await _load();
-                        },
-                  icon: const Icon(Icons.refresh_rounded),
-                ),
-                IconButton(
-                  tooltip: '新增模型平台',
-                  onPressed: busy || _loading ? null : () => _select(null),
-                  icon: const Icon(Icons.add_rounded),
-                ),
-              ],
-            ),
+          PageToolbar(
+            title: '模型设置',
+            actions: [
+              IconButton(
+                tooltip: '重新加载平台配置',
+                onPressed: busy || _loading
+                    ? null
+                    : () async {
+                        if (await _canLeaveDraft()) await _load();
+                      },
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+              IconButton(
+                tooltip: '新增模型平台',
+                onPressed: busy || _loading ? null : () => _select(null),
+                icon: const Icon(Icons.add, size: 18),
+              ),
+            ],
           ),
           Expanded(
             child: _loading
-                ? const Center(child: CircularProgressIndicator())
+                ? const Center(
+                    child: SizedBox.square(
+                      dimension: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
                 : SingleChildScrollView(
-                    padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+                    padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
                     child: Align(
-                      alignment: Alignment.topCenter,
+                      alignment: Alignment.topLeft,
                       child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 720),
+                        constraints: const BoxConstraints(maxWidth: 820),
                         child: Form(
                           key: _form,
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              DropdownButtonFormField<String>(
-                                initialValue: _selectedId ?? 'new',
-                                key: ValueKey('platform:$_selectedId'),
-                                isExpanded: true,
-                                decoration: const InputDecoration(
-                                  labelText: '当前平台',
-                                ),
-                                items: [
-                                  for (final item in _items)
-                                    DropdownMenuItem(
-                                      value: item['id'].toString(),
-                                      child: Text(
-                                        '${item['name']}${_registry['defaultPlatformId'] == item['id'] ? ' · 新会话默认' : ''}',
-                                        overflow: TextOverflow.ellipsis,
+                              PageSection(
+                                title: '平台与连接',
+                                children: [
+                                  PageProperty(
+                                    label: '当前平台',
+                                    child: DropdownButtonFormField<String>(
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodyMedium,
+                                      iconSize: 18,
+                                      initialValue: _selectedId ?? 'new',
+                                      key: ValueKey(
+                                        'platform:$_selectedId:$_selectorRevision',
                                       ),
-                                    ),
-                                  const DropdownMenuItem(
-                                    value: 'new',
-                                    child: Text('新增平台'),
-                                  ),
-                                ],
-                                onChanged: busy
-                                    ? null
-                                    : (value) => _select(
-                                        value == 'new' ? null : value,
-                                      ),
-                              ),
-                              const SizedBox(height: 20),
-                              _field(
-                                '平台名称',
-                                _name,
-                                enabled: _selectedId != 'default',
-                                validator: (value) =>
-                                    (value ?? '').trim().isEmpty
-                                    ? '请填写平台名称'
-                                    : null,
-                              ),
-                              DropdownButtonFormField<String>(
-                                key: ValueKey(
-                                  'provider:$_selectedId:$_provider',
-                                ),
-                                initialValue: _provider,
-                                isExpanded: true,
-                                decoration: const InputDecoration(
-                                  labelText: '协议',
-                                ),
-                                items: [
-                                  for (final entry in _protocols.entries)
-                                    DropdownMenuItem(
-                                      value: entry.key,
-                                      child: Text(entry.value),
-                                    ),
-                                ],
-                                onChanged: busy
-                                    ? null
-                                    : (value) => setState(() {
-                                        _provider = value!;
-                                        _model.text = _defaults[value]![0];
-                                        _base.text = _defaults[value]![1];
-                                        _key.clear();
-                                        _dirty = true;
-                                      }),
-                              ),
-                              const SizedBox(height: 20),
-                              _field(
-                                'API Base URL',
-                                _base,
-                                hint: 'https://…',
-                                validator: (value) {
-                                  if (_provider == 'none') return null;
-                                  final uri = Uri.tryParse(value ?? '');
-                                  return uri?.scheme != 'https' ||
-                                          uri!.host.isEmpty
-                                      ? '请输入完整的 HTTPS API 根地址'
-                                      : null;
-                                },
-                              ),
-                              _field(
-                                '默认模型 ID',
-                                _model,
-                                validator: (value) =>
-                                    _provider != 'none' &&
-                                        (value ?? '').trim().isEmpty
-                                    ? '请填写模型 ID'
-                                    : null,
-                              ),
-                              if (_models.isNotEmpty)
-                                Padding(
-                                  padding: const EdgeInsets.only(bottom: 16),
-                                  child: DropdownButtonFormField<String>(
-                                    initialValue: null,
-                                    isExpanded: true,
-                                    decoration: const InputDecoration(
-                                      labelText: '从已缓存目录选择（可选）',
-                                    ),
-                                    items: [
-                                      for (final model in _models)
-                                        DropdownMenuItem(
-                                          value: model['id'].toString(),
-                                          child: Text(
-                                            model['id'].toString(),
-                                            overflow: TextOverflow.ellipsis,
+                                      isExpanded: true,
+                                      items: [
+                                        for (final item in _items)
+                                          DropdownMenuItem(
+                                            value: item['id'].toString(),
+                                            child: Text(
+                                              '${item['name']}${_registry['defaultPlatformId'] == item['id'] ? ' · 新会话默认' : ''}',
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
                                           ),
+                                        const DropdownMenuItem(
+                                          value: 'new',
+                                          child: Text('新增平台'),
                                         ),
-                                    ],
-                                    onChanged: busy
-                                        ? null
-                                        : (value) => setState(() {
-                                            _model.text = value!;
-                                            _dirty = true;
-                                          }),
+                                      ],
+                                      onChanged: busy
+                                          ? null
+                                          : (value) => _select(
+                                              value == 'new' ? null : value,
+                                            ),
+                                    ),
                                   ),
-                                ),
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                child: TextButton.icon(
+                                  _field(
+                                    '平台名称',
+                                    _name,
+                                    enabled: _selectedId != 'default',
+                                    validator: (value) =>
+                                        (value ?? '').trim().isEmpty
+                                        ? '请填写平台名称'
+                                        : null,
+                                  ),
+                                  PageProperty(
+                                    label: '协议',
+                                    child: DropdownButtonFormField<String>(
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodyMedium,
+                                      iconSize: 18,
+                                      key: ValueKey(
+                                        'provider:$_selectedId:$_provider',
+                                      ),
+                                      initialValue: _provider,
+                                      isExpanded: true,
+                                      items: [
+                                        for (final entry in _protocols.entries)
+                                          DropdownMenuItem(
+                                            value: entry.key,
+                                            child: Text(
+                                              entry.value,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ),
+                                      ],
+                                      onChanged: busy
+                                          ? null
+                                          : (value) => setState(() {
+                                              _provider = value!;
+                                              _model.text =
+                                                  _defaults[value]![0];
+                                              _base.text = _defaults[value]![1];
+                                              _key.clear();
+                                              _models = [];
+                                              _dirty = true;
+                                            }),
+                                    ),
+                                  ),
+                                  _field(
+                                    'API Base URL',
+                                    _base,
+                                    hint: 'https://…',
+                                    validator: (value) {
+                                      if (_provider == 'none') return null;
+                                      final uri = Uri.tryParse(value ?? '');
+                                      return uri?.scheme != 'https' ||
+                                              uri!.host.isEmpty
+                                          ? '请输入完整的 HTTPS API 根地址'
+                                          : null;
+                                    },
+                                  ),
+                                  _field(
+                                    'API 密钥',
+                                    _key,
+                                    password: true,
+                                    hint: _current['keyConfigured'] == true
+                                        ? '已保存；同协议和地址下留空保留'
+                                        : '输入 API 密钥',
+                                  ),
+                                ],
+                              ),
+                              PageSection(
+                                title: '模型与请求',
+                                trailing: IconButton(
+                                  tooltip: '刷新已保存平台的模型目录',
                                   onPressed:
                                       busy || _selectedId == null || _dirty
                                       ? null
                                       : () => _catalog(refresh: true),
-                                  icon: const Icon(
-                                    Icons.sync_rounded,
-                                    size: 18,
-                                  ),
-                                  label: const Text('刷新已保存平台的模型目录'),
+                                  icon: const Icon(Icons.sync, size: 17),
                                 ),
-                              ),
-                              const SizedBox(height: 12),
-                              _field(
-                                'API 密钥',
-                                _key,
-                                password: true,
-                                hint: _current['keyConfigured'] == true
-                                    ? '已保存；同协议和地址下留空保留'
-                                    : '输入 API 密钥',
-                              ),
-                              _field(
-                                '响应等待超时（秒）',
-                                _timeout,
-                                validator: (value) {
-                                  final seconds = double.tryParse(value ?? '');
-                                  return seconds == null ||
-                                          !seconds.isFinite ||
-                                          seconds < 5 ||
-                                          seconds > 180
-                                      ? '填写 5～180 秒'
-                                      : null;
-                                },
-                              ),
-                              Text(
-                                '有效输出会续期。保存配置不会调用模型；音频输入能力仍取决于所选模型。',
-                                style: Theme.of(context).textTheme.bodySmall,
-                              ),
-                              const SizedBox(height: 20),
-                              Wrap(
-                                spacing: 8,
-                                runSpacing: 8,
-                                crossAxisAlignment: WrapCrossAlignment.center,
                                 children: [
-                                  OutlinedButton.icon(
-                                    onPressed:
-                                        busy ||
-                                            _dirty ||
-                                            _selectedId == null ||
-                                            _current['configured'] != true ||
-                                            isDefault
-                                        ? null
-                                        : _setDefault,
-                                    icon: Icon(
-                                      isDefault
-                                          ? Icons.check_rounded
-                                          : Icons.star_outline_rounded,
-                                      size: 18,
+                                  _field(
+                                    '默认模型 ID',
+                                    _model,
+                                    validator: (value) =>
+                                        _provider != 'none' &&
+                                            (value ?? '').trim().isEmpty
+                                        ? '请填写模型 ID'
+                                        : null,
+                                  ),
+                                  if (_models.isNotEmpty)
+                                    PageProperty(
+                                      label: '缓存目录',
+                                      child: DropdownButtonFormField<String>(
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodyMedium,
+                                        iconSize: 18,
+                                        key: ValueKey(
+                                          'catalog:$_selectedId:${_models.length}',
+                                        ),
+                                        initialValue: null,
+                                        isExpanded: true,
+                                        hint: const Text('选择模型（可选）'),
+                                        items: [
+                                          for (final model in _models)
+                                            DropdownMenuItem(
+                                              value: model['id'].toString(),
+                                              child: Text(
+                                                model['id'].toString(),
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                            ),
+                                        ],
+                                        onChanged: busy
+                                            ? null
+                                            : (value) => setState(() {
+                                                _model.text = value!;
+                                                _dirty = true;
+                                              }),
+                                      ),
                                     ),
-                                    label: Text(
-                                      isDefault ? '已设为新会话默认' : '设为新会话默认',
+                                  _field(
+                                    '等待超时（秒）',
+                                    _timeout,
+                                    validator: (value) {
+                                      final seconds = double.tryParse(
+                                        value ?? '',
+                                      );
+                                      return seconds == null ||
+                                              !seconds.isFinite ||
+                                              seconds < 5 ||
+                                              seconds > 180
+                                          ? '填写 5～180 秒'
+                                          : null;
+                                    },
+                                  ),
+                                ],
+                              ),
+                              PageSection(
+                                title: '使用范围',
+                                trailing: _selectedId == null
+                                    ? null
+                                    : IconButton(
+                                        tooltip: '停用平台并清除密钥',
+                                        onPressed: busy ? null : _disable,
+                                        icon: const Icon(
+                                          Icons.power_settings_new,
+                                          size: 17,
+                                        ),
+                                      ),
+                                children: [
+                                  Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: OutlinedButton.icon(
+                                      onPressed:
+                                          busy ||
+                                              _dirty ||
+                                              _selectedId == null ||
+                                              _current['configured'] != true ||
+                                              isDefault
+                                          ? null
+                                          : _setDefault,
+                                      icon: Icon(
+                                        isDefault
+                                            ? Icons.check
+                                            : Icons.star_border,
+                                        size: 16,
+                                      ),
+                                      label: Text(
+                                        isDefault ? '已设为新会话默认' : '设为新会话默认',
+                                      ),
                                     ),
                                   ),
-                                  if (_selectedId != null)
-                                    TextButton(
-                                      onPressed: busy ? null : _disable,
-                                      child: const Text('停用并清除密钥'),
+                                  if (_selectedId == 'default')
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 8),
+                                      child: Text(
+                                        '此配置同时用于独立 A/B 听评和 MCP 听评。',
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodySmall,
+                                      ),
                                     ),
                                 ],
                               ),
-                              if (_selectedId == 'default')
-                                Padding(
-                                  padding: const EdgeInsets.only(top: 12),
-                                  child: Text(
-                                    '此默认配置也用于独立 A/B 听评和 MCP 听评。',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall,
+                              const PageNotes(
+                                children: [
+                                  Text(
+                                    '保存配置不调用模型，也不验证云端连接。密钥按当前 Windows 账户加密保存；改变协议或地址后需重新填写。',
                                   ),
-                                ),
+                                  SizedBox(height: 8),
+                                  Text(
+                                    '页面只读本地模型目录缓存；点击刷新才访问已保存平台。模型列表不代表完整能力声明，音频与推理支持以平台实际响应为准。',
+                                  ),
+                                  SizedBox(height: 8),
+                                  Text('有效输出会续期等待超时。新会话默认只影响之后的会话；已存在会话保留原选择。'),
+                                ],
+                              ),
                             ],
                           ),
                         ),
@@ -519,25 +548,24 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                   ),
           ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-            decoration: BoxDecoration(
-              border: Border(
-                top: BorderSide(color: Theme.of(context).dividerColor),
-              ),
+          if (_feedback != null)
+            PageNotice(
+              message: _feedback!,
+              onDismiss: () => setState(() => _feedback = null),
             ),
+          PageFooter(
             child: Row(
               children: [
                 Expanded(
                   child: Text(
-                    _feedback ?? (_dirty ? '有未保存的修改' : '配置按当前 Windows 账户加密保存'),
+                    _dirty ? '有未保存的修改' : '本地配置',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ),
-                const SizedBox(width: 16),
+                const SizedBox(width: 12),
                 FilledButton.icon(
                   onPressed: busy || _loading ? null : _save,
-                  icon: const Icon(Icons.check_rounded, size: 18),
+                  icon: const Icon(Icons.check, size: 16),
                   label: const Text('保存并生效'),
                 ),
               ],

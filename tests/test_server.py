@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from synthv_assistant.server import make_server
 from synthv_assistant.settings import SettingsConflictError
+from synthv_assistant.bridge_setup import BridgeSetupConflict
 
 
 class ServerTests(unittest.TestCase):
@@ -55,6 +56,29 @@ class ServerTests(unittest.TestCase):
                 status, _, _ = self.request("GET", "/api/status", headers=headers)
                 self.assertEqual(status, 403)
         self.service.status.assert_not_called()
+
+    def test_bridge_management_requires_authentication_and_maps_conflicts(self):
+        """目录诊断和固定目标安装必须认证；修复接口不能透出底层异常正文。"""
+        self.service.bridge_diagnostics.return_value = {"reason": "directory_mismatch"}
+        self.service.connect_bridge.return_value = {"reason": "connected"}
+        self.service.install_bridge.return_value = {"restartRequired": True}
+        routes = (("GET", "/api/bridge/diagnostics", {}, self.service.bridge_diagnostics),
+                  ("POST", "/api/bridge/connect", {"target": "installed", "revision": "r"}, self.service.connect_bridge),
+                  ("POST", "/api/bridge/install", {"confirm": True, "revision": "r"}, self.service.install_bridge))
+        for method, path, payload, operation in routes:
+            with self.subTest(path=path):
+                self.assertEqual(self.request(method, path, body=payload)[0], 403)
+                operation.assert_not_called()
+                self.assertEqual(self.request(method, path, body=payload,
+                                              headers={"X-SV-Token": "test-token"})[0], 200)
+        self.service.connect_bridge.side_effect = BridgeSetupConflict("请刷新诊断。")
+        status, _, body = self.request("POST", "/api/bridge/connect", headers={"X-SV-Token": "test-token"})
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body)["error"], "请刷新诊断。")
+        self.service.install_bridge.side_effect = OSError("private-path-secret")
+        status, _, body = self.request("POST", "/api/bridge/install", headers={"X-SV-Token": "test-token"})
+        self.assertEqual(status, 500)
+        self.assertNotIn(b"private-path-secret", body)
 
     def test_cached_catalog_and_drawing_preference_routes_require_token(self):
         """目录只读端点不能误走联网刷新；绘制偏好作为独立字段进入会话任务。"""

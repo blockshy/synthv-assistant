@@ -51,12 +51,42 @@ class _PlayerLease {
   Future<void> pending = Future<void>.value();
   bool initialized = false;
   bool retired = false;
+  Future<void>? retirement;
 
   Future<T> invoke<T>(Future<T> Function() action) {
     final result = Future<T>.sync(action);
     // 这里仅记录结束时机；调用方仍会从 result 收到原始错误。
     pending = result.then<void>((_) {}, onError: (Object _, StackTrace _) {});
     return result;
+  }
+}
+
+final _activeAudioPlayers = <_PlayerLease>{};
+
+/// 只释放播放器，不涉及录音、模型或工程。相同实例始终复用同一份释放 Future，
+/// 避免页面卸载与应用退出同时重复 dispose 原生对象。
+Future<void> _releaseAudioPlayer(_PlayerLease lease) {
+  return lease.retirement ??= () async {
+    lease.retired = true;
+    if (!lease.failed.isCompleted) lease.failed.complete();
+    await Future.wait(lease.subscriptions.map((item) => item.cancel()));
+    await lease.pending;
+    await lease.player.dispose();
+    _activeAudioPlayers.remove(lease);
+  }();
+}
+
+/// 窗口退出前给原生音频一个有界收尾机会。超时不冒充“已取消”，原始释放仍在
+/// 继续；返回 false 让窗口记录固定诊断并走 Windows 正常关闭流程，不能无限转圈。
+Future<bool> stopAndDisposeAllAudio({
+  Duration timeout = const Duration(seconds: 3),
+}) async {
+  try {
+    await Future.wait(_activeAudioPlayers.toList().map(_releaseAudioPlayer))
+        .timeout(timeout);
+    return true;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -111,6 +141,7 @@ class _AudioClipState extends State<AudioClip> {
       widget.playerFactory?.call() ?? _NativeClipPlayer(),
     );
     _player = lease;
+    _activeAudioPlayers.add(lease);
     void nativeError(Object _, StackTrace _) {
       if (!_owns(lease)) return;
       if (!lease.failed.isCompleted) lease.failed.complete();
@@ -150,9 +181,7 @@ class _AudioClipState extends State<AudioClip> {
     _state = PlayerState.stopped;
     _retirement = () async {
       try {
-        await Future.wait(lease.subscriptions.map((item) => item.cancel()));
-        await lease.pending;
-        await lease.player.dispose();
+        await _releaseAudioPlayer(lease);
       } catch (_) {
         // 不显示原生错误正文，其中可能包含本机文件路径。
         _cleanupFailed = true;

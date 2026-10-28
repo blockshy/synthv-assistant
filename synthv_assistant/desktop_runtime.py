@@ -17,7 +17,7 @@ import time
 
 
 PROTOCOL_VERSION = 1
-APPLICATION_VERSION = "0.1.0"
+APPLICATION_VERSION = "0.2.0"
 
 
 def configure_desktop_data() -> Path:
@@ -87,7 +87,11 @@ class DesktopRuntime:
                 if acquired:
                     self.service.operation_lock.release()
             try:
-                operation_busy = self._busy_probe(self.data / "operation.lock")
+                # 显式接入旧脚本后，宿主互斥锁随 IPC 绑定变化；退出保护必须
+                # 探测同一个锁，不能继续只看当前资料目录中的空闲锁。
+                path_getter = getattr(self.service, "operation_path", None)
+                lock_path = path_getter() if callable(path_getter) else self.data / "operation.lock"
+                operation_busy = self._busy_probe(lock_path)
                 status_error = False
             except OSError:
                 operation_busy, status_error = True, True

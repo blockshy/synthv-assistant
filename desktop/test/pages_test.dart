@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:synthv_desktop/core/api.dart';
 import 'package:synthv_desktop/pages/library_page.dart';
+import 'package:synthv_desktop/pages/page_chrome.dart';
 import 'package:synthv_desktop/pages/recording_page.dart';
 import 'package:synthv_desktop/pages/settings_page.dart';
 import 'package:synthv_desktop/pages/trash_page.dart';
@@ -91,8 +92,11 @@ class _PageApi extends WorkbenchApi {
   }
 }
 
-Finder _field(String label) => find.byWidgetPredicate(
-  (widget) => widget is TextField && widget.decoration?.labelText == label,
+// 属性名独立于输入框；测试用稳定字段键定位，避免依赖旧浮动标签布局。
+Finder _field(String label) => find.descendant(
+  of: find.byKey(ValueKey('field:$label')),
+  matching: find.byType(TextField),
+  matchRoot: true,
 );
 
 /// 使用真实工作台主题和较窄窗口，验证主操作始终留在可视区域。
@@ -100,14 +104,16 @@ Future<void> _show(
   WidgetTester tester,
   Widget page, {
   double height = 600,
+  double width = 500,
+  Brightness brightness = Brightness.light,
 }) async {
-  tester.view.physicalSize = Size(500, height);
+  tester.view.physicalSize = Size(width, height);
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);
   await tester.pumpWidget(
     MaterialApp(
-      theme: WorkbenchTheme.build(Brightness.light),
+      theme: WorkbenchTheme.build(brightness),
       home: Scaffold(body: page),
     ),
   );
@@ -115,6 +121,51 @@ Future<void> _show(
 }
 
 void main() {
+  for (final width in [360.0, 800.0]) {
+    for (final brightness in Brightness.values) {
+      testWidgets('紧凑功能页在 $width / $brightness 下滚动仍保留底部操作', (tester) async {
+        final api = _PageApi();
+        addTearDown(api.dispose);
+        for (final page in [
+          LibraryPage(api: api, onAttach: (_) {}),
+          SettingsPage(api: api, onChanged: () {}),
+          RecordingPage(api: api, onAttach: (_) {}),
+          TrashPage(api: api, onChanged: () {}),
+        ]) {
+          await _show(
+            tester,
+            page,
+            width: width,
+            height: 480,
+            brightness: brightness,
+          );
+          expect(
+            tester.takeException(),
+            isNull,
+            reason: page.runtimeType.toString(),
+          );
+          final footer = find.byType(PageFooter);
+          final before = tester.getRect(footer);
+          expect(before.bottom, lessThanOrEqualTo(480));
+          await tester.drag(
+            find.byType(Scrollable).first,
+            const Offset(0, -500),
+          );
+          await tester.pumpAndSettle();
+          expect(tester.getRect(footer), before);
+          expect(
+            tester.takeException(),
+            isNull,
+            reason: page.runtimeType.toString(),
+          );
+          // 滚动及展开资料不应意外触发录制、云请求或本机音频预听。
+          expect(api.posts, isEmpty);
+          expect(api.audioReads, 0);
+        }
+      });
+    }
+  }
+
   testWidgets('素材固定栏可见，附件顺序遵循选择且不会带出私有索引', (tester) async {
     final api = _PageApi();
     addTearDown(api.dispose);
@@ -181,6 +232,31 @@ void main() {
       'edited-test-model',
     );
     expect(find.text('测试保存失败'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('取消切换平台时选择器恢复原平台，草稿与保存目标保持一致', (tester) async {
+    final api = _PageApi();
+    addTearDown(api.dispose);
+    await _show(tester, SettingsPage(api: api, onChanged: () {}), height: 700);
+    await tester.ensureVisible(_field('默认模型 ID'));
+    await tester.enterText(_field('默认模型 ID'), 'unsaved-model');
+    final selector = find.byKey(const ValueKey('platform:default:0'));
+    await tester.ensureVisible(selector);
+    await tester.tap(selector);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('新增平台').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('继续编辑'));
+    await tester.pumpAndSettle();
+    final restored = find.byKey(const ValueKey('platform:default:1'));
+    expect(restored, findsOneWidget);
+    expect(tester.state<FormFieldState<String>>(restored).value, 'default');
+    expect(
+      tester.widget<TextField>(_field('默认模型 ID')).controller!.text,
+      'unsaved-model',
+    );
+    expect(api.posts, isEmpty);
     expect(tester.takeException(), isNull);
   });
 

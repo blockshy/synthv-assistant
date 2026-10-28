@@ -151,6 +151,30 @@ void main() {
     }
   });
 
+  testWidgets('窗口收尾有界等待原生释放，超时后重复等待不重复dispose', (tester) async {
+    final player = makePlayer();
+    final disposing = Completer<void>();
+    player.disposing = disposing.future;
+    await _show(tester, api, () => player);
+    await _click(tester);
+    await tester.pump();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _drainCleanup(tester);
+    final first = stopAndDisposeAllAudio(
+      timeout: const Duration(milliseconds: 50),
+    );
+    await tester.pump(const Duration(milliseconds: 60));
+    expect(await first, isFalse);
+    expect(player.disposeCount, 1);
+    final second = stopAndDisposeAllAudio(
+      timeout: const Duration(milliseconds: 50),
+    );
+    disposing.complete();
+    await tester.pump();
+    expect(await second, isTrue);
+    expect(player.disposeCount, 1);
+  });
+
   testWidgets('各加载阶段可见，播放完成后保留音频源供再次试听', (tester) async {
     final player = makePlayer();
     final initialize = Completer<void>();

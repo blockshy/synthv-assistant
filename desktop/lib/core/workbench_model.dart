@@ -82,7 +82,17 @@ class WorkbenchModel extends ChangeNotifier {
   }
 
   Future<void> refreshStatus() async {
-    status = Map<String, dynamic>.from(await api.getJson('/api/status') as Map);
+    try {
+      status = Map<String, dynamic>.from(
+        await api.getJson('/api/status') as Map,
+      );
+    } catch (_) {
+      // 连接失败意味着上一次心跳和写入权限已经无法确认。立即清空并通知，
+      // 即使后台轮询调用者选择不显示错误，也不能继续把旧状态显示为在线可写。
+      status = {};
+      notifyListeners();
+      rethrow;
+    }
     notifyListeners();
   }
 

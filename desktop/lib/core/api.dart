@@ -27,12 +27,23 @@ class WorkbenchApi extends ChangeNotifier {
     ..connectionTimeout = const Duration(seconds: 10)
     ..findProxy = (_) => 'DIRECT';
   bool _busy = false;
-  bool get busy => _busy;
+  bool _closing = false;
+  bool _disposed = false;
+  bool get busy => _busy || _closing;
+  bool get closing => _closing;
   int previewEpoch = 0;
+
+  /// 退出协调期间暂停页面轮询和新业务请求；忙碌退出被拒绝后可以明确恢复。
+  /// 生命周期路由仍可查询，已经发出的 AI/录音/宿主请求不会被取消或重发。
+  void setClosing(bool value) {
+    if (_disposed || value == _closing) return;
+    _closing = value;
+    notifyListeners();
+  }
 
   /// 所有页面共享互斥状态，避免会话、录音和工程工具同时提交耗时任务。
   Future<T> exclusive<T>(Future<T> Function() action) async {
-    if (_busy) throw const ApiException('当前任务尚未完成，请稍后操作。');
+    if (busy) throw const ApiException('当前任务尚未完成或正在退出，请稍后操作。');
     _busy = true;
     notifyListeners();
     try {
@@ -56,6 +67,18 @@ class WorkbenchApi extends ChangeNotifier {
     Uint8List? bytes,
     String? filename,
   }) async {
+    if (_disposed) throw const ApiException('调教核心已停止，请重新连接。');
+    // 在途模型任务仍需轮询并读回正式会话，否则一次忙碌退出被拒绝也会丢失 jobId。
+    // 仅放行纯本机记录读取；GET /api/selection、/api/project 仍可能触发宿主 IPC，
+    // 因而不能把“GET”整体视为安全只读并全部放开。
+    final closingRead =
+        method == 'GET' &&
+        (RegExp(r'^/api/jobs/[0-9a-f]{32}$').hasMatch(path) ||
+            path == '/api/conversations' ||
+            RegExp(r'^/api/conversations/[0-9a-f]{32}$').hasMatch(path));
+    if (_closing && !closingRead && !path.startsWith('/api/desktop/')) {
+      throw const ApiException('工作台正在准备退出，已暂停新的操作。');
+    }
     if (!path.startsWith('/') ||
         path.startsWith('//') ||
         path.contains('://')) {
@@ -182,7 +205,15 @@ class WorkbenchApi extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
     _client.close(force: true);
     super.dispose();
+  }
+
+  /// 后台自然退出时，已经在途的 Future 仍可能完成 finally，不再向销毁的页面通知。
+  @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
   }
 }

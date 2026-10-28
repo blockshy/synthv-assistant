@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../core/api.dart';
 import '../widgets/audio_clip.dart';
+import 'page_chrome.dart';
 
 /// 素材页保持列表独立滚动，附件确认栏始终可见；导入仅写入本机资料库。
 class LibraryPage extends StatefulWidget {
@@ -115,171 +116,173 @@ class _LibraryPageState extends State<LibraryPage> {
       if (item.containsKey(key)) key: item[key],
   };
 
+  /// 素材采用连续列表行；选中背景只表达附件选择，不给每条音频重复套卡片。
   Widget _item(JsonMap item, bool busy) {
     final title = (item['label'] ?? item['name'] ?? '音频素材').toString();
     final key = _key(item);
     final duration =
         (item['durationSeconds'] as num?)?.toStringAsFixed(1) ?? '—';
-    return Card(
-      margin: const EdgeInsets.only(bottom: 8),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Checkbox(
-                  value: _selected.contains(key),
-                  onChanged: busy ? null : (value) => _toggle(item, value!),
-                ),
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Tooltip(
-                          message: title,
-                          child: Text(
-                            title,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleSmall,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          '${item['kind'] == 'recording' ? '工程录音' : '上传素材'} · $duration 秒',
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                        if ((item['note'] ?? '').toString().isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 6),
-                            child: Text(
-                              item['note'].toString(),
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-                IconButton(
-                  tooltip: item['starred'] == true ? '取消收藏' : '收藏音频',
-                  icon: Icon(
-                    item['starred'] == true
-                        ? Icons.star_rounded
-                        : Icons.star_outline_rounded,
-                    size: 18,
-                  ),
-                  onPressed: busy
-                      ? null
-                      : () => _change(() async {
-                          await widget.api.postJson(
-                            '/api/assets/${item['kind']}/${item['id']}/metadata',
-                            {'starred': item['starred'] != true},
-                          );
-                        }),
-                ),
-                IconButton(
-                  tooltip: '修改名称和备注',
-                  icon: const Icon(Icons.edit_note_rounded, size: 20),
-                  onPressed: busy
-                      ? null
-                      : () => setState(() {
-                          _editing = key;
-                          _purging = null;
-                          _name.text = title;
-                          _note.text = (item['note'] ?? '').toString();
-                        }),
-                ),
-                PopupMenuButton<String>(
-                  tooltip: '删除音频',
-                  enabled: !busy,
-                  icon: const Icon(Icons.delete_outline_rounded, size: 18),
-                  itemBuilder: (_) => const [
-                    PopupMenuItem(value: 'delete', child: Text('移入回收站')),
-                    PopupMenuItem(value: 'purge', child: Text('永久删除')),
-                  ],
-                  onSelected: (action) {
-                    if (action == 'purge') {
-                      setState(() {
-                        _purging = item;
-                        _editing = null;
-                      });
-                    } else {
-                      _change(() async {
-                        await widget.api.postJson(
-                          '/api/assets/${item['kind']}/${item['id']}/delete',
-                        );
-                      });
-                    }
-                  },
-                ),
-              ],
-            ),
-            AudioClip(key: ValueKey('audio:$key'), api: widget.api, clip: item),
-            if (_editing == key)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
+    final selected = _selected.contains(key);
+    final theme = Theme.of(context);
+    return Container(
+      decoration: BoxDecoration(
+        color: selected ? theme.colorScheme.surfaceContainerHighest : null,
+        border: Border(bottom: BorderSide(color: theme.dividerColor)),
+      ),
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Checkbox(
+                value: selected,
+                onChanged: busy ? null : (value) => _toggle(item, value!),
+              ),
+              Expanded(
                 child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    TextField(
-                      controller: _name,
-                      maxLength: 100,
-                      decoration: const InputDecoration(
-                        labelText: '名称',
-                        counterText: '',
+                    Tooltip(
+                      message: title,
+                      child: Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodyMedium,
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _note,
-                      minLines: 2,
-                      maxLines: 4,
-                      maxLength: 2000,
-                      decoration: const InputDecoration(
-                        labelText: '本地备注',
-                        counterText: '',
+                    Text(
+                      '${item['kind'] == 'recording' ? '工程录音' : '上传素材'}  ·  $duration 秒',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.end,
-                      children: [
-                        TextButton(
-                          onPressed: busy
-                              ? null
-                              : () => setState(() => _editing = null),
-                          child: const Text('取消'),
-                        ),
-                        const SizedBox(width: 8),
-                        FilledButton(
-                          onPressed: busy
-                              ? null
-                              : () => _change(() async {
-                                  await widget.api.postJson(
-                                    '/api/assets/${item['kind']}/${item['id']}/metadata',
-                                    {
-                                      'label': _name.text.trim(),
-                                      'note': _note.text,
-                                    },
-                                  );
-                                  if (mounted) setState(() => _editing = null);
-                                }),
-                          child: const Text('保存备注'),
-                        ),
-                      ],
                     ),
                   ],
                 ),
               ),
-          ],
-        ),
+              IconButton(
+                tooltip: item['starred'] == true ? '取消收藏' : '收藏音频',
+                icon: Icon(
+                  item['starred'] == true ? Icons.star : Icons.star_border,
+                  size: 17,
+                ),
+                onPressed: busy
+                    ? null
+                    : () => _change(() async {
+                        await widget.api.postJson(
+                          '/api/assets/${item['kind']}/${item['id']}/metadata',
+                          {'starred': item['starred'] != true},
+                        );
+                      }),
+              ),
+              IconButton(
+                tooltip: '修改名称和备注',
+                icon: const Icon(Icons.edit_note, size: 18),
+                onPressed: busy
+                    ? null
+                    : () => setState(() {
+                        _editing = key;
+                        _purging = null;
+                        _name.text = title;
+                        _note.text = (item['note'] ?? '').toString();
+                      }),
+              ),
+              PopupMenuButton<String>(
+                tooltip: '删除音频',
+                enabled: !busy,
+                icon: const Icon(Icons.delete_outline, size: 17),
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'delete', child: Text('移入回收站')),
+                  PopupMenuItem(value: 'purge', child: Text('永久删除')),
+                ],
+                onSelected: (action) {
+                  if (action == 'purge') {
+                    setState(() {
+                      _purging = item;
+                      _editing = null;
+                    });
+                  } else {
+                    _change(() async {
+                      await widget.api.postJson(
+                        '/api/assets/${item['kind']}/${item['id']}/delete',
+                      );
+                    });
+                  }
+                },
+              ),
+            ],
+          ),
+          if ((item['note'] ?? '').toString().isNotEmpty && _editing != key)
+            Padding(
+              padding: const EdgeInsets.only(left: 36, top: 3),
+              child: Tooltip(
+                message: item['note'].toString(),
+                child: Text(
+                  item['note'].toString(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall,
+                ),
+              ),
+            ),
+          AudioClip(key: ValueKey('audio:$key'), api: widget.api, clip: item),
+          if (_editing == key)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+              child: Column(
+                children: [
+                  PageProperty(
+                    label: '名称',
+                    child: TextField(
+                      controller: _name,
+                      enabled: !busy,
+                      maxLength: 100,
+                      decoration: const InputDecoration(counterText: ''),
+                    ),
+                  ),
+                  PageProperty(
+                    label: '本地备注',
+                    child: TextField(
+                      controller: _note,
+                      enabled: !busy,
+                      minLines: 2,
+                      maxLines: 4,
+                      maxLength: 2000,
+                      decoration: const InputDecoration(counterText: ''),
+                    ),
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () => setState(() => _editing = null),
+                        child: const Text('取消'),
+                      ),
+                      const SizedBox(width: 6),
+                      FilledButton(
+                        onPressed: busy
+                            ? null
+                            : () => _change(() async {
+                                await widget.api.postJson(
+                                  '/api/assets/${item['kind']}/${item['id']}/metadata',
+                                  {
+                                    'label': _name.text.trim(),
+                                    'note': _note.text,
+                                  },
+                                );
+                                if (mounted) setState(() => _editing = null);
+                              }),
+                        child: const Text('保存备注'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -305,158 +308,163 @@ class _LibraryPageState extends State<LibraryPage> {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          PageToolbar(
+            title: '音频素材',
+            actions: [
+              Tooltip(
+                message: '只导入本地素材库；附到会话后需点击发送才交给模型。',
+                child: Text(
+                  '${_items.length} 项',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton(
+                tooltip: '刷新音频素材',
+                onPressed: _loading || busy ? null : _load,
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+              const SizedBox(width: 6),
+              FilledButton.icon(
+                onPressed: busy ? null : _upload,
+                icon: const Icon(Icons.add, size: 16),
+                label: const Text('导入'),
+              ),
+            ],
+          ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
             child: Row(
               children: [
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '音频素材',
-                        style: Theme.of(context).textTheme.headlineSmall,
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '选择参考音频，或管理已保存的工程录音。',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ],
+                  child: TextField(
+                    controller: _search,
+                    onChanged: (_) => setState(() {}),
+                    decoration: const InputDecoration(
+                      hintText: '搜索名称或备注',
+                      prefixIcon: Icon(Icons.search, size: 17),
+                    ),
                   ),
-                ),
-                IconButton(
-                  tooltip: '刷新音频素材',
-                  onPressed: _loading ? null : _load,
-                  icon: const Icon(Icons.refresh_rounded),
                 ),
                 const SizedBox(width: 8),
-                FilledButton.icon(
-                  onPressed: busy ? null : _upload,
-                  icon: const Icon(Icons.add_rounded, size: 18),
-                  label: const Text('导入'),
+                SizedBox(
+                  width: 104,
+                  child: DropdownButtonFormField<String>(
+                    style: Theme.of(context).textTheme.bodyMedium,
+                    iconSize: 18,
+                    initialValue: _filter,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 8,
+                      ),
+                    ),
+                    items: [
+                      for (final entry in const {
+                        'all': '全部',
+                        'upload': '上传',
+                        'recording': '录音',
+                        'starred': '收藏',
+                      }.entries)
+                        DropdownMenuItem(
+                          value: entry.key,
+                          child: Text(entry.value),
+                        ),
+                    ],
+                    onChanged: (value) => setState(() => _filter = value!),
+                  ),
                 ),
               ],
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
-            child: TextField(
-              controller: _search,
-              onChanged: (_) => setState(() {}),
-              decoration: const InputDecoration(
-                hintText: '搜索名称或备注',
-                prefixIcon: Icon(Icons.search_rounded, size: 18),
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 12, 24, 8),
-            child: Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                for (final item in const {
-                  'all': '全部',
-                  'upload': '上传',
-                  'recording': '录音',
-                  'starred': '收藏',
-                }.entries)
-                  ChoiceChip(
-                    label: Text(item.value),
-                    selected: _filter == item.key,
-                    onSelected: (_) => setState(() => _filter = item.key),
-                  ),
-              ],
-            ),
-          ),
-          if (_feedback != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
-              child: Text(
-                _feedback!,
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ),
+          const Divider(height: 1),
           Expanded(
             child: _loading
-                ? const Center(child: CircularProgressIndicator())
+                ? const Center(
+                    child: SizedBox.square(
+                      dimension: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
                 : filtered.isEmpty
                 ? const Center(child: Text('暂无匹配的音频素材'))
                 : ListView.builder(
-                    padding: const EdgeInsets.fromLTRB(24, 8, 24, 12),
                     itemCount: filtered.length,
                     itemBuilder: (context, index) =>
                         _item(filtered[index], busy),
                   ),
           ),
+          if (_feedback != null)
+            PageNotice(
+              message: _feedback!,
+              onDismiss: () => setState(() => _feedback = null),
+            ),
           if (_purging != null)
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                border: Border(
-                  top: BorderSide(color: Theme.of(context).dividerColor),
-                ),
-              ),
-              child: Wrap(
-                spacing: 12,
-                runSpacing: 8,
-                crossAxisAlignment: WrapCrossAlignment.center,
+            PageFooter(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Text(
                     '永久删除「${_purging!['label'] ?? _purging!['name'] ?? '该音频'}」？此操作不能撤销。',
+                    style: Theme.of(context).textTheme.bodySmall,
                   ),
-                  TextButton(
-                    onPressed: busy
-                        ? null
-                        : () => setState(() => _purging = null),
-                    child: const Text('取消'),
-                  ),
-                  FilledButton(
-                    onPressed: busy
-                        ? null
-                        : () {
-                            final target = _purging!;
-                            _change(() async {
-                              await widget.api.postJson(
-                                '/api/assets/${target['kind']}/${target['id']}/purge',
-                                {'confirm': true},
-                              );
-                              if (mounted) setState(() => _purging = null);
-                            });
-                          },
-                    child: const Text('确认永久删除'),
+                  const SizedBox(height: 6),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () => setState(() => _purging = null),
+                        child: const Text('取消'),
+                      ),
+                      const SizedBox(width: 6),
+                      FilledButton(
+                        onPressed: busy
+                            ? null
+                            : () {
+                                final target = _purging!;
+                                _change(() async {
+                                  await widget.api.postJson(
+                                    '/api/assets/${target['kind']}/${target['id']}/purge',
+                                    {'confirm': true},
+                                  );
+                                  if (mounted) setState(() => _purging = null);
+                                });
+                              },
+                        child: const Text('确认永久删除'),
+                      ),
+                    ],
                   ),
                 ],
               ),
             ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-            decoration: BoxDecoration(
-              border: Border(
-                top: BorderSide(color: Theme.of(context).dividerColor),
-              ),
-            ),
+          PageFooter(
             child: Row(
               children: [
                 Expanded(
-                  child: Text(
-                    '已选择 ${_selected.length} / 2 段',
-                    style: Theme.of(context).textTheme.bodySmall,
+                  child: Tooltip(
+                    message: '仅加入会话草稿，尚未发送到模型。',
+                    child: Text(
+                      '已选 ${_selected.length} / 2 段',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                   ),
                 ),
-                TextButton(
+                IconButton(
+                  tooltip: '清空附件选择',
                   onPressed: _selected.isEmpty || busy
                       ? null
                       : () => setState(_selected.clear),
-                  child: const Text('清空'),
+                  icon: const Icon(Icons.clear_all, size: 18),
                 ),
                 const SizedBox(width: 8),
                 FilledButton.icon(
-                  onPressed: _selected.isEmpty || busy
+                  onPressed: _selected.isEmpty || busy || _loading
                       ? null
                       : () => widget.onAttach(
-                          // 保留用户选择次序，避免按创建时间排序后交换 A/B。
+                          // 保留用户点选次序，A/B 不因素材列表按创建时间排序而交换。
                           _selected
                               .map(
                                 (key) => _items.firstWhere(
@@ -466,7 +474,7 @@ class _LibraryPageState extends State<LibraryPage> {
                               .map(_attachment)
                               .toList(),
                         ),
-                  icon: const Icon(Icons.attach_file_rounded, size: 18),
+                  icon: const Icon(Icons.attach_file, size: 16),
                   label: const Text('附到会话'),
                 ),
               ],

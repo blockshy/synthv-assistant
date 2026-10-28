@@ -60,9 +60,32 @@ class AssistantService:
         self.jobs: dict[str, dict] = {}
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="synthv-audio")
         self.operation_lock = threading.RLock()
+        # 绑定锁覆盖宿主操作的完整周期；连接管理不能在读写途中替换桥接实例。
+        self.bridge_binding_lock = threading.RLock()
+        self._bridge_operation_root = None
+        self._bridge_saved_invalid = False
         self.recording = False
         # 会话管理器延迟构造；现有 MCP/录音功能不必提前加载模型调教模块。
         self._conversations = None
+        if isinstance(getattr(self.bridge, "directory", None), Path):
+            from .bridge_setup import restore_choice
+            restore_choice(self, DATA)
+
+    def operation_path(self) -> Path:
+        """接入旧脚本后与旧网页/MCP 使用同一个跨进程锁，业务资料目录不迁移。"""
+        return (self._bridge_operation_root or DATA) / "operation.lock"
+
+    def bridge_diagnostics(self) -> dict:
+        from .bridge_setup import diagnostics
+        return diagnostics(self, DATA)
+
+    def connect_bridge(self, payload: dict) -> dict:
+        from .bridge_setup import connect
+        return connect(self, DATA, payload)
+
+    def install_bridge(self, payload: dict) -> dict:
+        from .bridge_setup import install
+        return install(self, DATA, payload)
 
     def conversations(self):
         """共享唯一会话管理器，其持久化锁独立于工程操作锁。"""
@@ -209,11 +232,15 @@ class AssistantService:
         from .assets import upload_path
         return upload_path(identifier)
 
-    def status(self) -> dict:
+    def status(self, *, include_bridge_location: bool = False) -> dict:
         from .review import provider_status
-        bridge = self.bridge.status()
+        client = self.bridge
+        bridge = client.status()
+        if include_bridge_location:
+            # 路径只附加到桌面认证后的状态响应；网页原有公开状态不增加路径。
+            bridge = {**bridge, "ipcDirectory": str(client.directory)}
         try:
-            busy = operation_busy(DATA / "operation.lock")
+            busy = operation_busy(self.operation_path())
             operation_error = None
         except OSError:
             # 锁探测失败不能被解释成“空闲”；真正修改仍会重新申请锁并失败关闭。
@@ -229,15 +256,17 @@ class AssistantService:
             capture = {"available": False, "message": str(error)}
         return {"bridge": bridge, "capture": capture, "review": provider_status(),
                 "operationBusy": busy, "operationStatusError": operation_error,
-                "writeEnabled": bool(bridge.get("connected") and bridge.get("writeEnabled")), "version": "0.1.0"}
+                "writeEnabled": bool(bridge.get("connected") and bridge.get("writeEnabled")), "version": "0.2.0"}
 
     def get_project(self) -> dict:
-        return self.bridge.call("get_project")
+        with self.bridge_binding_lock:
+            return self.bridge.call("get_project")
 
     def get_selection(self) -> dict:
-        return self.bridge.call("get_selection")
+        with self.bridge_binding_lock:
+            return self.bridge.call("get_selection")
 
-    @exclusive_operation(lambda _service: DATA / "operation.lock")
+    @exclusive_operation(lambda service: service.operation_path(), guard_for_service=lambda service: service.bridge_binding_lock)
     def register_vocal_mode(self, payload: dict) -> dict:
         """把用户已核对的声线名称临时补入当前宿主目录，不写工程或持久文件。
 
@@ -296,7 +325,7 @@ class AssistantService:
         from .settings import clear_audio_settings
         return clear_audio_settings()
 
-    @exclusive_operation(lambda _service: DATA / "operation.lock")
+    @exclusive_operation(lambda service: service.operation_path(), guard_for_service=lambda service: service.bridge_binding_lock)
     def write_mode(self, enabled: bool) -> dict:
         """开启写入前备份磁盘版本；未保存的更改仍须由用户先另存副本。"""
         if not isinstance(enabled, bool):
@@ -320,7 +349,7 @@ class AssistantService:
                 result["backupFile"] = str(backup)
             return result
 
-    @exclusive_operation(lambda _service: DATA / "operation.lock")
+    @exclusive_operation(lambda service: service.operation_path(), guard_for_service=lambda service: service.bridge_binding_lock)
     def preview(self, parameter: str, delta: float | None = None, *, curve=None, render_mode="smooth") -> dict:
         """生成经过能力协商的预览，写入始终由另一次明确的 apply 完成。
 
@@ -341,7 +370,7 @@ class AssistantService:
                 preview = {**preview, "notes": selection_preview_notes(selection)}
             return public_preview(preview)
 
-    @exclusive_operation(lambda _service: DATA / "operation.lock")
+    @exclusive_operation(lambda service: service.operation_path(), guard_for_service=lambda service: service.bridge_binding_lock)
     def preview_batch(self, batch_id: str, actions: list[dict]) -> dict:
         """在一次宿主请求中预演最多五个参数，安全转换逐项失败信息。
 
@@ -384,7 +413,7 @@ class AssistantService:
                                    else "无法生成此参数的宿主预览，尚未修改工程；请检查桥接和当前选区。"})
             return {"previews": previews, "errors": errors}
 
-    @exclusive_operation(lambda _service: DATA / "operation.lock")
+    @exclusive_operation(lambda service: service.operation_path(), guard_for_service=lambda service: service.bridge_binding_lock)
     def edit(self, action: str, args: dict | None = None) -> dict:
         if action not in {"apply", "apply_batch", "restore"}:
             raise ValueError("未知编辑操作。")
@@ -446,7 +475,7 @@ class AssistantService:
         self.executor.submit(worker)
         return identifier
 
-    @exclusive_operation(lambda _service: DATA / "operation.lock")
+    @exclusive_operation(lambda service: service.operation_path(), guard_for_service=lambda service: service.bridge_binding_lock)
     def record(self, start_seconds: float, duration_seconds: float, label: str = "片段") -> dict:
         """先启动采集，再播放；默认录制工程当前混音，不擅自改变轨道静音/独奏。"""
         from .analysis import analyze_wav

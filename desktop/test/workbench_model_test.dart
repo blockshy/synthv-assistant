@@ -110,6 +110,48 @@ class RacingApi extends ModelApi {
 }
 
 void main() {
+  test('状态读取失败立即撤掉在线与可写快照，通知界面并允许后续恢复', () async {
+    final api = RacingApi();
+    final model = WorkbenchModel(api);
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    final displayed = <JsonMap>[];
+    model.addListener(
+      () => displayed.add(Map<String, dynamic>.from(model.status)),
+    );
+
+    api.delayedReads['/api/status'] = Completer<dynamic>()
+      ..complete({
+        'bridge': {'connected': true, 'session': 'fixture-session'},
+        'writeEnabled': true,
+      });
+    await model.refreshStatus();
+    expect(displayed.single['writeEnabled'], isTrue);
+
+    // 先建立错误监听，再模拟本机连接中断，避免测试自身产生未处理异步异常。
+    final unavailable = Completer<dynamic>();
+    api.delayedReads['/api/status'] = unavailable;
+    final failed = model.refreshStatus();
+    const failure = ApiException('合成连接中断', uncertain: true);
+    final checked = expectLater(failed, throwsA(same(failure)));
+    unavailable.completeError(failure);
+    await checked;
+    expect(model.status, isEmpty);
+    expect(displayed.length, 2);
+    expect(displayed.last, isEmpty);
+
+    api.delayedReads['/api/status'] = Completer<dynamic>()
+      ..complete({
+        'bridge': {'connected': true, 'session': 'recovered-session'},
+        'writeEnabled': false,
+      });
+    await model.refreshStatus();
+    expect(displayed.length, 3);
+    expect(displayed.last['bridge']['session'], 'recovered-session');
+    expect(displayed.last['writeEnabled'], isFalse);
+    expect(api.writes, isEmpty);
+  });
+
   test('切换会话期间禁止发送，迟到打开结果不会改变已开始请求的目标', () async {
     final api = RacingApi();
     final read = Completer<dynamic>();
