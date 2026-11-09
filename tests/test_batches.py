@@ -256,7 +256,8 @@ class BatchBoundaryTests(unittest.TestCase):
 
     def test_routes_require_token_and_reject_extra_fields(self):
         cases = [("preview", {"actionIds": ["a" * 32]}, "preview_action_batch"),
-                 ("apply", {"batchId": "b" * 32}, "apply_action_batch")]
+                 ("apply", {"batchId": "b" * 32}, "apply_action_batch"),
+                 ("restore", {"batchId": "c" * 32}, "restore_action_batch")]
         for verb, body, operation in cases:
             callback = getattr(self.service, operation)
             callback.return_value = {"actions": []}

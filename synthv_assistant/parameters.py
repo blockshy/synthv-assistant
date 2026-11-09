@@ -15,7 +15,9 @@ PARAMETER_LIMITS = {"breathiness": 0.3, "tension": 0.3, "gender": 0.3,
                     "loudness": 6.0, "pitchDelta": 100.0, "toneShift": 200.0,
                     "vibratoEnv": 0.3, "voicing": 0.3}
 MAX_CURVE_POINTS = 64
-MAX_PREVIEW_POINTS = 256
+# 自适应可视采样可覆盖短局部包络和节点中点；这不是允许写入的控制点数量，
+# 模型及手动输入的 64 节点上限保持不变。真实宿主仍负责误差和写后核验。
+MAX_PREVIEW_POINTS = 1024
 MAX_PREVIEW_CONTROL_POINTS = 4000
 MAX_PARAMETER_CONTEXT_POINTS = 33
 MAX_SELECTION_CONTEXT_POINTS = 512
@@ -86,9 +88,9 @@ def parameter_policy(parameter: object, selection: dict | None) -> tuple[float, 
             # 仅信任本地固定代码，绝不直接回显宿主可能包含工程路径的任意错误文本。
             # 此提示也用于旧提案：不会自动清除已有音高或将绝对 MIDI 曲线猜成偏移。
             if parameter == "pitchCurve" and definition.get("unavailableCode") == "pitch-delta-nonzero":
-                raise ParameterError("选区内已有非零音高偏移，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）做小幅调整，或在宿主中处理旧音高后重新读取选区。")
+                raise ParameterError("当前桥接将选区内已有音高偏移标记为原生曲线不兼容；请检查桥接版本与宿主旧曲线后重新读取选区，不能改用音高偏差代替重绘。")
             if parameter == "pitchCurve" and definition.get("unavailableCode") == "pitch-delta-unknown":
-                raise ParameterError("无法确认选区内音高偏移的兼容状态，原生音高曲线暂不可用；请使用音高偏移（pitchDelta）或检查宿主曲线。")
+                raise ParameterError("无法确认选区内旧音高的兼容状态，原生音高曲线暂不可用；请检查桥接和宿主曲线后重新读取选区。")
             raise ParameterError("当前声库或选区不支持该参数，请重新读取选区。")
     if parameter in PARAMETER_LIMITS:
         limit = PARAMETER_LIMITS[parameter]
@@ -136,7 +138,7 @@ def validate_change(parameter, delta=None, *, curve=None, render_mode="smooth", 
         raise ParameterError("请只提供一个参数增量或一条曲线。")
     limit, absolute_pitch = parameter_policy(parameter, selection)
     if absolute_pitch and render_mode != "smooth":
-        raise ParameterError("原生音高曲线只支持 smooth；控制点表示请使用 pitchDelta。")
+        raise ParameterError("原生音高曲线只支持绘制模式（smooth）；请切换绘制模式后重新生成预览，不能改用音高偏差代替。")
     result = {"parameter": parameter}
     if curve is not None:
         if not supports_curves(selection):
@@ -361,7 +363,7 @@ def public_preview(preview: object) -> dict:
 
     before 为 null 表示宿主没有可靠取得修改前的原生音高，不补造测量数据。
     controlPoints 为可选字段，仅含选区内经过宿主读回的候选节点，最多 4000 个；
-    它与最多 256 个 curvePreview 插值样本不可混用，旧桥接缺省时不伪造节点。
+    它与最多 1024 个 curvePreview 插值样本不可混用，旧桥接缺省时不伪造节点。
     畸形曲线整体拒绝，防止界面显示看似有效的预览却确认了不同内容。
     """
     if not isinstance(preview, dict) or not isinstance(preview.get("previewId"), str) or not 1 <= len(preview["previewId"]) <= 128:

@@ -61,6 +61,12 @@ class _Series {
     ];
     final minimum = values.isEmpty ? 0.0 : values.reduce(math.min);
     final maximum = values.isEmpty ? 1.0 : values.reduce(math.max);
+    // 图例报告真实的调整后取值；坐标留白仅用于绘图，不能冒充参数幅度。
+    final afterValues = points
+        .map((p) => (p['after'] as num).toDouble())
+        .toList();
+    afterLow = afterValues.isEmpty ? 0 : afterValues.reduce(math.min);
+    afterHigh = afterValues.isEmpty ? 0 : afterValues.reduce(math.max);
     final padding = math.max(
       (maximum - minimum) * .08,
       preview['parameter'] == 'pitchCurve' ? .5 : .01,
@@ -74,7 +80,13 @@ class _Series {
   late final List<JsonMap> controls;
   late final double low;
   late final double high;
-  String get label => '${preview['label'] ?? preview['parameter'] ?? '参数'}';
+  late final double afterLow;
+  late final double afterHigh;
+  String get label => switch (preview['parameter']) {
+    'pitchCurve' => '原生音高（替换）',
+    'pitchDelta' => '音高偏差（叠加）',
+    _ => '${preview['label'] ?? preview['parameter'] ?? '参数'}',
+  };
   String get unit => '${preview['unit'] ?? ''}';
   bool get nodes =>
       preview['renderMode'] == 'points' ||
@@ -104,7 +116,8 @@ class CurvePreview extends StatefulWidget {
 }
 
 class _CurvePreviewState extends State<CurvePreview> {
-  bool _before = false;
+  // 默认呈现原曲线，清楚区分“本次增量”与“宿主最终参数值”。
+  bool _before = true;
   final Set<String> _hidden = {};
   double? _position;
   static const _colors = [
@@ -153,7 +166,7 @@ class _CurvePreviewState extends State<CurvePreview> {
                 selected: !_hidden.contains(entry.label),
                 avatar: Icon(Icons.show_chart, size: 16, color: entry.color),
                 label: Text(
-                  '${entry.label} · ${curveNumber(entry.low)}–${curveNumber(entry.high)} ${entry.unit}',
+                  '${entry.label} · ${curveNumber(entry.afterLow)}–${curveNumber(entry.afterHigh)} ${entry.unit}',
                   style: const TextStyle(fontSize: 11),
                 ),
                 onSelected: (enabled) => setState(() {
@@ -164,21 +177,22 @@ class _CurvePreviewState extends State<CurvePreview> {
               ),
           ],
         ),
-        Row(
-          children: [
-            SizedBox(
-              width: 28,
-              height: 32,
-              child: Checkbox(
-                value: _before,
-                onChanged: (value) => setState(() => _before = value!),
+        if (valid.any((entry) => entry.points.any((p) => _finite(p['before']))))
+          Row(
+            children: [
+              SizedBox(
+                width: 28,
+                height: 32,
+                child: Checkbox(
+                  value: _before,
+                  onChanged: (value) => setState(() => _before = value!),
+                ),
               ),
-            ),
-            const Flexible(
-              child: Text('显示调整前（虚线）', style: TextStyle(fontSize: 11)),
-            ),
-          ],
-        ),
+              const Flexible(
+                child: Text('显示调整前（虚线）', style: TextStyle(fontSize: 11)),
+              ),
+            ],
+          ),
         LayoutBuilder(
           builder: (context, constraints) => MouseRegion(
             onExit: (_) => setState(() => _position = null),
@@ -222,6 +236,16 @@ class _CurvePreviewState extends State<CurvePreview> {
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 8),
+        if (all.any((entry) => entry.preview['parameter'] == 'pitchDelta'))
+          Text(
+            '音高偏差以音分叠加在原音高上；图中实线是写入后的偏差参数值，不是最终演唱音高。',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        if (all.any((entry) => entry.preview['parameter'] == 'pitchCurve'))
+          Text(
+            '原生曲线以绝对 MIDI 音高替换；未包含歌声合成及其他音高参数的最终结果。',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
         Text(
           all.length > 1
               ? '曲线按各自量程归一化，不能直接比较不同参数的绝对大小。音符为乐谱参考，不是实际演唱基频。'

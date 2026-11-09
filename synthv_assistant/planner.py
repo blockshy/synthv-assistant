@@ -20,6 +20,7 @@ from .model_options import normalize_model_options, validate_for_config, apply_r
 from .parameters import PARAMETER_LIMITS, ParameterError, supports_curves, validate_action, normalize_render_mode
 from .pitch_shapes import compile_pitch_shape, validate_note_alignment
 from .note_curves import compile_note_curves
+from .generation_policy import compile_note_edits, calibrate_generated_action, generation_limits
 from .tuning_context import musical_context
 from .prompts import PLANNER_BASE_INSTRUCTION, build_planner_instruction
 
@@ -71,7 +72,8 @@ def _history_data(history: list) -> list[dict]:
 
 
 def _build_user_text(text: str, selection: dict | None, history: list,
-                     audio_paths: list[Path], audio_context: list[dict], key: str) -> str:
+                     audio_paths: list[Path], audio_context: list[dict], key: str, *,
+                     allow_pitch_adjustments=False, allow_native_pitch=False) -> str:
     """校验输入并构造一个用户消息，明确区分当前要求和不可信的上下文资料。"""
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
         raise PlannerError("请填写 1 至 4000 字符的调教需求或咨询问题。")
@@ -84,6 +86,9 @@ def _build_user_text(text: str, selection: dict | None, history: list,
         raise PlannerError("音频上下文与附加音频不匹配，请重新选择录音。")
     material = {"history": _history_data(history), "selection": selection,
                 "musicalContext": musical_context(selection),
+                "generationPolicy": {"pitchPolicy": "redraw" if allow_native_pitch else
+                                     "local" if allow_pitch_adjustments else "preserve",
+                                     "startingLimits": generation_limits(selection) if _has_selection(selection) else {}},
                 "audioContext": audio_context, "hasUsableSelection": _has_selection(selection),
                 "inputMode": "audio" if audio_paths else "text"}
     try:
@@ -153,8 +158,10 @@ def _unsupported_claim(value: str, has_audio: bool, has_curves: bool = False) ->
 
 
 def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
-                selection: dict | None = None, render_mode="smooth") -> dict:
+                selection: dict | None = None, render_mode="smooth",
+                allow_pitch_adjustments=False, allow_native_pitch=False) -> dict:
     """只接受完整 JSON 或完整外层 json 围栏，不从散文、工具调用中猜测计划。"""
+    _validate_pitch_permissions(allow_pitch_adjustments, allow_native_pitch)
     if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_RESPONSE_CHARACTERS:
         raise PlannerError("模型没有返回有效的调教计划，请调整需求后重试。")
     candidate = raw.strip()
@@ -185,6 +192,33 @@ def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
     for action in actions:
         note_indices = None
         try:
+            if isinstance(action, dict):
+                # 音高策略来自用户界面/API 的独立字段，绝不从模型 reason、历史或
+                # “优化”等模糊词猜测授权；替换原生音高与叠加音分不能相互冒充。
+                if action.get("parameter") == "pitchCurve" and not allow_native_pitch:
+                    raise ParameterError("当前音高策略未允许重绘原生音高；请在会话中选择“重绘原生音高”后再生成。")
+                if action.get("parameter") == "pitchCurve":
+                    # 只收紧新 AI 输出，不改变手工/MCP/历史草稿的绝对曲线契约。
+                    # 任意折线可能在有限旋律检查点之间制造尖峰；逐音符结构由
+                    # 本机统一处理音符主体、过渡和单位，模型不能跳过短音符。
+                    shape = action.get("pitchShape")
+                    if not isinstance(shape, dict) or "notes" not in shape or "curve" in shape:
+                        raise ParameterError("原生音高生成需要 pitchShape.notes 逐音符包络；不接受整句任意折线或全部音符重复的统一模板。")
+                if action.get("parameter") == "pitchDelta":
+                    if not allow_pitch_adjustments:
+                        raise ParameterError("当前策略为保留音高，不能生成音高偏差；请先明确选择音高处理方式。")
+                    if allow_native_pitch:
+                        raise ParameterError("当前要求是重绘原生音高，模型却返回音高偏差，已拒绝替换处理方式。")
+                    if "noteEdits" not in action:
+                        raise ParameterError("微调音高偏差需要明确音符与位置的 noteEdits，不能自动生成整段偏移或任意起伏。")
+            if isinstance(action, dict) and "noteEdits" in action:
+                if set(action) - {"parameter", "reason", "renderMode", "noteEdits"}:
+                    raise ParameterError("局部表达不能与增量、整段曲线或其他包络混用。")
+                sources, compiled = compile_note_edits(action.get("parameter"), action["noteEdits"], selection)
+                note_indices = sorted(item["noteIndex"] for item in sources)
+                note_sources[action["parameter"]] = sources
+                action = {**action, "curve": compiled}
+                del action["noteEdits"]
             # 模型选择具体音符和增量，本地才负责秒坐标映射。编译后仍只保存既有
             # curve 契约，预览、复用、确认及恢复均不增加新的写入权限或执行入口。
             if isinstance(action, dict) and "noteCurves" in action:
@@ -213,6 +247,12 @@ def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
             normalized = validate_action(action, selection, reason_limit=1000)
             if normalized["parameter"] == "pitchCurve":
                 validate_note_alignment(normalized["curve"], selection)
+            normalized, scale, calibration_notes = calibrate_generated_action(normalized, selection)
+            if scale < 1 and normalized["parameter"] in note_sources:
+                # 保存的逐音符来源与最终候选必须等比例变化，避免跨段重预览时
+                # 恢复模型最初的过大幅度。不会把稀疏宿主采样保存为编辑曲线。
+                for item in note_sources[normalized["parameter"]]:
+                    item["curve"] = [[position, value * scale] for position, value in item["curve"]]
         except ParameterError as exc:
             raise PlannerError(str(exc)) from None
         parameter, reason = normalized["parameter"], normalized["reason"]
@@ -221,21 +261,19 @@ def _parse_plan(raw: object, *, has_selection: bool, has_audio: bool, key: str,
         if _contains_code(reason) or _unsupported_claim(reason, has_audio, has_curves):
             raise PlannerError("模型动作原因包含不支持的命令、执行声明或能力承诺，已拒绝该计划。")
         seen.add(parameter)
-        scope = ("（绘制原生音高控制曲线，会覆盖该段原有生成音高，并保留已有音高偏移；跨界原生曲线或区内引导点会拒绝预览，最终效果需试听。）"
-                 if parameter == "pitchCurve" else "（仅作用于当前所选音符覆盖的连续时间段。）")
+        scope = " 原生重绘会替换该范围的生成音高。" if parameter == "pitchCurve" else ""
         if note_indices is not None:
-            scope += " 局部包络目标：第" + "、".join(map(str, note_indices)) + "个选中音符；其余部分的目标增量为零，宿主插值结果请检查预览。"
+            scope += " 目标：第" + "、".join(map(str, note_indices)) + "个选中音符。"
+        if calibration_notes:
+            scope += " " + "".join(calibration_notes)
         checked.append({**normalized, "reason": _redact(reason, key) + scope})
     if {"pitchCurve", "pitchDelta"} <= seen:
         # 宿主组合写入也禁止这两种音高操作并存。计划阶段即说明冲突，避免生成
         # 两份看似可用、最终却无法组成同一批预览的建议，诱发重复请求或误操作。
         raise PlannerError("同一计划不能同时替换原生音高并叠加音高偏移，请选择一种音高处理方式。")
-    limitation = ("已附加音频，听感判断仍需你试听确认。" if has_audio else
-                  "本次未提供音频，建议仅依据结构和你的描述，尚未试听实际效果。")
-    if checked:
-        limitation += " 各项以当前选中音符跨度的连续时间段为目标，不会自动选字、改变选区或保证精确处理尾音。"
-    limitation += " 本次只生成建议，尚未修改工程；应用前需要预览并确认。"
-    result = {"text": _redact(explanation.strip(), key) + "\n\n" + limitation, "actions": checked}
+    # 预览/应用状态由工作台真实状态机展示；不再向每次回答追加已退役的音频
+    # 提醒与大段通用提示。原生替换影响及实际幅度收敛仅放在对应动作原因中。
+    result = {"text": _redact(explanation.strip(), key), "actions": checked}
     if note_sources:
         result["noteCurveSources"] = note_sources
     return result
@@ -270,17 +308,29 @@ def _gemini_text(response: dict) -> str:
     return "\n".join(texts)
 
 
+def _validate_pitch_permissions(allow_pitch_adjustments, allow_native_pitch):
+    """严格接受独立布尔权限，拒绝字符串真值和互相矛盾的音高策略。"""
+    if not isinstance(allow_pitch_adjustments, bool) or not isinstance(allow_native_pitch, bool):
+        raise PlannerError("音高生成权限必须是明确的布尔值。")
+    if allow_native_pitch and not allow_pitch_adjustments:
+        raise PlannerError("重绘原生音高需要明确的音高修改权限。")
+
+
 def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[Path], audio_context: list[dict],
-                model_options=None, on_progress=None, render_mode="smooth") -> dict:
+                model_options=None, on_progress=None, render_mode="smooth", *,
+                allow_pitch_adjustments=False, allow_native_pitch=False) -> dict:
     """生成文本咨询或音频辅助调教计划；不预览、不写参数、不调用宿主。
 
     路径白名单及选区去敏由调用层负责。此函数每次只读取一次设置快照；保存新
     设置不会更换正在运行请求的地址或凭据。网络调用仅一次，任何失败不自动重试。
     """
     try:
+        _validate_pitch_permissions(allow_pitch_adjustments, allow_native_pitch)
         mode = normalize_render_mode(render_mode)
         system_instruction = build_planner_instruction(selection, has_selection=_has_selection(selection),
-                                                      render_mode=mode, audio_count=len(audio_paths) if isinstance(audio_paths, list) else 0)
+                                                      render_mode=mode, audio_count=len(audio_paths) if isinstance(audio_paths, list) else 0,
+                                                      allow_pitch_adjustments=allow_pitch_adjustments,
+                                                      allow_native_pitch=allow_native_pitch)
         options = normalize_model_options(model_options)
         if model_options is None:
             # 旧 MCP/直接调用继续采用默认设置，不在读取时迁移凭据文件。
@@ -357,7 +407,9 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
                 raise PlannerError(str(exc)) from None
 
         report("正在准备请求")
-        prompt = _build_user_text(text, selection, history, audio_paths, audio_context, config["key"])
+        prompt = _build_user_text(text, selection, history, audio_paths, audio_context, config["key"],
+                                  allow_pitch_adjustments=allow_pitch_adjustments,
+                                  allow_native_pitch=allow_native_pitch)
         # 纯文本咨询绝不调用加载音频函数，也不要求模型支持音频输入。
         files = _load_audio(audio_paths) if audio_paths else []
         if config["provider"] in {"openai", "qwen"}:
@@ -398,7 +450,8 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
             raw = _gemini_text(response)
         report("正在校验调教建议")
         plan = _parse_plan(raw, has_selection=_has_selection(selection), has_audio=bool(files), key=config["key"],
-                           selection=selection, render_mode=mode)
+                           selection=selection, render_mode=mode,
+                           allow_pitch_adjustments=allow_pitch_adjustments, allow_native_pitch=allow_native_pitch)
         return {**plan, "provider": config["provider"], "model": config["model"], "inputMode": "audio" if files else "text",
                 "platformId": options["platformId"], "reasoningEffort": options["reasoningEffort"],
                 "reasoningSummary": safe_reasoning()}

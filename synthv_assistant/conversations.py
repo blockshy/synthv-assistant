@@ -44,6 +44,13 @@ REPLY_RESERVE_BYTES = 192 * 1024
 ACTION_STATES = {"proposed", "previewed", "applied", "unknown"}
 
 
+def normalize_pitch_policy(value: object) -> str:
+    """本次请求明确选择音高操作种类；历史会话或模型文本不能继承写入授权。"""
+    if not isinstance(value, str) or value not in {"preserve", "local", "redraw"}:
+        raise ConversationError("请选择保留音高、微调音高偏差或重绘原生音高。")
+    return value
+
+
 class ConversationError(ValueError):
     """仅包含可以公开展示的固定提示，不拼接模型、密钥或文件系统原始异常。"""
 
@@ -210,7 +217,7 @@ def _public_document(document: dict) -> dict:
     result["modelOptions"] = normalize_model_options(document.get("modelOptions"))
     result["renderMode"] = normalize_render_mode(document.get("renderMode", "smooth"))
     fields = {"id", "role", "text", "createdAt", "attachments", "inputMode", "provider", "model", "selection",
-              "platformId", "reasoningEffort", "reasoningSummary", "renderMode", "origin"}
+              "platformId", "reasoningEffort", "reasoningSummary", "renderMode", "origin", "pitchPolicy"}
     result["messages"] = [{**{key: value for key, value in message.items() if key in fields},
                            "actions": [_public_action(action) for action in message.get("actions", [])]}
                           for message in document["messages"]]
@@ -455,8 +462,9 @@ class ConversationManager:
                 "attachments": [], "actions": [], **extra}
 
     def send_message(self, identifier: str, text: str, include_selection: bool, attachments: list,
-                     model_options=None, on_progress=None, render_mode=None) -> dict:
+                     model_options=None, on_progress=None, render_mode=None, pitch_policy="preserve") -> dict:
         identifier = _identifier(identifier)
+        pitch_policy = normalize_pitch_policy(pitch_policy)
         if not isinstance(text, str) or not 1 <= len(text.strip()) <= MAX_TEXT_CHARS:
             raise ConversationError("请输入 1 至 4000 个字符的调教要求。")
         if not isinstance(include_selection, bool):
@@ -467,7 +475,7 @@ class ConversationManager:
             raise ConversationError("音频附件已停止接收，请仅发送文字和选区；历史资料不受影响。")
         text = text.strip()
         with self._lock(identifier), self.library.use_assets(attachments):
-            # 本锁只阻止同一会话重复发送；模型等待期间其他会话和本地录音仍可进行。
+            # 本锁只阻止同一会话重复发送；模型等待期间其他会话仍可独立浏览。
             current = self._read(identifier)
             # 模式是本次请求的快照；修改偏好不会重写历史提案的实际表示方式。
             mode = normalize_render_mode(render_mode if render_mode is not None else current.get("renderMode", "smooth"))
@@ -494,6 +502,7 @@ class ConversationManager:
                 user = self._message("user", text, attachments=metadata)
                 document["renderMode"] = mode
                 user["renderMode"] = mode
+                user["pitchPolicy"] = pitch_policy
                 if safe_selection is not None:
                     user["selection"] = safe_selection
                 document["messages"].append(user)
@@ -511,7 +520,8 @@ class ConversationManager:
                         on_progress(value)
 
             try:
-                extra = {}
+                extra = {"allow_pitch_adjustments": pitch_policy != "preserve",
+                         "allow_native_pitch": pitch_policy == "redraw"}
                 if render_mode is not None or mode != "smooth":
                     extra["render_mode"] = mode
                 if chosen is not None:
@@ -519,7 +529,13 @@ class ConversationManager:
                 if on_progress is not None:
                     extra["on_progress"] = publish_progress
                 plan = _plan_tuning(text, safe_selection, history, paths, metadata, **extra)
+                # 持久层再核对一次明确选择，防止规划器回归把偏差微调和原生重绘互换。
+                allowed_pitch = {"preserve": set(), "local": {"pitchDelta"}, "redraw": {"pitchCurve"}}[pitch_policy]
+                if any(isinstance(action, dict) and action.get("parameter") in {"pitchCurve", "pitchDelta"}
+                       and action["parameter"] not in allowed_pitch for action in plan.get("actions", [])):
+                    raise PlannerError("模型提出的音高操作与本次音高策略不同，未生成可应用方案；请明确选择音高操作后重试。")
                 reply, guards = self._planned_message(plan, selection, session)
+                reply["pitchPolicy"] = pitch_policy
             except PlannerError as error:
                 # 规划器专用异常只含已脱敏的固定提示，保留认证/限流/未配置等可操作原因。
                 reply = self._message("error", str(error))
@@ -1046,6 +1062,65 @@ class ConversationManager:
                         results.append(action["result"])
                 self._save(document)
                 return {"batchId": identifier, "actions": [_public_action(action) for action in actions], "results": results}
+
+    def restore_batch(self, batch_id: object) -> dict:
+        """撤销已确认的指定批次；宿主必须证明它仍是最近修改，不能误撤其他方案。
+
+        发出恢复之前将动作记为 unknown，进程崩溃或回执丢失时不会重复恢复。
+        只有宿主明确返回“未执行”的固定原因才能回到 applied；其余失败保持未知。
+        恢复成功清除旧预览与结果，原有目标守卫仍用于下一轮重新预览。
+        """
+        identifier = _identifier(batch_id)
+        with self._lock():
+            documents = [self._read(path.stem) for path in self._paths()]
+            matches = [(document, message) for document in documents for message in document["messages"]
+                       if any(action.get("previewBatchId") == identifier for action in message.get("actions", []))]
+            if len(matches) != 1:
+                raise ConversationError("找不到本次应用记录；请在 SynthV 检查撤销历史。")
+            document, message = matches[0]
+            with self._lock(document["id"]), self.service.operation_lock:
+                self.library.assert_available("conversation", document["id"])
+                actions = [action for action in message["actions"] if action.get("previewBatchId") == identifier]
+                if any(action.get("status") != "applied" or action.get("result", {}).get("verified") is not True
+                       for action in actions):
+                    raise ConversationError("此方案没有可确认的已应用记录；结果未知时请先检查 SynthV。")
+                state = self.service.bridge.status()
+                if not state.get("connected") or state.get("capabilities", {}).get("batchRestore") is not True:
+                    raise ConversationError("请更新并运行桥接后使用“撤销本次应用”；当前桥接不能核对方案身份。")
+                if state.get("writeEnabled") is not True:
+                    raise ConversationError("撤销也会修改工程，请先允许修改当前选区。")
+                for action in actions:
+                    action["status"] = "unknown"
+                self._save(document)
+                verified, rejected, reason = False, False, None
+                try:
+                    result = self.service.edit("restore_batch", {"batchId": identifier})
+                    verified = isinstance(result, dict) and result.get("verified") is True and result.get("batchId") == identifier
+                    rejected = (isinstance(result, dict) and result.get("rejected") is True
+                                and result.get("reason") in {"not_latest_batch", "wrong_project", "wrong_group"})
+                    reason = result.get("reason") if rejected else None
+                except Exception:
+                    # 不回显宿主异常：其中可能含工程路径；未知恢复不重发写命令。
+                    pass
+                if verified:
+                    for action in actions:
+                        action["status"] = "proposed"
+                        for key in ("preview", "previewBatchId", "result"):
+                            action.pop(key, None)
+                    document["_private"].pop("batch", None)
+                elif rejected:
+                    for action in actions:
+                        action["status"] = "applied"
+                else:
+                    for action in actions:
+                        action["result"] = {"verified": False, "message": "撤销结果未确认，请检查 SynthV；不要重复提交。"}
+                self._save(document)
+                messages = {"not_latest_batch": "此方案已不是最近一次助手修改，未执行撤销；请在 SynthV 检查撤销历史。",
+                            "wrong_project": "当前工程与此方案不同，未执行撤销；请回到原工程。",
+                            "wrong_group": "当前音符组与此方案不同，未执行撤销；请回到原音符组。"}
+                return {"batchId": identifier, "verified": verified, "rejected": rejected,
+                        "message": "已撤销本次应用，可重新预览。" if verified else messages.get(reason, "撤销结果未确认，请检查 SynthV；不要重复提交。"),
+                        "actions": [_public_action(action) for action in actions]}
 
     def apply_action(self, action_id: str) -> dict:
         with self._lock():

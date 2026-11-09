@@ -12,6 +12,7 @@ from urllib import error
 import wave
 
 from synthv_assistant import planner
+from synthv_assistant.generation_policy import AI_STARTING_LIMITS
 from tests.test_parameters import modern_selection
 
 
@@ -76,9 +77,9 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn("max_completion_tokens", body)
         self.assertNotIn("max_tokens", body)
         self.assertEqual(result["inputMode"], "text")
-        self.assertIn("未提供音频", result["text"])
-        self.assertIn("尚未修改工程", result["text"])
-        self.assertIn("连续时间段", result["actions"][0]["reason"])
+        # 退役的音频及流程脚注不再污染每条回复，真实状态由工作台统一显示。
+        self.assertEqual(result["text"], self.default_plan["text"])
+        self.assertEqual(result["actions"][0]["reason"], self.default_plan["actions"][0]["reason"])
         self.snapshot.assert_called_once()
 
     def test_openai_audio_contains_real_wav_base64(self):
@@ -145,25 +146,31 @@ class PlannerTests(unittest.TestCase):
         with self.assertRaises(planner.PlannerError):
             self.call()
 
-    def test_all_parameter_limits_allow_boundary_and_reject_overshoot(self):
+    def test_parameter_hard_boundaries_are_rejected_or_scaled_to_generation_budget(self):
         self.selection.update(modern_selection())
         for parameter, limit in planner.PARAMETER_LIMITS.items():
+            if parameter == "pitchDelta":
+                # 音高偏差生成必须使用有目标的局部表达，单独的策略测试覆盖该路径。
+                continue
             for delta in (-limit, limit):
                 with self.subTest(parameter=parameter, delta=delta):
                     self.respond({"text": "建议先小范围试听。", "actions": [{"parameter": parameter, "delta": delta, "reason": "进行有界调整。"}]})
-                    self.assertEqual(self.call()["actions"][0]["delta"], delta)
+                    action = self.call()["actions"][0]
+                    self.assertAlmostEqual(action["delta"], AI_STARTING_LIMITS[parameter] * (1 if delta > 0 else -1))
+                    self.assertIn("等比减小幅度", action["reason"])
             with self.subTest(parameter=parameter), self.assertRaises(planner.PlannerError):
                 self.respond({"text": "测试", "actions": [{"parameter": parameter, "delta": limit + 0.000001, "reason": "测试"}]})
                 self.call()
 
     def test_dynamic_mode_and_piecewise_curve_are_bound_to_current_catalog(self):
-        """模型只能使用本次真实目录；音高分段仍是一条有限参数动作。"""
+        """模型只能使用本次真实目录；通用参数分段仍是一条有限参数动作。"""
         self.selection.update(modern_selection())
         actions = [{"parameter": "vocalMode_Soft", "delta": 20, "reason": "增加柔和模式。"},
-                   {"parameter": "pitchDelta", "curve": [[0, 0], [0.4, -25], [0.8, 15], [1, 0]],
+                   {"parameter": "loudness", "curve": [[0, 0], [0.4, -1.5], [0.8, 1], [1, 0]],
                     "renderMode": "points", "reason": "在选区内表达分段偏移。"}]
         self.respond({"text": "根据选区结构建议这些变化，仍需试听。", "actions": actions})
         result = self.call()
+        self.assertEqual(result["actions"][0]["delta"], 10)
         self.assertEqual(result["actions"][1]["curve"], actions[1]["curve"])
         # 会话当前默认绘制模式优先，模型自行写的 points 不能覆盖用户偏好。
         self.assertEqual(result["actions"][1]["renderMode"], "smooth")
@@ -189,14 +196,13 @@ class PlannerTests(unittest.TestCase):
         self.selection["notes"] = [{"pitch": 48, "onsetSeconds": 1, "durationSeconds": 1},
                                    {"pitch": 52, "onsetSeconds": 2, "durationSeconds": 1}]
         self.respond({"text": "可以逐点绘制选区内的有限趋势，依据仅为音符结构。",
-                      "actions": [{"parameter": "pitchCurve", "curve": [[0, 60], [0.49, 60], [0.51, 64], [1, 64]],
+                      "actions": [{"parameter": "pitchCurve", "pitchShape": {"notes": [
+                          {"noteIndex": 1, "curve": [[0, 0], [1, 0]]}]},
                                    "reason": "按工程音高规划。"}]})
-        result = self.call()
+        result = self.call(allow_pitch_adjustments=True, allow_native_pitch=True)
         self.assertEqual(result["actions"][0]["renderMode"], "smooth")
-        self.assertIn("未提供音频", result["text"])
-        # 原生控制曲线不再因旧偏移存在而被一律拒绝；规划说明必须保留依赖与试听语义。
-        self.assertIn("保留已有音高偏移", result["actions"][0]["reason"])
-        self.assertIn("最终效果需试听", result["actions"][0]["reason"])
+        self.assertNotIn("未提供音频", result["text"])
+        self.assertIn("替换该范围的生成音高", result["actions"][0]["reason"])
         for text in ("我已经听过音高效果。", "我可以自动选中末音。"):
             self.respond({"text": text, "actions": []})
             with self.assertRaises(planner.PlannerError):
@@ -209,22 +215,23 @@ class PlannerTests(unittest.TestCase):
             {"pitch": 48, "onsetSeconds": 1, "durationSeconds": 0.1},
             {"pitch": 52, "onsetSeconds": 1.1, "durationSeconds": 1.9}])
         self.respond({"text": "依据音符保持旋律，小幅调整起音和尾音。", "actions": [{
-            "parameter": "pitchCurve", "pitchShape": {"curve": [[0, -10], [0.3, 0], [1, -8]]}, "reason": "小幅变化。"}]})
-        action = self.call()["actions"][0]
+            "parameter": "pitchCurve", "pitchShape": {"notes": [
+                {"noteIndex": 2, "curve": [[0, -10], [0.3, 0], [1, -8]]}]}, "reason": "小幅变化。"}]})
+        action = self.call(allow_pitch_adjustments=True, allow_native_pitch=True)["actions"][0]
         self.assertNotIn("pitchShape", action)
         self.assertGreater(len(action["curve"]), 4)
         self.assertTrue(any(position < 0.05 and 59.5 <= value <= 60.5 for position, value in action["curve"]))
         with self.assertRaises(planner.PlannerError):
-            self.call(render_mode="points")
+            self.call(render_mode="points", allow_pitch_adjustments=True, allow_native_pitch=True)
         self.respond({"text": "不合旋律的旧稀疏曲线。", "actions": [{
             "parameter": "pitchCurve", "curve": [[0, 60], [1, 64]], "reason": "跨度内变化。"}]})
         with self.assertRaises(planner.PlannerError):
-            self.call()
+            self.call(allow_pitch_adjustments=True, allow_native_pitch=True)
 
     def test_conversation_render_mode_overrides_model_preference_without_changing_values(self):
         self.selection.update(modern_selection())
-        self.respond({"text": "尝试有限偏移。", "actions": [{"parameter": "pitchDelta",
-            "curve": [[0, 0], [0.5, 20], [1, 0]], "renderMode": "smooth", "reason": "保留原音高轮廓。"}]})
+        self.respond({"text": "尝试有限偏移。", "actions": [{"parameter": "tension",
+            "curve": [[0, 0], [0.5, -0.05], [1, 0]], "renderMode": "smooth", "reason": "降低张力。"}]})
         self.assertEqual(self.call(render_mode="points")["actions"][0]["renderMode"], "points")
         self.assertIn("本次会话绘制模式为 points", self.http.call_args.args[1]["messages"][0]["content"])
         self.assertEqual(self.call(render_mode="smooth")["actions"][0]["renderMode"], "smooth")

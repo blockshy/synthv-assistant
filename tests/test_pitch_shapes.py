@@ -246,7 +246,8 @@ class PitchPreviewConversationTests(unittest.TestCase):
         self.identifier = self.manager.create_conversation()["id"]
 
     def propose(self):
-        return self.manager.send_message(self.identifier, "测试音高", True, [])["messages"][-1]["actions"][0]
+        return self.manager.send_message(self.identifier, "测试音高", True, [],
+                                         pitch_policy="redraw")["messages"][-1]["actions"][0]
 
     def test_old_rough_pitch_proposal_is_rejected_before_host_preview(self):
         from synthv_assistant.conversations import ConversationError
@@ -273,18 +274,21 @@ class PitchPreviewConversationTests(unittest.TestCase):
 
     def test_planner_shape_fields_and_point_mode_cannot_bypass_native_contract(self):
         from synthv_assistant.planner import _parse_plan, PlannerError
-        shape = {"parameter": "pitchCurve", "pitchShape": {"curve": [[0, 0], [1, 0]]}, "reason": "保持旋律。"}
+        shape = {"parameter": "pitchCurve", "pitchShape": {"notes": [
+            {"noteIndex": 1, "curve": [[0, 0], [1, 0]]}]}, "reason": "保持旋律。"}
         bad = [{**shape, "delta": 0.1}, {**shape, "curve": self.curve}, {**shape, "code": "untrusted"},
                {**shape, "pitchShape": None}, {**shape, "pitchShape": True}, {**shape, "renderMode": None},
                {**shape, "renderMode": True}, {**shape, "renderMode": "invalid"}, {**shape, "parameter": "pitchDelta"}]
         for action in bad:
             with self.subTest(action=repr(action)), self.assertRaises(PlannerError):
                 _parse_plan(json.dumps({"text": "测试", "actions": [action]}),
-                            has_selection=True, has_audio=False, key="", selection=self.selection)
+                            has_selection=True, has_audio=False, key="", selection=self.selection,
+                            allow_pitch_adjustments=True, allow_native_pitch=True)
         for action in (shape, {"parameter": "pitchCurve", "curve": self.curve, "renderMode": "smooth", "reason": "保持旋律。"}):
             with self.subTest(action=repr(action)), self.assertRaises(PlannerError):
                 _parse_plan(json.dumps({"text": "测试", "actions": [action]}),
-                            has_selection=True, has_audio=False, key="", selection=self.selection, render_mode="points")
+                            has_selection=True, has_audio=False, key="", selection=self.selection, render_mode="points",
+                            allow_pitch_adjustments=True, allow_native_pitch=True)
 
 
 if __name__ == "__main__":

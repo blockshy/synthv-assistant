@@ -19,7 +19,7 @@ import 'widgets/model_picker.dart';
 import 'widgets/workbench_dropdown.dart';
 import 'widgets/workbench_expansion_tile.dart';
 
-/// 三栏工作台只组织页面与会话；所有宿主写入都沿用后端票据流程。
+/// 导航与主页面组成工作台；工程编辑有独立空间，宿主写入沿用后端票据流程。
 class Workbench extends StatefulWidget {
   const Workbench({
     super.key,
@@ -46,8 +46,9 @@ class _WorkbenchState extends State<Workbench> {
   final _composerFocus = FocusNode();
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   int page = 0;
-  double leftWidth = 230, rightWidth = 302;
-  bool leftVisible = true, rightVisible = true;
+  double leftWidth = 230;
+  bool leftVisible = true;
+  bool _inspectorVisited = false;
   String search = '';
   Timer? _statusTimer, _saveTimer;
   bool _loadingStatus = false;
@@ -84,7 +85,6 @@ class _WorkbenchState extends State<Workbench> {
     if (!mounted) return;
     setState(() {
       leftWidth = (prefs.getDouble('leftWidth') ?? 230).clamp(190, 340);
-      rightWidth = (prefs.getDouble('rightWidth') ?? 302).clamp(260, 430);
     });
   }
 
@@ -93,7 +93,6 @@ class _WorkbenchState extends State<Workbench> {
     _saveTimer = Timer(const Duration(milliseconds: 350), () async {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setDouble('leftWidth', leftWidth);
-      await prefs.setDouble('rightWidth', rightWidth);
     });
   }
 
@@ -140,6 +139,7 @@ class _WorkbenchState extends State<Workbench> {
     if (!await _canLeaveSettings() || !mounted) return;
     setState(() {
       page = target;
+      if (target == 6) _inspectorVisited = true;
     });
   }
 
@@ -164,7 +164,6 @@ class _WorkbenchState extends State<Workbench> {
   }
 
   void _openConnection() {
-    _scaffoldKey.currentState?.closeEndDrawer();
     _navigate(5);
   }
 
@@ -295,25 +294,11 @@ class _WorkbenchState extends State<Workbench> {
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, bounds) {
-      final wide = bounds.maxWidth >= 1160;
       final left = leftVisible && bounds.maxWidth >= 940;
-      final right = rightVisible && wide;
-      final rightContext = page == 0;
       final actualLeft = math.min(leftWidth, bounds.maxWidth * .23);
-      final actualRight = math.min(rightWidth, bounds.maxWidth * .28);
       return Scaffold(
         key: _scaffoldKey,
         drawer: Drawer(width: 260, child: _sidebar()),
-        endDrawer: SizedBox(
-          width: 340,
-          child: Drawer(
-            child: Inspector(
-              key: ValueKey(_bridgeGeneration),
-              api: widget.api,
-              onConnection: _openConnection,
-            ),
-          ),
-        ),
         body: Column(
           children: [
             DesktopTitleBar(
@@ -354,18 +339,6 @@ class _WorkbenchState extends State<Workbench> {
                       PopupMenuItem(value: ThemeMode.dark, child: Text('深色')),
                     ],
                   ),
-                  if (rightContext)
-                    IconButton(
-                      tooltip: right ? '收起工程检查器' : '打开工程检查器',
-                      onPressed: () {
-                        if (wide) {
-                          setState(() => rightVisible = !rightVisible);
-                        } else {
-                          _scaffoldKey.currentState?.openEndDrawer();
-                        }
-                      },
-                      icon: const Icon(Icons.tune_rounded),
-                    ),
                   const SizedBox(width: 12),
                 ],
               ),
@@ -393,42 +366,31 @@ class _WorkbenchState extends State<Workbench> {
                         _saveLayout();
                       },
                     ),
-                  Expanded(child: ClipRect(child: _page())),
-                  // 属性面板仅在工程相关页面占用宽度；隐藏时保留已读选区与草稿。
-                  if (right)
-                    Visibility(
-                      visible: rightContext,
-                      maintainState: true,
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
+                  Expanded(
+                    child: ClipRect(
+                      // 工程页首次进入才创建，离开后保留本地草稿与预览；隐藏期间
+                      // Inspector 停止轮询，避免“仅切换页面”触发宿主读取或丢失编辑。
+                      child: Stack(
+                        fit: StackFit.expand,
                         children: [
-                          _ResizeHandle(
-                            label: '调整检查器宽度',
-                            onDelta: (delta) {
-                              setState(
-                                () => rightWidth = (rightWidth - delta).clamp(
-                                  260,
-                                  430,
+                          _page(),
+                          if (_inspectorVisited)
+                            Offstage(
+                              offstage: page != 6,
+                              child: TickerMode(
+                                enabled: page == 6,
+                                child: Inspector(
+                                  key: ValueKey(_bridgeGeneration),
+                                  api: widget.api,
+                                  active: page == 6,
+                                  onConnection: _openConnection,
                                 ),
-                              );
-                              _saveLayout();
-                            },
-                            onReset: () {
-                              setState(() => rightWidth = 302);
-                              _saveLayout();
-                            },
-                          ),
-                          SizedBox(
-                            width: actualRight,
-                            child: Inspector(
-                              key: ValueKey(_bridgeGeneration),
-                              api: widget.api,
-                              onConnection: _openConnection,
+                              ),
                             ),
-                          ),
                         ],
                       ),
                     ),
+                  ),
                 ],
               ),
             ),
@@ -473,6 +435,7 @@ class _WorkbenchState extends State<Workbench> {
           ),
           // 返回当前草稿只切换页面；不能通过新建会话丢弃尚未发送的内容。
           _nav(0, Icons.chat_bubble_outline_rounded, '当前会话'),
+          _nav(6, Icons.tune_rounded, '工程与参数'),
           _nav(5, Icons.cable_outlined, 'SynthV 连接'),
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 12, 8, 4),
@@ -678,6 +641,8 @@ class _WorkbenchState extends State<Workbench> {
   );
 
   Widget _page() => switch (page) {
+    // 独立工程页由持久容器承载，不能在普通页面切换时重新挂载。
+    6 => const SizedBox.shrink(),
     5 => ConnectionPage(api: widget.api, onChanged: _connectionChanged),
     3 => TrashPage(
       api: widget.api,
@@ -982,6 +947,16 @@ class _WorkbenchState extends State<Workbench> {
                           }
                         },
                       ),
+                    // 音高策略随请求快照展示，避免切换策略后把历史方案误认为本次授权。
+                    if (user && message['pitchPolicy'] != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(switch (message['pitchPolicy']) {
+                          'local' => '音高策略 · 偏差微调（叠加）',
+                          'redraw' => '音高策略 · 原生重绘（替换）',
+                          _ => '音高策略 · 保留原音高',
+                        }, style: Theme.of(context).textTheme.bodySmall),
+                      ),
                     for (final clip in maps(message['attachments']))
                       Padding(
                         padding: const EdgeInsets.only(top: 8),
@@ -1262,7 +1237,7 @@ class _WorkbenchState extends State<Workbench> {
     );
   }
 
-  /// 会话工具栏只保留日常决策：模型、推理和绘制方式。
+  /// 会话工具栏明确区分曲线表示方式与音高修改对象；后者是每次请求的权限边界。
   /// 平台凭据与目录管理留在模型服务页；模型弹层一次返回完整的平台/型号组合。
   Widget _modelControls(bool disabled) => LayoutBuilder(
     builder: (context, constraints) {
@@ -1386,6 +1361,19 @@ class _WorkbenchState extends State<Workbench> {
                 setState(() => model.renderMode = value!);
                 unawaited(model.savePreferences());
               },
+            ),
+            option(
+              label: '音高',
+              value: model.pitchPolicy,
+              options: const [
+                {'value': 'preserve', 'label': '保留原音高'},
+                {'value': 'local', 'label': '偏差微调'},
+                {'value': 'redraw', 'label': '原生重绘'},
+              ],
+              tooltip:
+                  '保留：仅调整其他参数。\n偏差微调：在原音高上叠加指定音符的局部偏差。\n'
+                  '原生重绘：替换选区内原生音高曲线，不会改用音高偏差。',
+              onChanged: (value) => model.setPitchPolicy(value!),
             ),
           ],
         ),

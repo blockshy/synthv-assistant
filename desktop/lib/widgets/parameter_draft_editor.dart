@@ -97,6 +97,7 @@ class ParameterDraftEditor extends StatefulWidget {
     required this.parameter,
     required this.enabled,
     required this.onChanged,
+    this.canvasHeight,
   });
   final List<List<double>> points;
   final List<double> bounds;
@@ -104,6 +105,9 @@ class ParameterDraftEditor extends StatefulWidget {
   final String parameter;
   final bool enabled;
   final ValueChanged<List<List<double>>> onChanged;
+
+  /// 独立参数页可扩大画布；几何与命中测试仍使用同一个实际尺寸，避免拖动偏差。
+  final double? canvasHeight;
   @override
   State<ParameterDraftEditor> createState() => _ParameterDraftEditorState();
 }
@@ -260,7 +264,10 @@ class _ParameterDraftEditorState extends State<ParameterDraftEditor> {
         LayoutBuilder(
           builder: (context, constraints) {
             _geometry = _DraftGeometry(
-              Size(constraints.maxWidth, _native ? 222 : 242),
+              Size(
+                constraints.maxWidth,
+                widget.canvasHeight ?? (_native ? 222 : 242),
+              ),
               widget.bounds,
               notes,
               _native,

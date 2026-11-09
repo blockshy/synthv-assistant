@@ -4,7 +4,8 @@ import copy
 import unittest
 
 from synthv_assistant.parameters import (PARAMETER_LIMITS, ParameterError, public_parameter_catalog,
-                                         public_preview, validate_action, validate_change, selection_preview_notes)
+                                         public_preview, validate_action, validate_change, selection_preview_notes,
+                                         MAX_PREVIEW_POINTS)
 
 
 def modern_selection():
@@ -76,11 +77,11 @@ class ParameterTests(unittest.TestCase):
             self.assertEqual(validate_change("tension", 0.1, selection=legacy)["delta"], 0.1)
 
     def test_native_pitch_unavailability_reports_fixed_reason_and_is_excluded_from_model(self):
-        """原因只按代码映射，不能回显任意宿主字符串；模型仍可使用已有偏移参数。"""
+        """原因只按代码映射；旧工程可保留偏移，但错误提示不能要求偷换用户的原生重绘。"""
         self.selection["capabilities"]["nativePitch"] = False
         definition = self.selection["parameters"]["pitchCurve"]
         definition.update(available=False, unavailableCode="pitch-delta-nonzero", unavailableReason="private host details")
-        with self.assertRaisesRegex(ParameterError, "非零音高偏移") as caught:
+        with self.assertRaisesRegex(ParameterError, "原生曲线不兼容") as caught:
             validate_change("pitchCurve", curve=[[0, 60], [1, 64]], selection=self.selection)
         self.assertNotIn("private", str(caught.exception))
         public = public_parameter_catalog(self.selection)
@@ -190,10 +191,15 @@ class ParameterTests(unittest.TestCase):
         self.assertEqual(public_preview(source)["curvePreview"][0]["before"], None)
         self.assertNotIn("voiceFile", public_preview(source))
         for bad in ({"curvePreview": [{"position": 0, "after": True}]}, {"pointReduction": 0.5},
-                    {"curvePreview": [{"position": index / 256, "after": 60} for index in range(257)]},
+                    {"curvePreview": [{"position": index / MAX_PREVIEW_POINTS, "after": 60}
+                                      for index in range(MAX_PREVIEW_POINTS + 1)]},
                     {"curvePreview": [{"position": 0, "after": 60, "path": "private-path"}]}):
             with self.subTest(fields=list(bad)), self.assertRaises(ParameterError):
                 public_preview({**copy.deepcopy(source), **bad})
+        # 可视采样增加只用于忠实显示局部峰值，不扩大可写入的 64 个控制点契约。
+        dense = [{"position": index / (MAX_PREVIEW_POINTS - 1), "after": 60}
+                 for index in range(MAX_PREVIEW_POINTS)]
+        self.assertEqual(len(public_preview({**source, "curvePreview": dense})["curvePreview"]), MAX_PREVIEW_POINTS)
 
     def test_public_preview_keeps_real_nodes_separate_and_is_backward_compatible(self):
         """真实节点保留自己的位置和单位；二次白名单过滤不丢点，也不为旧桥接补造节点。"""

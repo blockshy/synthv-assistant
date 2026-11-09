@@ -12,9 +12,9 @@ from tests.test_tuning_quality import phrase
 class PromptTests(unittest.TestCase):
     """验证系统规则随实际能力变化，且用户资料始终留在低优先级上下文。"""
 
-    def build(self, selection=None, *, mode="smooth", count=0):
+    def build(self, selection=None, *, mode="smooth", count=0, **permissions):
         return prompts.build_planner_instruction(selection, has_selection=planner._has_selection(selection),
-                                                 render_mode=mode, audio_count=count)
+                                                 render_mode=mode, audio_count=count, **permissions)
 
     def test_consultation_omits_irrelevant_execution_contracts(self):
         instruction = self.build()
@@ -27,15 +27,17 @@ class PromptTests(unittest.TestCase):
 
     def test_legacy_and_current_capabilities_select_allowed_contracts(self):
         legacy = {"noteCount": 1, "notes": [{"pitch": 60}]}
-        self.assertIn("只可给可用参数delta", self.build(legacy))
+        self.assertIn("只可给非音高可用参数delta", self.build(legacy))
         current = phrase()
         self.assertIn("noteIndex是", self.build(current))
-        self.assertIn("transitionMs", self.build(current))
-        current["parameters"]["pitchCurve"]["available"] = False
         self.assertNotIn("transitionMs", self.build(current))
-        self.assertIn("原生音高不可用", self.build(current))
+        permissions = {"allow_pitch_adjustments": True, "allow_native_pitch": True}
+        self.assertIn("transitionMs", self.build(current, **permissions))
+        current["parameters"]["pitchCurve"]["available"] = False
+        self.assertNotIn("transitionMs", self.build(current, **permissions))
+        self.assertIn("原生音高不可用", self.build(current, **permissions))
         current["parameters"]["pitchCurve"]["available"] = True
-        self.assertNotIn("transitionMs", self.build(current, mode="points"))
+        self.assertNotIn("transitionMs", self.build(current, mode="points", **permissions))
         current["notes"][0].pop("durationSeconds")
         self.assertNotIn("noteIndex是", self.build(current))
         self.assertIn("没有可靠的逐音符时间布局", self.build(current))

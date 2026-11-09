@@ -57,16 +57,10 @@ def _note_layout(selection: dict) -> tuple[float, float, list[tuple[float, float
     return float(start), float(end), notes
 
 
-def _shape_data(shape: object) -> tuple[list[list[float]], float]:
-    """严格校验模型的局部音分包络，不猜测单位、不补点、不裁剪越界值。"""
-    if (not isinstance(shape, dict) or "curve" not in shape
-            or set(shape) - {"curve", "transitionMs"}):
-        raise ParameterError("音高包络只能包含 curve 和可选 transitionMs。")
-    curve, transition = shape["curve"], shape.get("transitionMs", 40)
+def _checked_envelope(curve: object) -> list[list[float]]:
+    """只核对一个音符的音分包络；不能把 MIDI、音分和位置的单位混用。"""
     if not isinstance(curve, list) or not 2 <= len(curve) <= 8:
         raise ParameterError("每个音符的音高包络必须包含 2 至 8 个控制点。")
-    if not finite(transition, 5, 120):
-        raise ParameterError("音符过渡时间必须是 5 至 120 毫秒的有限数字。")
     checked, previous = [], -1.0
     for point in curve:
         if (not isinstance(point, list) or len(point) != 2
@@ -77,7 +71,38 @@ def _shape_data(shape: object) -> tuple[list[list[float]], float]:
         checked.append([previous, float(point[1])])
     if checked[0][0] != 0 or checked[-1][0] != 1:
         raise ParameterError("音高包络的首尾位置必须分别为 0 和 1。")
-    return checked, float(transition) / 2000
+    return checked
+
+
+def _shape_data(shape: object, note_count: int) -> tuple[dict[int, list[list[float]]], float]:
+    """核对逐音符形状或旧式统一形状，未列音符仅使用明确的乐谱基准。
+
+    notes 允许不同音符有不同处理，避免把一句中的短音、长音和跳进全部套用
+    同一种唱法。它仍然是整段原生替换，缺省平直线绝不等于保留生成音高。
+    保留 curve 输入供既有草稿重新生成，二者互斥且不允许隐式混合优先级。
+    """
+    if (not isinstance(shape, dict) or set(shape) - {"curve", "notes", "transitionMs"}
+            or ("curve" in shape) == ("notes" in shape)):
+        raise ParameterError("音高包络必须包含 curve 或 notes 其中一种，以及可选 transitionMs。")
+    transition = shape.get("transitionMs", 40)
+    if not finite(transition, 5, 120):
+        raise ParameterError("音符过渡时间必须是 5 至 120 毫秒的有限数字。")
+    if "curve" in shape:
+        common = _checked_envelope(shape["curve"])
+        return {index: common for index in range(1, note_count + 1)}, float(transition) / 2000
+    raw_notes = shape["notes"]
+    if not isinstance(raw_notes, list) or not 1 <= len(raw_notes) <= 32:
+        raise ParameterError("逐音符音高包络 notes 必须包含 1 至 32 个明确目标。")
+    envelopes = {}
+    for raw in raw_notes:
+        if not isinstance(raw, dict) or set(raw) != {"noteIndex", "curve"}:
+            raise ParameterError("逐音符音高包络只允许 noteIndex 和 curve。")
+        index = raw["noteIndex"]
+        if (not isinstance(index, int) or isinstance(index, bool)
+                or not 1 <= index <= note_count or index in envelopes):
+            raise ParameterError("逐音符音高包络的音符序号必须有效且不重复。")
+        envelopes[index] = _checked_envelope(raw["curve"])
+    return envelopes, float(transition) / 2000
 
 
 def _remove_collinear(points: list[list[float]]) -> list[list[float]]:
@@ -100,17 +125,23 @@ def _remove_collinear(points: list[list[float]]) -> list[list[float]]:
 
 
 def compile_pitch_shape(shape: object, selection: dict) -> list[list[float]]:
-    """将同一音分包络映射至每个音符，返回既有契约的绝对 MIDI 曲线。
+    """将音分包络映射至音符，返回既有契约的绝对 MIDI 曲线。
 
     相接音符在两侧各留最多 transitionMs/2、且不超过本音符时长 10% 的过渡，
     因而任何短音符至少保留 80% 主体。遇到休止则直接连接休止两端，不在空白
     中创造音符，也不为了跨休止而挤占实际音符。整段首尾严格覆盖比例 0 和 1。
     """
-    envelope, half_transition = _shape_data(shape)
     start, end, notes = _note_layout(selection)
+    envelopes, half_transition = _shape_data(shape, len(notes))
     low, high = native_pitch_range(selection)
     points = []
     for index, (onset, finish, pitch) in enumerate(notes):
+        envelope = envelopes.get(index + 1, [[0., 0.], [1., 0.]])
+        # 新的逐音符方式不对短音自动加装饰；旧式统一包络保留兼容，以免历史
+        # 草稿重新预览时暗改已有形状。新规划提示词不再默认选择旧式统一包络。
+        if (isinstance(shape, dict) and "notes" in shape and finish - onset < .18 - TIME_EPSILON
+                and any(cents != 0 for _, cents in envelope)):
+            raise ParameterError("短于 180ms 的音符不自动添加原生音高起伏，请保持平直基准或缩小目标。")
         margin = min(half_transition, (finish - onset) * 0.1)
         touches_previous = index > 0 and abs(onset - notes[index - 1][1]) <= TIME_EPSILON
         touches_next = index + 1 < len(notes) and abs(notes[index + 1][0] - finish) <= TIME_EPSILON
@@ -171,7 +202,7 @@ def validate_preview_note_alignment(preview: object, selection: dict) -> None:
 
     原生曲线的插值未公开，输入折线吻合音符不代表宿主渲染也吻合。因此只用
     宿主 getValueAt 返回的真实 after 值检查音符中间 25%..75% 区间，避免把
-    允许的边缘过渡误判成偏音。这里绝不把 97 点显示采样再次连成折线求值：
+    允许的边缘过渡误判成偏音。这里绝不把有限显示采样再次连成折线求值：
     那样会跨过没有采样命中的短音符，制造出宿主从未返回的错误音高。
 
     若短音符主体未被采样命中，本函数不会声称已验证该主体；输入端的逐音符

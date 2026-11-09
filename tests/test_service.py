@@ -204,12 +204,14 @@ class ServiceTests(unittest.TestCase):
         manager = MagicMock()
 
         def simulated_conversation(identifier, text, include_selection, attachments,
-                                   model_options=None, on_progress=None):
+                                   model_options=None, on_progress=None, pitch_policy="preserve"):
             self.assertEqual(identifier, expected["id"])
             self.assertEqual(text, "解释当前调教思路")
             self.assertFalse(include_selection)
             self.assertEqual(attachments, [])
             self.assertEqual(model_options, {"model": "mock-model"})
+            # 旧客户端未传策略时，流式任务仍保持音高，不能自行开启重绘。
+            self.assertEqual(pitch_policy, "preserve")
             self.assertTrue(callable(on_progress))
             callbacks.append(on_progress)
             entered.set()

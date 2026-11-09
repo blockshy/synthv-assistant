@@ -38,13 +38,13 @@ class NoteCurveReuseTests(unittest.TestCase):
                  "onsetSeconds": onset, "durationSeconds": duration}
                 for index, (onset, duration) in enumerate(notes)])
 
-    def local_plan(self, parameter="tension"):
+    def local_plan(self, parameter="tension", *, pitch_policy="preserve"):
         """模拟规划器内部结果；公开动作仅有曲线，来源单独保存在内部字典。"""
         self.plan["actions"] = [{"parameter": parameter,
                                  "curve": compile_note_curves(parameter, self.local, self.selection),
                                  "reason": "只修饰第3个选中音符。"}]
         self.plan["noteCurveSources"] = {parameter: copy.deepcopy(self.local)}
-        return self.proposed_message()
+        return self.proposed_message(pitch_policy=pitch_policy)
 
     def test_reuse_recompiles_last_note_instead_of_scaling_whole_phrase(self):
         source = self.local_plan()
@@ -92,7 +92,8 @@ class NoteCurveReuseTests(unittest.TestCase):
         self.assert_no_external_execution()
 
     def test_pitch_delta_local_source_does_not_relax_melody_or_rhythm_guard(self):
-        source = self.local_plan("pitchDelta")
+        # 本用例验证已获微调授权的历史来源仍受节奏保护，不绕过默认保留策略。
+        source = self.local_plan("pitchDelta", pitch_policy="local")
         self.set_layout([(20, 1.7), (21.7, 0.1), (21.8, 0.2)])
         before = self.read_saved()
         with self.assertRaisesRegex(ConversationError, "相对节奏不匹配"):

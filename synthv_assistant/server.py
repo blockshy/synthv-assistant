@@ -349,6 +349,11 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                         # 入队前验证，非法模式不能被 null 回退成默认，也不能触发付费请求。
                         from .parameters import normalize_render_mode
                         optional = [args.get("modelOptions"), normalize_render_mode(args["renderMode"])]
+                    if "pitchPolicy" in args:
+                        # 策略在排队之前校验；默认保留音高，不能由模型自行切换成重绘。
+                        from .conversations import normalize_pitch_policy
+                        optional = [args.get("modelOptions"), args.get("renderMode"),
+                                    normalize_pitch_policy(args["pitchPolicy"])]
                     result = {"jobId": service.submit(service.send_message, identifier, args.get("text"),
                                                       args.get("includeSelection", True), args.get("attachments", []), *optional)}
                 elif re.fullmatch(r"/api/assistant/actions/[0-9a-f]{32}/(?:preview|apply)", path):
@@ -362,6 +367,10 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                     if set(args) != {"batchId"}:
                         raise ValueError("组合确认只接受 batchId 字段。")
                     return self.workbench_response(service.apply_action_batch, args["batchId"])
+                elif path == "/api/assistant/batches/restore":
+                    if set(args) != {"batchId"}:
+                        raise ValueError("撤销方案只接受 batchId 字段。")
+                    return self.workbench_response(service.restore_action_batch, args["batchId"])
                 elif path == "/api/write-mode":
                     result = service.write_mode(args.get("enabled"))
                 elif path == "/api/parameters/vocal-mode":

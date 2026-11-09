@@ -11,7 +11,7 @@ const _batch = '0123456789abcdef0123456789abcdef';
 JsonMap _preview(String parameter, {int pitch = 60}) => {
   'previewId': 'preview-$parameter',
   'parameter': parameter,
-  'label': parameter,
+  'label': {'breathiness': '气声', 'tension': '张力'}[parameter] ?? parameter,
   'unit': parameter == 'pitchCurve' ? 'MIDI' : '',
   'startSeconds': 0,
   'endSeconds': 2,
@@ -36,13 +36,19 @@ JsonMap _action(String id, {String status = 'proposed'}) => {
   'parameter': id,
   'status': status,
   'delta': .1,
+  if (status == 'applied') 'previewBatchId': _batch,
+  if (status == 'applied') 'result': {'verified': true},
 };
 
 class _FakeApi extends WorkbenchApi {
   _FakeApi() : super(port: 0, token: 'test-only');
   final List<String> gets = [];
   final List<(String, JsonMap)> posts = [];
-  bool partial = false, failApply = false;
+  bool partial = false,
+      failApply = false,
+      writeEnabled = true,
+      failRestore = false,
+      uncertainRestore = false;
 
   @override
   Future<dynamic> getJson(String path) async {
@@ -50,7 +56,7 @@ class _FakeApi extends WorkbenchApi {
     if (path == '/api/status') {
       return {
         'bridge': {'connected': true},
-        'writeEnabled': true,
+        'writeEnabled': writeEnabled,
       };
     }
     if (path == '/api/selection') {
@@ -102,6 +108,29 @@ class _FakeApi extends WorkbenchApi {
       return {
         'batchId': _batch,
         'actions': [_action('breathiness', status: 'applied')],
+      };
+    }
+    if (path == '/api/write-mode') {
+      writeEnabled = body['enabled'] == true;
+      return {'writeEnabled': writeEnabled};
+    }
+    if (path == '/api/assistant/batches/restore') {
+      if (uncertainRestore) {
+        throw const ApiException('撤销连接中断，结果尚未确认。', uncertain: true);
+      }
+      if (failRestore) {
+        return {
+          'batchId': _batch,
+          'verified': false,
+          'rejected': true,
+          'message': '已有其他修改，未撤销此方案。',
+          'actions': [_action('breathiness', status: 'applied')],
+        };
+      }
+      return {
+        'batchId': _batch,
+        'verified': true,
+        'actions': [_action('breathiness')],
       };
     }
     if (path == '/api/preview') {
@@ -189,62 +218,190 @@ void main() {
     });
   }
 
-  testWidgets('只有当次预览票据可确认，其他预览使旧票据失效', (tester) async {
+  testWidgets('主动作从预览切换到应用，其他预览使确认资格失效', (tester) async {
     final api = _FakeApi();
     addTearDown(api.dispose);
     await tester.pumpWidget(_host(_proposal(api), width: 700));
-    expect(
-      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
-      isNull,
-    );
-    await _tap(tester, '生成预览');
-    expect(
-      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
-      isNotNull,
-    );
+    expect(find.text('预览方案'), findsOneWidget);
+    expect(find.text('应用方案'), findsNothing);
+    await _tap(tester, '预览方案');
+    expect(find.text('应用方案'), findsOneWidget);
     api.invalidatePreviews();
     await tester.pump();
-    expect(
-      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
-      isNull,
-    );
+    expect(find.text('应用方案'), findsNothing);
+    expect(find.text('预览方案'), findsOneWidget);
     expect(api.posts.where((call) => call.$1.endsWith('/apply')), isEmpty);
   });
 
-  testWidgets('部分参数失败时只确认成功批次并保留失败明细', (tester) async {
+  testWidgets('部分失败先展示原因，只有显式重新预览通过项后才可应用', (tester) async {
     final api = _FakeApi()..partial = true;
     addTearDown(api.dispose);
     await tester.pumpWidget(_host(_proposal(api, pair: true), width: 700));
-    await _tap(tester, '生成预览');
-    expect(find.text('张力未通过校验'), findsOneWidget);
+    await _tap(tester, '预览方案');
+    expect(find.textContaining('张力未通过校验'), findsOneWidget);
+    expect(find.text('应用方案'), findsNothing);
+    expect(api.posts.where((call) => call.$1.endsWith('/apply')), isEmpty);
+    // 用户明确选择子方案；第二次完整预览必须只请求气声，不能沿用部分批次票据。
+    api.partial = false;
+    await _tap(tester, '仅预览通过的 1 项');
+    expect(api.posts.last.$2, {
+      'actionIds': ['breathiness'],
+    });
+    expect(find.text('本次已排除：张力'), findsOneWidget);
+    await _tap(tester, '应用方案');
+    expect(find.byType(AlertDialog), findsOneWidget);
+    expect(api.posts.where((call) => call.$1.endsWith('/apply')), isEmpty);
     await _tap(tester, '确认应用');
     expect(api.posts.last.$1, '/api/assistant/batches/apply');
     expect(api.posts.last.$2, {'batchId': _batch});
-    expect(find.text('breathiness · 已应用'), findsOneWidget);
-    expect(find.text('tension · 待预览'), findsOneWidget);
-    expect(find.text('张力未通过校验'), findsOneWidget);
+    expect(find.text('撤销本次应用'), findsOneWidget);
+    expect(find.text('本次已排除：张力'), findsOneWidget);
+  });
+
+  testWidgets('只读时在同一确认框明确授权，取消不切换权限或提交应用', (tester) async {
+    final api = _FakeApi()..writeEnabled = false;
+    addTearDown(api.dispose);
+    await tester.pumpWidget(_host(_proposal(api), width: 700));
+    await _tap(tester, '预览方案');
+    await _tap(tester, '应用方案');
     expect(
-      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
+      tester
+          .widget<FilledButton>(find.widgetWithText(FilledButton, '确认应用'))
+          .onPressed,
       isNull,
     );
+    await _tap(tester, '取消');
+    expect(
+      api.posts.where(
+        (call) => call.$1 == '/api/write-mode' || call.$1.endsWith('/apply'),
+      ),
+      isEmpty,
+    );
+    await _tap(tester, '应用方案');
+    await _tap(tester, '允许修改选区');
+    await _tap(tester, '确认应用');
+    expect(api.posts.map((call) => call.$1).toList(), [
+      '/api/assistant/batches/preview',
+      '/api/write-mode',
+      '/api/assistant/batches/apply',
+    ]);
+  });
+
+  testWidgets('确认对话框打开期间预览失效，不开启权限或应用', (tester) async {
+    final api = _FakeApi()..writeEnabled = false;
+    addTearDown(api.dispose);
+    await tester.pumpWidget(_host(_proposal(api), width: 700));
+    await _tap(tester, '预览方案');
+    await _tap(tester, '应用方案');
+    await _tap(tester, '允许修改选区');
+    api.invalidatePreviews();
+    await _tap(tester, '确认应用');
+    expect(
+      api.posts.where(
+        (call) => call.$1 == '/api/write-mode' || call.$1.endsWith('/apply'),
+      ),
+      isEmpty,
+    );
+    expect(find.textContaining('确认期间预览已变化'), findsOneWidget);
   });
 
   testWidgets('应用连接中断立即锁定结果未知的方案且不重复提交', (tester) async {
     final api = _FakeApi()..failApply = true;
     addTearDown(api.dispose);
     await tester.pumpWidget(_host(_proposal(api), width: 700));
-    await _tap(tester, '生成预览');
+    await _tap(tester, '预览方案');
+    await _tap(tester, '应用方案');
     await _tap(tester, '确认应用');
-    expect(find.text('breathiness · 结果未知'), findsOneWidget);
-    expect(
-      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
-      isNull,
-    );
-    expect(
-      tester.widget<OutlinedButton>(find.byType(OutlinedButton)).onPressed,
-      isNull,
-    );
+    expect(find.text('需要核对结果'), findsOneWidget);
+    expect(find.text('应用方案'), findsNothing);
+    expect(find.text('预览方案'), findsNothing);
+    expect(find.widgetWithText(OutlinedButton, '刷新方案状态'), findsOneWidget);
     expect(api.posts.where((call) => call.$1.endsWith('/apply')).length, 1);
+  });
+
+  testWidgets('撤销只提交本方案批次，成功后可重新预览', (tester) async {
+    final api = _FakeApi();
+    addTearDown(api.dispose);
+    await tester.pumpWidget(_host(_proposal(api), width: 700));
+    await _tap(tester, '预览方案');
+    await _tap(tester, '应用方案');
+    await _tap(tester, '确认应用');
+    await _tap(tester, '撤销本次应用');
+    expect(api.posts.where((call) => call.$1.endsWith('/restore')), isEmpty);
+    await _tap(tester, '确认撤销');
+    expect(api.posts.last.$1, '/api/assistant/batches/restore');
+    expect(api.posts.last.$2, {'batchId': _batch});
+    expect(find.text('预览方案'), findsOneWidget);
+    expect(find.text('已撤销。可重新预览这份方案。'), findsOneWidget);
+    expect(api.posts.where((call) => call.$1 == '/api/restore'), isEmpty);
+  });
+
+  testWidgets('撤销被明确拒绝时保留已应用状态，不虚构成功', (tester) async {
+    final api = _FakeApi()..failRestore = true;
+    addTearDown(api.dispose);
+    await tester.pumpWidget(_host(_proposal(api), width: 700));
+    await _tap(tester, '预览方案');
+    await _tap(tester, '应用方案');
+    await _tap(tester, '确认应用');
+    await _tap(tester, '撤销本次应用');
+    await _tap(tester, '确认撤销');
+    expect(find.text('撤销本次应用'), findsOneWidget);
+    expect(find.text('已有其他修改，未撤销此方案。'), findsOneWidget);
+    expect(find.text('已撤销。可重新预览这份方案。'), findsNothing);
+  });
+
+  testWidgets('撤销传输中断只允许刷新，不会重复提交恢复请求', (tester) async {
+    final api = _FakeApi()..uncertainRestore = true;
+    addTearDown(api.dispose);
+    await tester.pumpWidget(_host(_proposal(api), width: 700));
+    await _tap(tester, '预览方案');
+    await _tap(tester, '应用方案');
+    await _tap(tester, '确认应用');
+    await _tap(tester, '撤销本次应用');
+    await _tap(tester, '确认撤销');
+    expect(find.text('需要核对结果'), findsOneWidget);
+    expect(find.text('撤销本次应用'), findsNothing);
+    expect(find.text('预览方案'), findsNothing);
+    expect(api.posts.where((call) => call.$1.endsWith('/restore')).length, 1);
+  });
+
+  testWidgets('音高修改语义在预览前可见，原生替换确认再次说明范围', (tester) async {
+    final api = _FakeApi();
+    addTearDown(api.dispose);
+    await tester.pumpWidget(
+      _host(
+        ProposalCard(
+          api: api,
+          conversationId: 'test-conversation',
+          onChanged: () {},
+          message: {
+            'id': 'pitch-message',
+            'actions': [_action('pitchCurve')],
+          },
+        ),
+        width: 700,
+      ),
+    );
+    expect(find.text('原生音高（替换）'), findsOneWidget);
+    await _tap(tester, '预览方案');
+    await _tap(tester, '应用方案');
+    expect(find.text('原生音高将替换该范围的现有曲线，包括原有演唱细节。'), findsOneWidget);
+    await _tap(tester, '取消');
+    await tester.pumpWidget(
+      _host(
+        ProposalCard(
+          api: api,
+          conversationId: 'test-conversation',
+          onChanged: () {},
+          message: {
+            'id': 'offset-message',
+            'actions': [_action('pitchDelta')],
+          },
+        ),
+        width: 700,
+      ),
+    );
+    expect(find.text('音高偏差（叠加）'), findsOneWidget);
   });
 
   testWidgets('检查器仅显式读取选区并在窄侧栏校验非法增量', (tester) async {

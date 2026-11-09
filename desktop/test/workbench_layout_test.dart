@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:synthv_desktop/core/api.dart';
+import 'package:synthv_desktop/pages/inspector.dart';
 import 'package:synthv_desktop/theme.dart';
 import 'package:synthv_desktop/workbench.dart';
 
@@ -32,6 +33,35 @@ class _NavigationApi extends ModelApi {
             'revision': 'platform-fixture',
           },
         ],
+      };
+    }
+    return super.getJson(path);
+  }
+}
+
+/// 独立参数页的导航夹具，只返回一段虚构选区；切页不应重复读取或写入。
+class _ParameterNavigationApi extends ModelApi {
+  @override
+  Future<dynamic> getJson(String path) async {
+    if (path == '/api/status') {
+      calls.add('GET $path');
+      return {
+        'bridge': {'connected': true, 'session': 'navigation-fixture'},
+        'writeEnabled': false,
+      };
+    }
+    if (path == '/api/selection') {
+      calls.add('GET $path');
+      return {
+        'noteCount': 1,
+        'startSeconds': 1,
+        'endSeconds': 2,
+        'groupName': '导航测试选区',
+        'notes': <JsonMap>[],
+        'capabilities': {'curves': true},
+        'parameters': {
+          'breathiness': {'label': '气声', 'kind': 'automation', 'maxDelta': .3},
+        },
       };
     }
     return super.getJson(path);
@@ -86,7 +116,7 @@ void main() {
     await tester.binding.setSurfaceSize(null);
   });
 
-  testWidgets('鼠标单次位移可拖动左右分隔条并保存宽度', (tester) async {
+  testWidgets('导航仍可拖动保存宽度，独立参数页不再占用右侧栏', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await tester.binding.setSurfaceSize(const Size(1536, 816));
     final api = ModelApi();
@@ -102,10 +132,12 @@ void main() {
     );
     await tester.pumpAndSettle();
     final left = find.byTooltip('调整导航宽度 · 双击复位');
-    final right = find.byTooltip('调整检查器宽度 · 双击复位');
     final originalLeft = tester.getRect(left);
-    final originalRight = tester.getRect(right);
     expect(originalLeft.left, 230);
+    expect(find.byTooltip('调整检查器宽度 · 双击复位'), findsNothing);
+    expect(find.byTooltip('打开工程检查器'), findsNothing);
+    expect(find.text('工程与参数'), findsOneWidget);
+    expect(find.text('读取当前选区'), findsNothing);
 
     // 桌面自动化、低采样率鼠标或短拖动可能只产生一次 move，不能丢弃越过
     // 手势阈值的首段位移，否则用户明确拖动后宽度仍然保持不变。
@@ -118,21 +150,62 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.getRect(left).left, closeTo(272, .01));
 
-    final rightGesture = await tester.startGesture(
-      Offset(tester.getRect(right).center.dx, 451),
-      kind: PointerDeviceKind.mouse,
-    );
-    await rightGesture.moveBy(const Offset(-36, 0));
-    await rightGesture.up();
-    await tester.pumpAndSettle();
-    expect(tester.getRect(right).left, closeTo(originalRight.left - 36, .01));
     await tester.pump(const Duration(milliseconds: 400));
     final prefs = await SharedPreferences.getInstance();
     expect(prefs.getDouble('leftWidth'), 272);
-    expect(prefs.getDouble('rightWidth'), 338);
+    expect(prefs.containsKey('rightWidth'), isFalse);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
+    api.dispose();
+    await tester.binding.setSurfaceSize(null);
+  });
+
+  testWidgets('工程页首次进入才创建，往返保留草稿且不重复读取选区', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    await tester.binding.setSurfaceSize(const Size(1440, 900));
+    final api = _ParameterNavigationApi();
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: WorkbenchTheme.build(Brightness.dark),
+        home: Workbench(
+          api: api,
+          mode: ThemeMode.system,
+          onThemeChanged: (_) {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(Inspector, skipOffstage: false), findsNothing);
+    await tester.tap(find.text('工程与参数').first);
+    await tester.pumpAndSettle();
+    expect(find.byType(Inspector), findsOneWidget);
+    expect(api.calls.where((call) => call == 'GET /api/selection'), isEmpty);
+    await tester.tap(find.text('读取当前选区'));
+    await tester.pumpAndSettle();
+    final delta = find.byKey(const ValueKey('inspector-delta'));
+    await tester.ensureVisible(delta);
+    await tester.enterText(delta, '0.12');
+    await tester.tap(find.text('当前会话').first);
+    await tester.pumpAndSettle();
+    expect(find.byType(Inspector), findsNothing);
+    expect(find.byType(Inspector, skipOffstage: false), findsOneWidget);
+    expect(
+      tester
+          .widget<Inspector>(find.byType(Inspector, skipOffstage: false))
+          .active,
+      isFalse,
+    );
+    await tester.tap(find.text('工程与参数').first);
+    await tester.pumpAndSettle();
+    expect(tester.widget<TextField>(delta).controller!.text, '0.12');
+    expect(api.calls.where((call) => call == 'GET /api/selection').length, 1);
+    expect(
+      api.calls.where((call) => call.startsWith('POST /api/apply')),
+      isEmpty,
+    );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
     api.dispose();
     await tester.binding.setSurfaceSize(null);
   });

@@ -1,7 +1,7 @@
 """为模型提供确定的乐句坐标，避免让语言模型自行估算音符的时间比例。
 
 这些信息只描述乐谱结构，并非对实际演唱的测量。短音和分句阈值是规划参考，
-不能据此断言发音、气口或唱法；音频证据仍由用户明确附加。
+不能据此断言发音、气口、唱法或实际听感；本工作台只提供结构资料。
 """
 
 from .parameters import ParameterError, finite, selection_preview_notes, supports_curves
@@ -12,7 +12,7 @@ def musical_context(selection: dict | None) -> dict:
     """返回有界、无路径和歌词的逐音符规划资料；资料缺失时不猜测时间。
 
     noteIndex 是按起点排序后的选区内序号，与工程内部 index 无关。使用宿主
-    返回的秒坐标，因此跨速度变化时也与 noteCurves 编译器采用相同的时间轴。
+    返回的秒坐标，因此跨速度变化时也与局部表达编译器采用相同的时间轴。
     """
     unavailable = {"noteCurvesAvailable": False}
     if not supports_curves(selection):

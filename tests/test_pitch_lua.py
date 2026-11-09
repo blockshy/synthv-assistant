@@ -5,6 +5,7 @@
 """
 
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -69,6 +70,10 @@ function Curve:getValueAt(position)
   if calibration and host.calibrationEvaluator then return host.calibrationEvaluator(position,self.points) end
   if host.nativeSemantics=="group" then position=position-self.position end
   local shift=host.nativeSemantics=="group" and self.pitch or 0
+  -- 模拟控件附加到工程后发生插值变化，但节点描述没有变化的真实风险。
+  if not calibration and self.attached and host.attachedEvaluator then
+    return host.attachedEvaluator(position,self.points)+shift
+  end
   if not calibration and host.nativeEvaluator then return host.nativeEvaluator(position,self.points)+shift end
   local points=self.points
   if position<=points[1][1] then return points[1][2]+shift end
@@ -191,6 +196,11 @@ class NativePitchLuaTests(unittest.TestCase):
     def preview(self, args=None, context=None):
         return self.native.preview(args if args is not None else self.request(), context or self.lua.globals().makeContext())
 
+    def preview_at(self, proposal, position):
+        """自适应显示点数不固定；按归一化时间查找锚点，避免测试依赖旧 97 点网格。"""
+        return next(point for point in proposal["public"]["curvePreview"].values()
+                    if abs(point["position"] - position) < 1e-12)
+
     def rejects_preview(self, message, args=None, context=None):
         """所有预览拒绝路径均应保持真实宿主控件和写入计数不变。"""
         before = self.native.snapshot(self.group)
@@ -222,8 +232,7 @@ class NativePitchLuaTests(unittest.TestCase):
         self.assertEqual(row["position"], 1000)
         self.assertEqual(row["pitch"], 60)
         self.assertEqual(row["points"][2][1], 375)
-        self.assertEqual(proposal["public"]["curvePreview"][49]["position"], 0.5)
-        self.assertEqual(proposal["public"]["curvePreview"][49]["after"], 73)
+        self.assertEqual(self.preview_at(proposal, 0.5)["after"], 73)
 
     def test_public_nodes_use_normalized_host_coordinates_and_ignore_external_controls(self):
         """节点取宿主读回值，在变速和移调后仍按秒数与绝对 MIDI 对齐，区外控件不公开。"""
@@ -239,7 +248,7 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
         row = proposal["after"]["controls"][2]["description"]
         points = proposal["public"]["controlPoints"]
         self.assertEqual(len(points), 3)
-        self.assertEqual(len(proposal["public"]["curvePreview"]), 97)
+        self.assertLessEqual(len(proposal["public"]["curvePreview"]), 1024)
         self.assertEqual([point["position"] for point in points.values()], [0, 0.5, 1])
         for index, node in points.items():
             self.assertEqual(node["value"], row["pitch"] + row["points"][index][2] + 12)
@@ -254,10 +263,10 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
           end
         ''')
         proposal = self.preview()
-        self.assertEqual(len(proposal["public"]["curvePreview"]), 97)
+        self.assertLessEqual(len(proposal["public"]["curvePreview"]), 1024)
         self.assertEqual(proposal["public"]["beforePointCount"], 0)
         # 1/4 选区处真实模拟曲线为 0.125；若直连输入断点会错误显示 0.25。
-        self.assertEqual(proposal["public"]["curvePreview"][25]["after"], 60.125)
+        self.assertEqual(self.preview_at(proposal, 0.25)["after"], 60.125)
         queries = list(self.host.valueQueries.values())
         for position in [100, 200, 300, 400, 600, 700, 800, 900]:
             self.assertIn(position, queries)
@@ -270,6 +279,94 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
           end
         ''')
         self.rejects_preview("插值采样超出允许音高范围")
+
+    def test_short_peak_between_old_uniform_samples_is_preserved(self):
+        """30 秒选区中的 60ms 峰值必须完整出现，不能只让独立控制点保留而展示线漏峰。"""
+        self.host.finish = 31000
+        proposal = self.preview(self.request([[0, 60], [0.003, 60], [0.004, 61], [0.005, 60], [1, 60]]))
+        peak = self.preview_at(proposal, 0.004)
+        self.assertEqual(peak["after"], 61)
+        self.assertEqual(max(point["after"] for point in proposal["public"]["curvePreview"].values()), 61)
+        self.assertEqual(self.host.mutations, 0)
+
+    def test_dense_native_nodes_are_all_displayed_after_host_normalization(self):
+        """稠密节点经过 blick/float32 量化后仍逐个加入显示折线，不再依赖等距命中。"""
+        self.lua.execute('host.finish=31000; host.quantize=true; host.nativeSemantics="group"')
+        curve = [[index / 63, 60.1234567 + (0.3 if index % 2 else 0)] for index in range(64)]
+        proposal = self.preview(self.request(curve))
+        for node in proposal["public"]["controlPoints"].values():
+            self.assertAlmostEqual(self.preview_at(proposal, node["position"])["after"], node["value"], places=6)
+        self.assertLessEqual(len(proposal["public"]["curvePreview"]), 1024)
+        self.native.write(self.group, proposal["after"])
+        self.assertTrue(self.native.same(self.group, proposal["after"]))
+
+    def test_adaptive_display_tracks_narrow_host_interpolation_bump(self):
+        """节点间的实际弯曲须细分展示；用独立密集检查验证显示线与宿主形状的误差。"""
+        self.lua.execute('''
+          host.nativeEvaluator=function(x)
+            if x<=201 or x>=209 then return 0 end
+            return 1.5*math.sin(math.pi*(x-201)/8)^2
+          end
+        ''')
+        proposal = self.preview(self.request([[0, 60], [0.201, 60], [0.209, 60], [1, 60]]))
+        displayed = list(proposal["public"]["curvePreview"].values())
+        self.assertGreater(len(displayed), 40)
+        self.assertLessEqual(len(displayed), 1024)
+        for left, right in zip(displayed, displayed[1:]):
+            for fraction in [part / 20 for part in range(21)]:
+                position = (left["position"] + (right["position"] - left["position"]) * fraction) * 1000
+                actual = 60 + (1.5 * math.sin(math.pi * (position - 201) / 8) ** 2 if 201 < position < 209 else 0)
+                shown = left["after"] + (right["after"] - left["after"]) * fraction
+                self.assertLessEqual(abs(actual - shown), 0.01001)
+        self.assertGreater(len(proposal["after"]["sampleChecks"]["points"]), len(displayed))
+
+    def test_short_notes_have_explicit_internal_samples(self):
+        """即使音符比基础网格短，四分点仍要读取宿主曲线，不能跳过整个音符主体。"""
+        context = self.lua.globals().makeContext()
+        context["selection"]["notes"] = self.lua.table_from([
+            {"onset": 1000, "duration": 251, "pitch": 60},
+            {"onset": 1251, "duration": 9, "pitch": 60},
+            {"onset": 1260, "duration": 740, "pitch": 60},
+        ], recursive=True)
+        proposal = self.preview(context=context)
+        samples = list(point["position"] for point in proposal["after"]["sampleChecks"]["points"].values())
+        for position in [1251, 1253.25, 1255.5, 1257.75, 1260]:
+            self.assertTrue(any(abs(sample - position) < 1e-9 for sample in samples))
+
+    def test_complex_interpolation_rejects_display_budget_instead_of_truncating(self):
+        """超过 1024 点才能展示的插值明确拒绝，且不修改工程或交付失真的成功预览。"""
+        self.lua.execute('''
+          host.finish=31000
+          host.nativeEvaluator=function(x,points)
+            if x<=points[1][1] or x>=points[#points][1] then return 0 end
+            for index=1,#points-1 do
+              if x<=points[index+1][1] then
+                local fraction=(x-points[index][1])/(points[index+1][1]-points[index][1])
+                return 1.5*math.sin(math.pi*fraction)^2
+              end
+            end
+          end
+        ''')
+        self.rejects_preview("超过预览显示上限", self.request([[index / 63, 60] for index in range(64)]))
+
+    def test_written_interpolation_is_checked_even_when_control_nodes_match(self):
+        """已附加对象与预览克隆插值不同但节点相同时，也必须报错并保留可回滚快照。"""
+        self.lua.execute('host.addFixture("point",500,55,nil,{owner="保留"})')
+        proposal = self.preview()
+        self.assertEqual(proposal["after"]["sampleChecks"]["controlIndex"], 2)
+        self.assertIsNone(proposal["before"]["sampleChecks"])
+        self.lua.execute('''
+          host.attachedEvaluator=function(x)
+            local base=x<=500 and x/1000 or (1000-x)/1000
+            return base+0.05*math.sin(math.pi*x/1000)
+          end
+        ''')
+        with self.assertRaisesRegex(Exception, "实际插值与预览不一致"):
+            self.native.write(self.group, proposal["after"])
+        # 指纹只验证节点，本例故意证明它不足以验证应用形状。
+        self.assertTrue(self.native.same(self.group, proposal["after"]))
+        self.native.write(self.group, proposal["before"])
+        self.assertTrue(self.native.same(self.group, proposal["before"]))
 
     def test_native_points_and_invalid_modes_never_write_or_create(self):
         self.rejects_preview("原生音高点会影响邻近生成音高", self.request(renderMode="points"))
@@ -446,7 +543,7 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
         self.assertEqual(control["pitch"], 60)
         self.assertEqual([point[2] for point in control["points"].values()], [0, 1, 0])
         self.assertEqual([point["value"] for point in proposal["public"]["controlPoints"].values()], [72, 73, 72])
-        self.assertEqual(proposal["public"]["curvePreview"][49]["after"], 73)
+        self.assertEqual(self.preview_at(proposal, 0.5)["after"], 73)
         self.assertIn("不代表最终合成音高", proposal["public"]["capabilityWarnings"][1])
         self.assertEqual(delta_fixture_snapshot(self.host), original)
         self.assertEqual(self.host.mutations, 0)
@@ -641,9 +738,9 @@ host.addFixture("curve",2500,63,{{0,0},{500,0.5}},{private="另一条区外曲�
         self.assertEqual(row["position"], 1000)
         self.assertEqual(row["pitch"], 60)
         self.assertEqual(row["points"][2][1], 375)
-        self.assertEqual(proposal["public"]["curvePreview"][49]["after"], 73)
+        self.assertEqual(self.preview_at(proposal, 0.5)["after"], 73)
         self.assertEqual(proposal["public"]["curvePreview"][1]["after"], 72)
-        self.assertEqual(proposal["public"]["curvePreview"][97]["after"], 72)
+        self.assertEqual(self.preview_at(proposal, 1)["after"], 72)
         self.assertEqual(self.host.mutations, 0)
         self.native.write(self.group, proposal["after"])
         self.assertTrue(self.native.same(self.group, proposal["after"]))
@@ -877,7 +974,7 @@ function selected:getSelectedNotes() return {note(1000,60,1),note(1500,64,2)} en
         self.assertTrue(selection["result"]["parameters"]["pitchCurve"]["available"])
         preview = self.prepare()
         self.assertEqual(preview["representation"], "native-pitch-curve")
-        self.assertEqual(len(preview["curvePreview"]), 97)
+        self.assertLessEqual(len(preview["curvePreview"]), 1024)
         self.assertEqual(self.host.undos, 0)
         self.assertEqual(self.host.mutations, 0)
         self.assertTrue(self.native.same(self.group, original))
@@ -993,6 +1090,26 @@ function selected:getSelectedNotes() return {note(1000,60,1),note(1500,64,2)} en
         self.assertFalse(failed["ok"])
         self.assertIn("已恢复并校验", failed["error"])
         self.assertTrue(self.native.same(self.group, original))
+        self.assertEqual(self.host.undos, 1)
+
+    def test_dispatch_interpolation_mismatch_rolls_back_and_consumes_ticket(self):
+        """真实分发器遇到写后形状失配时恢复原对象，不能留下可重复应用的旧预览票据。"""
+        self.lua.execute('host.addFixture("point",500,59,nil,{outside=true})')
+        original = self.native.snapshot(self.group)
+        preview = self.prepare()
+        self.lua.execute('''
+          host.attachedEvaluator=function(x)
+            local base=x<=500 and x/1000 or (1000-x)/1000
+            return base+0.05*math.sin(math.pi*x/1000)
+          end
+        ''')
+        failed = self.call("apply", previewId=preview["previewId"])
+        self.assertFalse(failed["ok"])
+        self.assertIn("已恢复并校验", failed["error"])
+        self.assertTrue(self.native.same(self.group, original))
+        writes = self.host.mutations
+        self.assertFalse(self.call("apply", previewId=preview["previewId"])["ok"])
+        self.assertEqual(self.host.mutations, writes)
         self.assertEqual(self.host.undos, 1)
 
     def test_dispatch_failed_rollback_retains_snapshot_for_guarded_restore(self):

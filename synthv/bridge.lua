@@ -6,7 +6,7 @@ JSON 解析器及 IPC_DIR 由 Python 安装器注入本文件前部。
 ]]
 
 function getClientInfo()
-  return {name="SynthV Assistant", category="SynthV Assistant", author="Local", versionNumber=3, minEditorVersion=0x020102}
+  return {name="SynthV Assistant", category="SynthV Assistant", author="Local", versionNumber=4, minEditorVersion=0x020102}
 end
 
 local session = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock()*1000000))
@@ -89,7 +89,7 @@ local function heartbeat()
   local info=SV:getHostInfo()
   writeFile("heartbeat.json", {session=session,timestamp=os.time(),hostVersion=info.hostVersion,
     projectFile=projectName(),writeEnabled=writeProject~=nil and writeProject==projectName(),protocol=2,
-    capabilities={curves=true,nativePitch=NativePitch~=nil,batchPreview=true}})
+    capabilities={curves=true,nativePitch=NativePitch~=nil,batchPreview=true,batchRestore=true}})
 end
 
 local function current()
@@ -315,7 +315,7 @@ local function selection()
     startSeconds=first and axis:getSecondsFromBlick(first) or nil,
     endSeconds=last and axis:getSecondsFromBlick(last) or nil,parameters=curves,computedPitch=computedPitch,
     hostVersion=SV:getHostInfo().hostVersion,vocalModes=vocalModes,
-    capabilities={curves=true,nativePitch=curves.pitchCurve~=nil and curves.pitchCurve.available,batchPreview=true},
+    capabilities={curves=true,nativePitch=curves.pitchCurve~=nil and curves.pitchCurve.available,batchPreview=true,batchRestore=true},
     capabilityWarnings=warnings}
 end
 
@@ -591,6 +591,62 @@ local function simplifyPoints(points,tolerance,protected)
   return result
 end
 
+local function sampleAutomationPreview(curve,candidate,points,original,axis,ref,begin,finish,startSec,endSec,tolerance)
+  -- 旧图固定 97 个等距样本，30 秒选区会跳过不足 312ms 的局部峰值。
+  -- 新图先保留真实节点及基础网格，再按宿主实际插值的线性展示误差细分。
+  -- 所有采样仍来自只读克隆；不把模型节点、平滑推测或计算音高冒充实际候选。
+  local ratios={[0]=true,[1]=true}
+  for i=0,32 do ratios[i/32]=true end
+  for _,source in ipairs({points,original}) do
+    for _,p in ipairs(source) do
+      if p[1]>=begin and p[1]<=finish then
+        local ratio=(axis:getSecondsFromBlick(p[1]+ref:getTimeOffset())-startSec)/(endSec-startSec)
+        ratios[math.max(0,math.min(1,ratio))]=true
+      end
+    end
+  end
+  local ordered={}; for ratio in pairs(ratios) do ordered[#ordered+1]=ratio end
+  table.sort(ordered)
+  local cache={}
+  local function read(ratio)
+    if not cache[ratio] then
+      local b=axis:getBlickFromSeconds(startSec+(endSec-startSec)*ratio)-ref:getTimeOffset()
+      local before,after=curve:get(b),candidate:get(b)
+      if not finite(before) or not finite(after) then error("宿主预览插值读回无效，未生成可应用预览。") end
+      cache[ratio]={position=ratio,before=before,after=after,blick=b}
+    end
+    return cache[ratio]
+  end
+  local count=#ordered
+  if count>1024 then error("预览曲线细节超过显示上限，请缩小选区后预览。") end
+  local output={}
+  local function segment(left,right,depth)
+    local a,b=read(left),read(right)
+    local worst,split=0,nil
+    for part=1,3 do
+      local fraction=part/4; local ratio=left+(right-left)*fraction
+      local value=read(ratio)
+      local error=math.max(math.abs(value.after-(a.after+(b.after-a.after)*fraction)),
+                           math.abs(value.before-(a.before+(b.before-a.before)*fraction)))
+      if error>worst then worst,split=error,ratio end
+    end
+    if worst>tolerance then
+      if count>=1024 or depth>=12 then error("预览曲线细节超过显示上限，请缩小选区后预览。") end
+      count=count+1; segment(left,split,depth+1); segment(split,right,depth+1)
+    else
+      output[#output+1]=b
+    end
+  end
+  output[1]=read(0)
+  for i=1,#ordered-1 do segment(ordered[i],ordered[i+1],0) end
+  local public,checks={},{}
+  for _,row in ipairs(output) do
+    public[#public+1]={position=row.position,before=row.before,after=row.after}
+    checks[#checks+1]={blick=row.blick,value=row.after}
+  end
+  return public,checks
+end
+
 local function preview(args)
   -- 无论单项预览最终是否成功，新的请求都不能留下上一批次可确认的入口。
   previews={}; previewBatch=nil
@@ -745,12 +801,7 @@ local function preview(args)
     error(tostring(lastError).." 未写入；可缩短选区或选择控制点模式。")
   end
   points=normalized
-  local view={}
-  for index=0,96 do
-    local ratio=index/96; local t=startSec+(endSec-startSec)*ratio
-    local b=axis:getBlickFromSeconds(t)-ref:getTimeOffset()
-    view[#view+1]={position=ratio,before=curve:get(b),after=candidate:get(b)}
-  end
+  local view,checks=sampleAutomationPreview(curve,candidate,points,original,axis,ref,begin,finish,startSec,endSec,tolerance)
   -- 图形中的节点必须来自候选克隆的真实读回结果，不能拿等距插值采样冒充控制点。
   -- points 还保存着用于安全写入的整条参数曲线；公开预览只返回选区内的节点，
   -- 不暴露区外素材。横坐标按实际秒数归一化，以匹配速度变化下的音符位置。
@@ -773,7 +824,8 @@ local function preview(args)
   end
   -- 仅保留最近一次预览，避免长时间保留宿主对象及无界增长。
   previews={}
-  previews[id]={kind="automation",signature=signature(s),parameter=name,before=original,after=points,interpolation=interpolation,created=os.time()}
+  previews[id]={kind="automation",signature=signature(s),parameter=name,before=original,after=points,
+    sampleChecks=checks,interpolation=interpolation,created=os.time()}
   return {previewId=id,parameter=name,delta=delta,noteCount=s.noteCount,startSeconds=startSec,endSeconds=endSec,
     summary="将在所选音符覆盖的连续时间段叠加参数曲线，边缘淡入淡出；尚未写入。",
     curve=knots,renderMode=renderMode,representation=renderMode=="smooth" and "automation-simplified" or "automation-points",
@@ -848,6 +900,19 @@ local function captureSnapshot(record,target)
   return target:getAllPoints()
 end
 
+local function verifyDisplayedSamples(record,target)
+  -- 完整节点一致并不充分：还要确认真实组中 get() 的插值与预览克隆一致。
+  -- 以同一时间位置核验所有展示样本；失败进入原有回滚，不能显示“已应用”。
+  if record.kind=="pitch" then return end
+  for _,check in ipairs(record.sampleChecks or {}) do
+    local actual=target:get(check.blick)
+    local epsilon=math.max(0.0000001,math.abs(check.value)*0.000001)
+    if not finite(actual) or math.abs(actual-check.value)>epsilon then
+      error("写入后的参数插值与预览不一致。")
+    end
+  end
+end
+
 local function apply(args)
   requireWrite()
   local p=previews[args.previewId]
@@ -863,7 +928,10 @@ local function apply(args)
   local edit={kind=p.kind,project=projectName(),uuid=group:getUUID(),parameter=p.parameter,before=p.before,after=p.after,
     interpolation=p.interpolation,voiceFingerprint=s.voiceFingerprint,groupOffset=s.groupOffset,groupPitchOffset=s.groupPitchOffset}
   SV:getProject():newUndoRecord()
-  local ok,err=pcall(writeSnapshot,p,curve,p.after)
+  local ok,err=pcall(function()
+    writeSnapshot(p,curve,p.after)
+    verifyDisplayedSamples(p,curve)
+  end)
   if not ok then
     previews={}
     local recovered=pcall(writeSnapshot,p,curve,p.before)
@@ -913,7 +981,7 @@ local function applyMany(args)
   end
   if parameters.pitchCurve and parameters.pitchDelta then error("原生音高与音高偏移不能同时应用。") end
   local previousEdit=lastEdit
-  local edit={kind="batch",project=projectName(),uuid=group:getUUID(),voiceFingerprint=s.voiceFingerprint,
+  local edit={kind="batch",batchId=args.batchId,project=projectName(),uuid=group:getUUID(),voiceFingerprint=s.voiceFingerprint,
     groupOffset=s.groupOffset,groupPitchOffset=s.groupPitchOffset,entries=records}
   -- 确认凭据先消耗，哪怕宿主中途抛异常也不得重放。整批只有一条宿主撤销记录。
   previews={}; previewBatch=nil
@@ -921,7 +989,10 @@ local function applyMany(args)
   local attempted=0
   local ok,err=pcall(function()
     for index,p in ipairs(records) do attempted=index; writeSnapshot(p,targets[index],p.after) end
-    for index,p in ipairs(records) do if not sameSnapshot(p,targets[index],p.after) then error("组合写入后完整校验失败。") end end
+    for index,p in ipairs(records) do
+      if not sameSnapshot(p,targets[index],p.after) then error("组合写入后完整校验失败。") end
+      verifyDisplayedSamples(p,targets[index])
+    end
   end)
   if not ok then
     local recovered=true
@@ -947,8 +1018,18 @@ local function applyMany(args)
   return {verified=true,undoRecords=1,results=results,message="组合参数已应用，可在 SynthV 一次撤销。"}
 end
 
-local function restore()
+local function restore(expectedBatch)
   requireWrite()
+  if expectedBatch~=nil then
+    -- 指定方案撤销必须在任何快照写入前检查身份；旧卡片不能撤销新的助手修改。
+    -- 固定的 rejected 回执表示完全未执行，客户端可保留 applied 而不误报恢复成功。
+    if not lastEdit or lastEdit.kind~="batch" or lastEdit.batchId~=expectedBatch then
+      return {verified=false,rejected=true,reason="not_latest_batch"}
+    end
+    if lastEdit.project~=projectName() then return {verified=false,rejected=true,reason="wrong_project"} end
+    local _,_,target=current()
+    if target:getUUID()~=lastEdit.uuid then return {verified=false,rejected=true,reason="wrong_group"} end
+  end
   if not lastEdit or lastEdit.project~=projectName() then error("本会话没有可恢复的修改。") end
   local _,_,group=current()
   if group:getUUID()~=lastEdit.uuid then error("请先回到上次修改的音符组。") end
@@ -977,7 +1058,7 @@ local function restore()
       error("组合恢复未完成，已保留全部原始参数，请检查 SynthV 撤销历史。")
     end
     lastEdit=nil
-    return {verified=true,message="已恢复本助手上一批修改前的全部参数。"}
+    return {verified=true,batchId=expectedBatch,message="已恢复本助手上一批修改前的全部参数。"}
   end
   local curve=editTarget(lastEdit,group)
   if lastEdit.kind~="pitch" and curve:getInterpolationMethod()~=lastEdit.interpolation then error("曲线插值方式已经改变，无法安全恢复。") end
@@ -1005,6 +1086,11 @@ local function dispatch(action,args)
   elseif action=="apply" then return apply(args)
   elseif action=="apply_batch" then return applyMany(args)
   elseif action=="restore" then return restore()
+  elseif action=="restore_batch" then
+    if type(args.batchId)~="string" or #args.batchId~=32 or not args.batchId:match("^[0-9a-f]+$") then
+      error("撤销方案编号无效。")
+    end
+    return restore(args.batchId)
   elseif action=="write_mode" then
     local name=projectName()
     if args.enabled and name=="" then error("请先保存工程副本。") end

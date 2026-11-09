@@ -25,9 +25,10 @@ def phrase():
 class TuningQualityTests(unittest.TestCase):
     """数值断言检查可应用结果，不能将通过测试解释为主观听感已改善。"""
 
-    def parse(self, actions, *, mode="smooth"):
+    def parse(self, actions, *, mode="smooth", **permissions):
         return planner._parse_plan(json.dumps({"text": "依据乐谱提出局部微调。", "actions": actions}),
-                                   has_selection=True, has_audio=False, key="", selection=phrase(), render_mode=mode)
+                                   has_selection=True, has_audio=False, key="", selection=phrase(), render_mode=mode,
+                                   **permissions)
 
     def test_musical_context_uses_sorted_seconds_and_explicit_note_ordinals(self):
         selection = phrase()
@@ -58,8 +59,8 @@ class TuningQualityTests(unittest.TestCase):
         self.assertEqual(musical_context(nanosecond_overlap), {"noteCurvesAvailable": False})
 
     def test_note_curves_compile_to_existing_contract_in_both_render_modes(self):
-        raw = {"parameter": "pitchDelta", "noteCurves": [
-            {"noteIndex": 3, "curve": [[0, 0], [0.6, 12], [1, 0]]}], "reason": "轻微修饰末音。"}
+        raw = {"parameter": "tension", "noteCurves": [
+            {"noteIndex": 3, "curve": [[0, 0], [0.6, 0.06], [1, 0]]}], "reason": "轻微修饰末音。"}
         for mode in ("smooth", "points"):
             with self.subTest(mode=mode):
                 action = self.parse([raw], mode=mode)["actions"][0]
@@ -68,7 +69,7 @@ class TuningQualityTests(unittest.TestCase):
                 self.assertEqual(action["curve"][0], [0, 0])
                 self.assertEqual(action["curve"][-1], [1, 0])
                 self.assertAlmostEqual(action["curve"][1][0], 0.4)
-                self.assertEqual(max(point[1] for point in action["curve"]), 12)
+                self.assertEqual(max(point[1] for point in action["curve"]), 0.06)
                 self.assertIn("第3个选中音符", action["reason"])
                 validate_action(action, phrase())
 
@@ -83,10 +84,12 @@ class TuningQualityTests(unittest.TestCase):
             self.parse([{**base, "parameter": "pitchCurve"}])
 
     def test_two_pitch_semantics_cannot_create_an_unpreviewable_batch(self):
-        with self.assertRaisesRegex(planner.PlannerError, "同一计划"):
+        with self.assertRaisesRegex(planner.PlannerError, "模型却返回音高偏差"):
             self.parse([
-                {"parameter": "pitchCurve", "pitchShape": {"curve": [[0, 0], [1, 0]]}, "reason": "明确重画。"},
-                {"parameter": "pitchDelta", "delta": 10, "reason": "偏移。"}])
+                {"parameter": "pitchCurve", "pitchShape": {"notes": [
+                    {"noteIndex": 2, "curve": [[0, 0], [1, 0]]}]}, "reason": "明确重画。"},
+                {"parameter": "pitchDelta", "delta": 10, "reason": "偏移。"}],
+                allow_pitch_adjustments=True, allow_native_pitch=True)
 
     def test_mock_provider_receives_current_values_and_returns_localized_plan(self):
         """走实际请求构造与解析路径，但 HTTP 替身不会联网或读取真实密钥。"""
@@ -117,7 +120,7 @@ class TuningQualityTests(unittest.TestCase):
         self.assertEqual(len(plan["actions"]), 1)
         self.assertNotIn("noteCurves", plan["actions"][0])
         self.assertEqual(min(point[1] for point in plan["actions"][0]["curve"]), -0.05)
-        self.assertIn("未提供音频", plan["text"])
+        self.assertEqual(plan["text"], reply["text"])
 
 
 if __name__ == "__main__":

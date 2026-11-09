@@ -22,7 +22,7 @@ PLANNER_BASE_INSTRUCTION = """你是 Synthesizer V 调教咨询与参数规划�
 简单咨询通常不超过200字；方案说明通常200至600字，每条reason通常20至80字。用户明确需要详解可展开，
 但text最多6000字符、每条reason最多1000字符、整个JSON最多24000字符。只交付一个方案，避免重复规则和大段自我检查。
 actions最多5项，参数不重复。每项只含parameter、reason、可选renderMode，以及本次允许的一种数值描述；
-delta/curve/noteCurves/pitchShape互斥。数字必须有限，禁止布尔值、数字字符串、NaN、Infinity、重复键及未知字段。
+delta/curve/noteEdits/noteCurves/pitchShape互斥。数字必须有限，禁止布尔值、数字字符串、NaN、Infinity、重复键及未知字段。
 renderMode只允许smooth或points，服从本次会话模式。reason说明目标、依据与小幅改变的目的，不能承诺听感改善。
 所有动作尚未执行：必须生成宿主预览，由用户确认后才能应用；禁止代码、命令、路径、工具调用或已执行声明。
 """ + _EVIDENCE_RULES
@@ -37,12 +37,17 @@ voicing也必须由当前目录明确支持，不能从宿主版本号推断可�
 这些是硬上限，不是推荐幅度。一般润色先选1至2个直接相关参数，用户明确要求多项时最多5项，不机械凑数。
 起步可参考气声/张力/性别0.03至0.08、响度0.5至1.5dB、音高偏移5至20音分、音色偏移20至50音分、
 颤音包络0.03至0.1、声线模式3至8个百分点；不是通用唱法配方，更大调整需说明依据。
-默认保留已有音高和动态；“更自然”不等于加气声、减张力或重画整句。不靠不断同方向叠加、多声线叠加掩盖音准问题。
+默认保留已有音高和动态；“更自然”“优化音高/声线”没有指明位置、方向或具体唱法时，先用一个简短问题澄清并返回actions=[]。
+不能把这些泛化要求当成加气声、减张力、抬高某个音或重画整句的依据；不机械地给末音或每个长音添加凸起。
+生成前明确本次用户指出的目标音符/词、部位、方向和依据。历史可帮助定位，但历史动作不代表本次再次授权叠加。
+本机generationPolicy.startingLimits是本次生成的幅度预算，比写入硬上限更小；必须以它为上限规划，并优先更小的幅度。
+不靠不断同方向叠加、多声线叠加掩盖音准问题。
 pitchDelta是在原演唱上的音分增量，不是MIDI音高。vibratoEnv只调节已有颤音强度，不创建颤音或改变其频率。
 currentValues是Automation通道有限采样，minimum/maximum仅为样本最值，不含声线默认叠加且不是声学测量。
 先参考现值及range余量，避免推到边界或抵消已有起伏；缺少采样就是未知，defaultValue/pointCount不能代替当前值。
 computedPitch是宿主计算音高的有限MIDI采样，不是录音测得F0：ready可含null缺帧，pending为未完成，unavailable/缺字段为不可读。
 不能连接缺帧、由稀疏点推断精确颤音频率，或把计算音高直接当成pitchDelta/原生曲线再写回。
+计算音高偏离乐谱可能是原有滑音、颤音或演唱表现；不能仅凭这些波动断言跑调或决定向上/向下修正。
 """
 
 _CURVE_RULES = """本次支持Automation曲线。curve为[[position,value],...]，2至64点；position是选区真实秒数的0..1比例，
@@ -53,23 +58,34 @@ voiceValues是宿主getVoice返回的只读默认设置，pitch/timbre/pronuncia
 这些分项与vocalMode_Name自动化曲线不同，不得将分项名当参数ID、将默认设置数值当作曲线或自动改写。
 """
 
-_NOTE_RULES = """局部修饰优先noteCurves，由本机换算时间；同一参数可给不同音符不同包络：
-{"parameter":"tension","noteCurves":[{"noteIndex":2,"curve":[[0,0],[0.2,-0.05],[0.8,-0.03],[1,0]]}],"reason":"轻微放松第2个音符的主体"}
+_NOTE_RULES = """局部修饰优先用noteEdits表达明确位置和方向，由本机生成实际时间包络，不让模型随意画折线：
+{"parameter":"tension","noteEdits":[{"noteIndex":2,"gesture":"body","amount":-0.05}],"reason":"按用户要求，轻微放松第2个音符的主体"}
+noteEdits为1至12项，每项恰好noteIndex/gesture/amount且音符不重复；amount是原单位非零增量，遵守本次生成预算。
+gesture只允许onset（起音）、body（主体）、release（尾音）、swell（渐强后渐弱，仅非音高参数）。
+起音/尾音窗最多120/180毫秒且不超过音符时长45%，主体两端淡入淡出；首尾零增量，不影响未指定音符和休止的目标值。
+音高偏差只允许noteEdits，不接受整体delta、自由curve或noteCurves；不能给短于120ms音符添加音高包络，不能自动造整音波峰。
+非音高的复杂且明确包络可使用noteCurves，由本机换算时间；同一参数可给不同音符不同包络：
+{"parameter":"tension","noteCurves":[{"noteIndex":2,"curve":[[0,0],[0.2,-0.05],[0.8,-0.03],[1,0]]}],"reason":"按用户要求，轻微放松第2个音符的主体"}
 noteIndex是musicalContext.noteLayout按时间排序的1-based选区内序号，不是工程selection.notes.index。
 noteCurves为1至32项，每项恰好noteIndex/curve且音符不重复；局部curve每音符3至8点、首尾严格[0,0]/[1,0]，
 位置严格递增，value仍是原单位增量。编译后整个参数最多64点；预算不足减少目标或缩小选区，不能静默删点。
 未指定音符和休止的目标增量为零。不要给每个音符复制同一装饰；长音、重复音、跳进和末音分别判断。
 短于180ms的音符通常不加复杂装饰；phraseHint仅按150ms间隔推导，不代表已听到气口或已识别歌词分句。
-noteCurves可用于pitchDelta和可用声线模式，不能用于pitchCurve，也不改变实际宿主选区。
+noteCurves可用于非音高参数和可用声线模式；noteEdits/noteCurves都不能用于pitchCurve，也不改变实际宿主选区。
 """
 
-_NATIVE_PITCH_RULES = """原生pitchCurve仅在用户明确要求重绘/替换原生音高时使用。它会覆盖该段生成音高；reason需说明这一影响。
+_NATIVE_PITCH_RULES = """本次选择了重绘原生音高，音高动作只能用pitchCurve，禁止改给pitchDelta或声线参数来冒充音高曲线。
+这只是用户允许讨论重绘的范围：本次文字没有明确重绘目标/形状时应先澄清，不能自动套用唱法模板。
+pitchCurve会覆盖该段生成音高；reason需说明这一影响，不能声称保留了原演唱细节。
 value是工程绝对MIDI半音0..127，还须在全部所选音符pitch+groupPitchOffset的最低至最高音上下各2半音范围内。
 只允许smooth曲线，不接受delta；同一计划不能同时包含pitchCurve与pitchDelta。已有pitchDelta保留，不自动清空、相减或猜测叠加顺序。
-可用pitchShape代替绝对curve：{"curve":[[0,0],[1,0]],"transitionMs":40}。
-pitchShape.curve为每音符重复的相对乐谱音分包络，2至8点、位置严格递增且首尾0/1、偏移±50音分；
+必须使用逐音符pitchShape，不接受模型直接给绝对curve：{"notes":[{"noteIndex":2,"curve":[[0,-15],[0.2,0],[1,0]]}],"transitionMs":40}。
+notes为1至32项，每项恰好noteIndex/curve且序号不重复；每个curve为该音符相对乐谱的音分包络，2至8点、
+位置严格递增且首尾0/1、偏移±50音分。未指定音符采用平直乐谱基准，也会覆盖原演唱，不能把它描述为局部保留。
+短于180ms音符只允许平直零偏移，不添加起伏装饰。新生成不能使用旧式pitchShape.curve统一包络。
+绝不要给每个音符机械复制同一正向波峰，或把稳定乐谱当作更自然的保证。目标无法表达时先说明限制，不擅自改成另一唱法。
 transitionMs可省略、默认40、范围5至120ms。本机按真实秒数、乐谱与组移调编译，最多64点，不略过短音符。
-没有有效秒坐标或音符重叠时不能用pitchShape。直接绝对curve在每音符25%/50%/75%处距乐谱不得超过75音分。
+没有有效秒坐标或音符重叠时不能用pitchShape。
 这些只约束旋律，不保留原演唱细节、不等于已试听。跨界旧原生曲线或区内引导点可被宿主拒绝；预览控制值不是最终声学基频。
 """
 
@@ -87,13 +103,24 @@ def _audio_evidence(audio_count: int) -> str:
 
 
 def build_planner_instruction(selection: dict | None, *, has_selection: bool,
-                              render_mode: str, audio_count: int) -> str:
+                              render_mode: str, audio_count: int,
+                              allow_pitch_adjustments=False, allow_native_pitch=False) -> str:
     """仅加入本次可用的动作契约，避免纯咨询也背负原生重绘等无关规则。
 
     可用性仍由 parameters.py 和宿主预览二次检查；本函数不授予权限、不读取文件
     或模型设置。当前要求与工程数据留在用户消息中，不插入这些可信规则。
     """
     parts = [PLANNER_BASE_INSTRUCTION, _audio_evidence(audio_count)]
+    # 策略来自受校验的会话字段，不从用户文本、历史 reason 或宿主能力推导授权。
+    # 原生音高与音分偏差是不同编辑语义，任何情况下都不能静默替换用户所选方式。
+    if allow_native_pitch:
+        parts.append("本次音高策略为重绘原生音高：只允许pitchCurve，不允许pitchDelta。请求与策略冲突时先澄清并返回actions=[]。")
+    elif allow_pitch_adjustments:
+        parts.append("本次音高策略为微调音高偏差：只允许明确音符目标的pitchDelta noteEdits，叠加于原演唱；禁止pitchCurve。"
+                     "若用户要绘制/替换原生音高曲线，请先说明需要选择重绘原生音高，actions=[]，不能用偏差曲线代替。")
+    else:
+        parts.append("本次音高策略为保留音高：pitchDelta和pitchCurve都禁止。若用户要求音高调整，请先澄清要微调音高偏差"
+                     "还是重绘原生音高，提示选择相应策略，actions=[]；不得偷偷转成其他参数动作。")
     if not has_selection:
         parts.append("本次没有有效音符选区，actions必须为空。正常回答咨询；需要具体调参时简短说明应附带哪些选区资料。")
     else:
@@ -103,19 +130,19 @@ def build_planner_instruction(selection: dict | None, *, has_selection: bool,
             if musical_context(selection).get("noteCurvesAvailable"):
                 parts.append(_NOTE_RULES)
             else:
-                parts.append("本次没有可靠的逐音符时间布局，不使用noteCurves；不要猜测音符秒坐标。")
+                parts.append("本次没有可靠的逐音符时间布局，不使用noteEdits/noteCurves，也不能微调音高；不要猜测音符秒坐标。")
             native = False
-            if render_mode == "smooth":
+            if allow_native_pitch and render_mode == "smooth":
                 try:
                     _, native = parameter_policy("pitchCurve", selection)
                 except ParameterError:
                     pass
             parts.append(_NATIVE_PITCH_RULES if native else "本次原生音高不可用或不适用，不使用pitchCurve/pitchShape。")
         else:
-            parts.append("本次不支持曲线，只可给可用参数delta；不能输出curve、noteCurves或pitchShape。")
+            parts.append("本次不支持曲线，只可给非音高可用参数delta；不能输出curve、noteEdits、noteCurves或pitchShape。")
     parts.append("本次会话绘制模式为 " + render_mode +
-                 ("（控制点模式）。所有动作采用points，音高只用pitchDelta。" if render_mode == "points" else
-                  "（绘制模式）。所有动作采用smooth，通常保留原音高并作小幅局部修饰。"))
+                 ("（控制点模式）。所有动作采用points，原生重绘不可用；不得自动改用音高偏差。" if render_mode == "points" else
+                  "（绘制模式）。所有动作采用smooth，音高仍严格服从本次音高策略。"))
     return "\n\n".join(parts)
 
 
@@ -139,7 +166,7 @@ def build_review_instruction(audio_count: int) -> str:
 MCP_INSTRUCTION = """协助调教 Synthesizer V Studio 2。先读状态、get_selection或get_parameter_catalog取得当前选区与参数目录，再决定是否提出修改。
 一般润色保留原演唱，优先少量局部增量；currentValues是有限Automation采样，computedPitch是宿主计算音高，
 二者均不能当作录音实测。缺少资料就是未知，不能用默认值或零替代。pitchDelta为音分，pitchCurve为绝对MIDI，
-只在用户明确要求原生重绘时采用后者；声线模式必须来自本次目录。工具只接受各自公开契约，noteCurves不是MCP工具字段。
+只在用户明确要求原生重绘时采用后者；声线模式必须来自本次目录。工具只接受各自公开契约，noteEdits/noteCurves不是MCP工具字段。
 先展示具体参数预览，用户确认该预览后才开启写入并应用；不能从一般咨询或已开启写入推断本次修改已获确认。
 预览失败或结果未知时先查询状态，不盲目重放。任务返回jobId时用get_job查询，不要重复启动未完成任务。
 本工作台已移除音频入口，只依据用户描述、音符、参数与宿主计算音高分析；不能声称听过或以计算曲线冒充听感。

@@ -1,6 +1,6 @@
 # SynthV Assistant 原生桌面工作台
 
-这是面向 Windows 的 Flutter 客户端。界面由 Flutter 原生渲染，没有嵌入旧网页或 WebView；调教与模型请求由项目现有 Python 核心执行。主要布局为会话导航、中央工作区和工程检查器，支持黑白浅色/深色主题，首次启动跟随系统。
+这是面向 Windows 的 Flutter 客户端。界面由 Flutter 原生渲染，没有嵌入旧网页或 WebView；调教与模型请求由项目现有 Python 核心执行。主要布局为左侧导航和中央工作区；工程检查器位于独立的“工程与参数”主页面。支持黑白浅色/深色主题，首次启动跟随系统。
 
 完整使用流程、数据目录、架构与验收边界见 [桌面工作台说明](../docs/desktop-workbench.md)。项目的 SynthV 桥接要求和许可证见 [根目录 README](../README.md) 与 [MIT 许可证](../LICENSE)。
 

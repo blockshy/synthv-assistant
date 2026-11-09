@@ -139,6 +139,44 @@ class RacingApi extends ModelApi {
 }
 
 void main() {
+  test('音高策略默认保留，显式选择随本次请求传输，忙碌时不可改变', () async {
+    final api = RacingApi();
+    final model = WorkbenchModel(api)..draft = '调整这一句';
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    expect(model.pitchPolicy, 'preserve');
+    model.setPitchPolicy('invalid');
+    expect(model.pitchPolicy, 'preserve');
+    model.setPitchPolicy('redraw');
+    final sent = model.send();
+    expect(model.pendingMessage?['pitchPolicy'], 'redraw');
+    model.setPitchPolicy('local');
+    expect(model.pitchPolicy, 'redraw');
+    await Future<void>.delayed(Duration.zero);
+    final request = api.writes
+        .singleWhere((e) => e.$1.endsWith('/messages'))
+        .$2;
+    expect(request['pitchPolicy'], 'redraw');
+    expect(request.containsKey('allowNativePitch'), isFalse);
+    api.answer.complete(api.document);
+    await sent;
+  });
+
+  test('音高策略不会从历史会话恢复，打开和新建均回到保留', () async {
+    final api = ModelApi();
+    final model = WorkbenchModel(api);
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    api.document['pitchPolicy'] = 'redraw';
+    model.setPitchPolicy('local');
+    await model.openConversation(conversationId);
+    expect(model.pitchPolicy, 'preserve');
+    model.setPitchPolicy('redraw');
+    await model.newConversation();
+    expect(model.pitchPolicy, 'preserve');
+    expect(api.calls.where((call) => call.endsWith('/messages')), isEmpty);
+  });
+
   test('一次模型选择同时保存平台与型号，不支持的推理档位明确返回复位结果', () async {
     final api = RacingApi();
     final model = WorkbenchModel(api)..conversation = api.document;

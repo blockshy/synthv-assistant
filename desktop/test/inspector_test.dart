@@ -144,9 +144,10 @@ Future<void> _show(
   WidgetTester tester,
   Widget child, {
   double height = 760,
+  double width = 360,
   Brightness brightness = Brightness.dark,
 }) async {
-  tester.view.physicalSize = Size(360, height);
+  tester.view.physicalSize = Size(width, height);
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);
@@ -303,6 +304,11 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(apply);
     await tester.pumpAndSettle();
+    // 工具栏入口只打开具体范围确认，已有写入权限也不跳过这一层。
+    expect(api.posts.where((p) => p.path == '/api/apply'), isEmpty);
+    expect(find.textContaining('2 个音符 · 10–12 秒'), findsWidgets);
+    await tester.tap(find.text('确定应用'));
+    await tester.pumpAndSettle();
     final submitted = api.posts.where((p) => p.path == '/api/apply').single;
     expect(submitted.body, {'previewId': 'fixture-preview'});
     expect(tester.widget<FilledButton>(apply).onPressed, isNull);
@@ -336,6 +342,77 @@ void main() {
       original,
     );
     expect(api.posts, isEmpty);
+  });
+
+  testWidgets('只读预览可就地确认权限，取消不写入，允许后只应用已确认票据', (tester) async {
+    final api = _InspectorApi();
+    addTearDown(api.dispose);
+    await _show(tester, Inspector(api: api), height: 900);
+    await tester.tap(find.text('读取当前选区'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('生成预览'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('确认应用'));
+    await tester.pumpAndSettle();
+    expect(find.text('允许修改当前选区'), findsOneWidget);
+    final finalConfirm = find.widgetWithText(FilledButton, '确定应用');
+    expect(tester.widget<FilledButton>(finalConfirm).onPressed, isNull);
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    expect(api.posts.map((p) => p.path), ['/api/preview']);
+    await tester.tap(find.text('确认应用'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('允许修改当前选区'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('确定应用'));
+    await tester.pumpAndSettle();
+    expect(api.posts.map((p) => p.path), [
+      '/api/preview',
+      '/api/write-mode',
+      '/api/apply',
+    ]);
+    expect(api.posts.last.body, {'previewId': 'fixture-preview'});
+    expect(find.text('已允许修改 · 关闭'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('确认期间票据失效时不因对话框同意而开启权限或应用旧范围', (tester) async {
+    final api = _InspectorApi();
+    addTearDown(api.dispose);
+    await _show(tester, Inspector(api: api), height: 900);
+    await tester.tap(find.text('读取当前选区'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('生成预览'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('确认应用'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('允许修改当前选区'));
+    await tester.pumpAndSettle();
+    api.invalidatePreviews();
+    await tester.tap(find.text('确定应用'));
+    await tester.pumpAndSettle();
+    expect(api.posts.map((p) => p.path), ['/api/preview']);
+    expect(find.textContaining('预览已变化'), findsOneWidget);
+  });
+
+  testWidgets('宽屏参数页将属性与大画布分栏且底栏始终可见', (tester) async {
+    final api = _InspectorApi();
+    addTearDown(api.dispose);
+    await _show(tester, Inspector(api: api), width: 1200, height: 720);
+    await tester.tap(find.text('读取当前选区'));
+    await tester.pumpAndSettle();
+    await _category(tester, '原生音高');
+    final canvas = tester.getRect(
+      find.byKey(const ValueKey('parameter-draft-canvas')),
+    );
+    final category = tester.getRect(
+      find.byKey(const ValueKey('inspector-choice:参数分类')),
+    );
+    expect(canvas.left, greaterThan(category.right));
+    expect(canvas.width, greaterThan(700));
+    expect(canvas.height, 340);
+    expect(tester.getRect(find.text('生成预览')).bottom, lessThan(720));
+    expect(tester.takeException(), isNull);
   });
 
   for (final brightness in Brightness.values) {

@@ -271,7 +271,8 @@ end; host.curve.points=p
         self.assertLess(smooth["pointCount"], dense["pointCount"] / 2)
         self.assertEqual(smooth["representation"], "automation-simplified")
         self.assertGreater(smooth["pointReduction"], 0)
-        self.assertAlmostEqual(smooth["curvePreview"][48]["after"], 0.1)
+        middle = min(smooth["curvePreview"], key=lambda row: abs(row["position"] - 0.5))
+        self.assertAlmostEqual(middle["after"], 0.1)
         self.assertEqual(self.host.mutations, 0)
 
     def test_graded_guards_preserve_sparse_clamped_cubic_without_editing_the_host(self):
@@ -324,7 +325,7 @@ host.curve.points=mirrored
                 after = [self.host.curve.get(self.host.curve, value) for value in positions]
                 self.assertLessEqual(max(abs(a - b) for a, b in zip(before, after)), 1e-7)
                 # 保形不能以取消调教为代价：选区中段必须真实叠加曲线所要求的增量。
-                middle = preview["curvePreview"][48]
+                middle = min(preview["curvePreview"], key=lambda row: abs(row["position"] - 0.5))
                 self.assertAlmostEqual(middle["after"] - middle["before"], 0.042, delta=0.002)
                 self.assertEqual(self.host.curve.getInterpolationMethod(self.host.curve), "Cubic")
                 self.assertTrue(self.call("restore")["ok"])
@@ -485,7 +486,7 @@ end
                 # 比较实际返回的两种表示，不绑定实现恰好选择的 21 个控制点。
                 self.assertLess(smooth["pointCount"], dense["pointCount"] / 3)
                 self.assertEqual(smooth["pointReduction"], dense["pointCount"] - smooth["pointCount"])
-                self.assertEqual(len(smooth["curvePreview"]), 97)
+                self.assertLessEqual(len(smooth["curvePreview"]), 1024)
                 for row in smooth["curvePreview"]:
                     self.assertGreater(row["before"], 0.1)
                     elapsed = 4.5 * row["position"]
@@ -502,9 +503,44 @@ end
         preview = self.call("preview", parameter="tension", curve=[[0, 0], [0.25, 0.1], [0.75, -0.1], [1, 0]])
         self.assertTrue(preview["ok"], preview.get("error"))
         view = preview["result"]["curvePreview"]
-        self.assertAlmostEqual(view[24]["after"], 0.1)
-        self.assertAlmostEqual(view[72]["after"], -0.1)
+        self.assertAlmostEqual(min(view, key=lambda row: abs(row["position"] - 0.25))["after"], 0.1)
+        self.assertAlmostEqual(min(view, key=lambda row: abs(row["position"] - 0.75))["after"], -0.1)
         self.assertEqual(self.host.mutations, 0)
+
+    def test_short_local_peak_is_visible_and_matches_written_curve(self):
+        """旧的 97 点等距图会跳过节点之间的短峰；新图必须包含该峰的真实读回。"""
+        curve = [[0, 0], [0.5, 0], [0.504, 0.1], [0.508, 0], [1, 0]]
+        response = self.call("preview", parameter="tension", curve=curve, renderMode="points")
+        self.assertTrue(response["ok"], response.get("error"))
+        preview = response["result"]
+        self.assertGreater(max(row["after"] for row in preview["curvePreview"]), 0.09)
+        self.assertEqual(self.host.mutations, 0)
+        self.enable()
+        result = self.call("apply", previewId=preview["previewId"])
+        self.assertTrue(result["ok"], result.get("error"))
+        for row in preview["curvePreview"]:
+            actual = self.host.curve.get(self.host.curve, 1000 + 1000 * row["position"])
+            self.assertAlmostEqual(actual, row["after"], delta=1e-7)
+
+    def test_identical_points_with_different_live_interpolation_roll_back(self):
+        """写入后节点相同却插值不同也不能报告成功；模拟宿主绑定与克隆差异。"""
+        before = [[p[1], p[2]] for p in self.host.curve.points.values()]
+        preview = self.preview_id()
+        self.lua.execute('''
+local original=getmetatable(host.curve).get
+getmetatable(host.curve).get=function(self,x)
+  local value=original(self,x)
+  -- 只对第一次真实写入施加差异；回滚后恢复正常，点读取始终不变。
+  if not self.cloned and self.writeRound==1 then return value+0.02 end
+  return value
+end
+''')
+        self.enable()
+        result = self.call("apply", previewId=preview)
+        self.assertFalse(result["ok"])
+        self.assertIn("插值与预览不一致", result["error"])
+        self.assertIn("已恢复", result["error"])
+        self.assertEqual([[p[1], p[2]] for p in self.host.curve.points.values()], before)
 
     def test_curve_shape_and_unknown_fields_are_rejected_before_writes(self):
         for arguments in (

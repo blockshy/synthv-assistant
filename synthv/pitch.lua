@@ -10,6 +10,9 @@
 local M = {}
 local MAX_POINTS, MAX_FINGERPRINT, MAX_METADATA = 4000, 262144, 32768
 local MAX_SAFE = 9007199254740991
+-- 显示折线误差为 0.01 MIDI（1 音分）；独立限制输出量、宿主读取量与递归深度，
+-- 防止极密曲线或异常插值让宿主脚本长期阻塞。超限必须拒绝预览，不能静默截断。
+local MAX_PREVIEW_POINTS,MAX_SAMPLE_CHECKS,DISPLAY_TOLERANCE = 1024,12288,0.01
 local safeErrors={}
 
 local function fail(message)
@@ -303,6 +306,26 @@ function M.write(group, snapshot)
     total,bytes=addReadBudget(fresh[#fresh].description,total,bytes)
   end
   if packed(fresh).fingerprint~=snapshot.fingerprint then fail("原生音高恢复快照已变化，未写入。") end
+  -- 这些检查点只保存在当前候选的内存快照中，不影响原始控件指纹，也不加入回滚
+  -- 用的 before 快照。先校验记录格式，避免损坏的本地快照在清空工程后才被发现。
+  local checks=snapshot.sampleChecks
+  if checks then
+    if type(checks)~="table" or not finite(checks.controlIndex) or checks.controlIndex%1~=0
+        or not fresh[checks.controlIndex] or fresh[checks.controlIndex].description.kind~="curve"
+        or (checks.coordinateMode~="group" and checks.coordinateMode~="relative")
+        or not finite(checks.transpose) then fail("原生音高插值校验快照无效，未写入。") end
+    local row=fresh[checks.controlIndex].description
+    if #row.points<2 or length(checks.points,MAX_SAMPLE_CHECKS,"原生音高插值校验快照无效，未写入。")<2 then
+      fail("原生音高插值校验快照无效，未写入。")
+    end
+    for _,point in ipairs(checks.points) do
+      if type(point)~="table" or not finite(point.position) or not finite(point.value)
+          or point.position<row.position+row.points[1][1]
+          or point.position>row.position+row.points[#row.points][1] then
+        fail("原生音高插值校验快照无效，未写入。")
+      end
+    end
+  end
   -- 偏移曲线是候选绝对音高成立的依赖；已知依赖变化时不先删除任何原生控件。
   -- 不比较当前原生控件与目标快照，因为恢复操作本来就要把不同的当前状态恢复回去。
   if snapshot.pitchDeltaFingerprint then
@@ -318,6 +341,20 @@ function M.write(group, snapshot)
   for index=count,1,-1 do invoke(group,"removePitchControl",index) end
   for _,entry in ipairs(fresh) do invoke(group,"addPitchControl",entry.clone) end
   if not M.same(group,snapshot) then fail("原生音高写入后完整校验失败，请由桥接恢复原快照。") end
+  if checks then
+    -- 节点相同不等于宿主附加后的曲线形状相同；对实际工程对象重读预览时检查过
+    -- 的全部位置。采用规范化后的候选值及 float32 可容忍误差，不拿模型原值比较。
+    local control=invoke(group,"getPitchControl",checks.controlIndex)
+    local row=fresh[checks.controlIndex].description
+    for _,point in ipairs(checks.points) do
+      local query=checks.coordinateMode=="group" and point.position or point.position-row.position
+      local value=invoke(control,"getValueAt",query)
+      local pitch=finite(value) and value+checks.transpose+(checks.coordinateMode=="group" and 0 or row.pitch) or nil
+      if not finite(pitch) or math.abs(pitch-point.value)>0.00001 then
+        fail("原生音高写入后的实际插值与预览不一致，请由桥接恢复原快照。")
+      end
+    end
+  end
   return true
 end
 
@@ -399,6 +436,75 @@ local function validateInput(args, ctx)
   end
   if args.curve[1][1]~=0 or args.curve[count][1]~=1 then fail("原生音高曲线首尾时间比例必须为0和1。") end
   return transpose,timeOffset,low,high,noteCount
+end
+
+local function sampleNativePreview(row,ctx,timeOffset,sampledPitch)
+  -- 时间轴使用真实秒数；将宿主规范化后的节点固定为种子，短峰值即使落在旧版
+  -- 97 点网格之间也不会消失。音符内部另加四分点，保证短音符主体参与实际检查。
+  local ratios={[0]=ctx.begin,[1]=ctx.finish}
+  for index=1,31 do ratios[index/32]=false end
+  local function seed(position)
+    if not finite(position) or position<ctx.begin or position>ctx.finish then return end
+    local seconds=invoke(ctx.axis,"getSecondsFromBlick",position+timeOffset)
+    local ratio=position==ctx.begin and 0 or (position==ctx.finish and 1
+      or (seconds-ctx.startSeconds)/(ctx.endSeconds-ctx.startSeconds))
+    if not finite(ratio) or ratio<0 or ratio>1 then fail("宿主时间轴无法转换候选曲线。") end
+    ratios[ratio]=position
+  end
+  for _,point in ipairs(row.points) do seed(row.position+point[1]) end
+  for _,note in ipairs(ctx.selection.notes) do
+    if finite(note.onset) and finite(note.duration) and note.duration>0 then
+      -- 四分点在真实时间上等距，不能在变速段使用 blick 的算术平均冒充秒数。
+      local first=invoke(ctx.axis,"getSecondsFromBlick",note.onset+timeOffset)
+      local last=invoke(ctx.axis,"getSecondsFromBlick",note.onset+note.duration+timeOffset)
+      for part=0,4 do
+        seed(invoke(ctx.axis,"getBlickFromSeconds",first+(last-first)*part/4)-timeOffset)
+      end
+    end
+  end
+  local ordered={}; for ratio in pairs(ratios) do ordered[#ordered+1]=ratio end
+  table.sort(ordered)
+  local count=#ordered
+  if count>MAX_PREVIEW_POINTS then fail("原生音高曲线细节超过预览显示上限，请缩小选区后预览。") end
+  local cache,checks={},{}
+  local function read(ratio)
+    if not cache[ratio] then
+      if #checks>=MAX_SAMPLE_CHECKS then fail("原生音高曲线细节超过预览显示上限，请缩小选区后预览。") end
+      local position=ratios[ratio] or (invoke(ctx.axis,"getBlickFromSeconds",
+        ctx.startSeconds+(ctx.endSeconds-ctx.startSeconds)*ratio)-timeOffset)
+      if not finite(position) or position<ctx.begin or position>ctx.finish then
+        fail("宿主时间轴无法转换候选曲线。")
+      end
+      local value=sampledPitch(position)
+      cache[ratio]={position=ratio,after=value}
+      -- 保留所有检查点，包含最终没有成为折线节点的四分点；写后校验不能只看
+      -- 模型节点，否则同节点而不同插值的宿主行为仍会被误判为应用成功。
+      checks[#checks+1]={position=position,value=value}
+    end
+    return cache[ratio]
+  end
+  local output={read(0)}
+  local function segment(left,right,depth)
+    local a,b=read(left),read(right)
+    local worst,split=0,nil
+    for part=1,3 do
+      local fraction=part/4; local ratio=left+(right-left)*fraction
+      local error=math.abs(read(ratio).after-(a.after+(b.after-a.after)*fraction))
+      if error>worst then worst,split=error,ratio end
+    end
+    if worst>DISPLAY_TOLERANCE then
+      if count>=MAX_PREVIEW_POINTS or depth>=12 or split==left or split==right then
+        fail("原生音高曲线细节超过预览显示上限，请缩小选区后预览。")
+      end
+      count=count+1; segment(left,split,depth+1); segment(split,right,depth+1)
+    else
+      output[#output+1]=b
+    end
+  end
+  for index=1,#ordered-1 do segment(ordered[index],ordered[index+1],0) end
+  -- 未公开宿主插值的数学形式，因此有限四分采样是误差检查而非连续极值证明。
+  -- 不满足预算时拒绝，绝不删去峰值来迎合固定图表尺寸。
+  return output,checks
 end
 
 function M.preview(args, ctx)
@@ -498,22 +604,8 @@ function M.preview(args, ctx)
     local left,right=row.points[index][1],row.points[index+1][1]
     for sample=1,4 do sampledPitch(row.position+left+(right-left)*sample/5) end
   end
-  local previewRows={}
-  for sample=0,96 do
-    local fraction=sample/96
-    local position
-    if sample==0 then position=ctx.begin
-    elseif sample==96 then position=ctx.finish
-    else
-      local seconds=ctx.startSeconds+(ctx.endSeconds-ctx.startSeconds)*fraction
-      position=invoke(ctx.axis,"getBlickFromSeconds",seconds)-timeOffset
-    end
-    if not finite(position) or position<ctx.begin or position>ctx.finish then
-      fail("宿主时间轴无法转换候选曲线。")
-    end
-    previewRows[#previewRows+1]={position=fraction,after=sampledPitch(position)}
-  end
-  -- 节点标记取自宿主规范化后的曲线描述，不能使用模型原始输入或 97 个插值采样。
+  local previewRows,sampleChecks=sampleNativePreview(row,ctx,timeOffset,sampledPitch)
+  -- 节点标记取自宿主规范化后的曲线描述，不能使用模型原始输入或展示折线采样。
   -- 横坐标把曲线锚点、节点偏移和组时间偏移换算为实际秒数；纵坐标将锚点音高、
   -- 节点相对音高与组移调相加一次，得到可与钢琴卷帘音符直接对齐的绝对 MIDI。
   -- 仅公开此次新建曲线的节点；保留在选区外的原生控件不属于本次预览的可视范围。
@@ -538,6 +630,10 @@ function M.preview(args, ctx)
   end)
   local after=packed(kept)
   after.pitchDeltaFingerprint=before.pitchDeltaFingerprint
+  local controlIndex
+  for index,entry in ipairs(kept) do if entry==added then controlIndex=index; break end end
+  after.sampleChecks={controlIndex=controlIndex,coordinateMode=coordinateMode,
+    transpose=transpose,points=sampleChecks}
   return {before=before,after=after,public={parameter="pitchCurve",renderMode="smooth",noteCount=noteCount,
     startSeconds=ctx.startSeconds,endSeconds=ctx.endSeconds,beforePointCount=before.pointCount,
     pointCount=after.pointCount,controlCount=#after.controls,

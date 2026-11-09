@@ -55,10 +55,16 @@ class ProposalReuseTests(unittest.TestCase):
         return {"previews": [{"actionId": action["id"], "preview": self.host_preview(action["parameter"])}
                              for action in actions], "errors": []}
 
-    def proposed_message(self, actions=None):
+    def proposed_message(self, actions=None, *, pitch_policy="preserve"):
+        """按用例显式选择本次音高权限，不能从模拟模型动作反推用户授权。"""
         if actions is not None:
             self.plan["actions"] = actions
-        return self.send()["messages"][-1]
+        message = self.manager.send_message(self.identifier, "请让这句轻柔一些", True, [],
+                                             pitch_policy=pitch_policy)["messages"][-1]
+        # 复用用例必须真正生成源提案，不能误把策略拒绝当作后续复用保护生效。
+        self.assertEqual(message["role"], "assistant")
+        self.assertTrue(message["actions"])
+        return message
 
     def reuse(self, source):
         result = self.manager.reuse_message(self.identifier, source["id"])
@@ -233,7 +239,7 @@ class ProposalReuseTests(unittest.TestCase):
         self.assert_no_external_execution()
 
     def test_pitch_curve_reuse_accepts_same_effective_pitch_and_proportional_rhythm(self):
-        source = self.proposed_message([self.pitch_action()])
+        source = self.proposed_message([self.pitch_action()], pitch_policy="redraw")
         self.move_target(scale=2)
         # 组移调和原始 MIDI 可以不同；实际发声音高相同才是旋律匹配条件。
         self.selection["groupPitchOffset"] = 12
@@ -252,7 +258,8 @@ class ProposalReuseTests(unittest.TestCase):
             for change in ("pitch", "rhythm", "count"):
                 with self.subTest(parameter=parameter, change=change):
                     base = copy.deepcopy(self.selection)
-                    source = self.proposed_message([self.pitch_action(parameter)])
+                    source = self.proposed_message([self.pitch_action(parameter)],
+                                                   pitch_policy="redraw" if parameter == "pitchCurve" else "local")
                     self.move_target()
                     if change == "pitch":
                         self.selection["notes"][1]["pitch"] += 1
@@ -274,7 +281,7 @@ class ProposalReuseTests(unittest.TestCase):
         source = self.proposed_message([
             self.pitch_action("pitchDelta"),
             {"parameter": "breathiness", "delta": 0.1, "reason": "调整气声。"},
-        ])
+        ], pitch_policy="local")
         self.move_target()
         self.selection["notes"][0]["pitch"] += 2
         message, _ = self.reuse(source)
@@ -282,7 +289,7 @@ class ProposalReuseTests(unittest.TestCase):
         self.assert_no_external_execution()
 
     def test_native_pitch_reuse_revalidates_curve_against_each_note(self):
-        source = self.proposed_message([self.pitch_action()])
+        source = self.proposed_message([self.pitch_action()], pitch_policy="redraw")
         document = self.read_saved()
         # 历史文件可能由旧版模型生成粗略长滑音；旋律相同不能绕过逐音符校验。
         document["messages"][-1]["actions"][0]["curve"] = [[0, 60], [1, 64]]
@@ -293,7 +300,7 @@ class ProposalReuseTests(unittest.TestCase):
         self.assert_no_external_execution()
 
     def test_reusing_a_reused_message_uses_its_own_selection_snapshot(self):
-        source = self.proposed_message([self.pitch_action("pitchDelta")])
+        source = self.proposed_message([self.pitch_action("pitchDelta")], pitch_policy="local")
         self.move_target(scale=2)
         first, _ = self.reuse(source)
         document = self.read_saved()
@@ -310,7 +317,8 @@ class ProposalReuseTests(unittest.TestCase):
         self.assert_no_external_execution()
 
     def test_uniform_pitch_delta_does_not_require_matching_melody(self):
-        source = self.proposed_message([{"parameter": "pitchDelta", "delta": 5, "reason": "整体微调五音分。"}])
+        source = self.proposed_message([{"parameter": "pitchDelta", "delta": 5, "reason": "整体微调五音分。"}],
+                                       pitch_policy="local")
         self.move_target()
         self.selection["notes"][0]["pitch"] = 70
         message, _ = self.reuse(source)

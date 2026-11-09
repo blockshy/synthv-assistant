@@ -1,4 +1,7 @@
-"""控制台与 MCP 共用的业务层，集中管理录音、参数编辑和评审任务。"""
+"""桌面、控制台与 MCP 共用的业务层，集中管理参数编辑和模型任务。
+
+音频兼容实现仅供保留历史资料，公开路由及 MCP 已禁止重新发起音频操作。
+"""
 
 from __future__ import annotations
 
@@ -199,12 +202,14 @@ class AssistantService:
         from .assets import restore_asset
         return restore_asset(kind, identifier)
 
-    def send_message(self, identifier, text, include_selection, attachments, model_options=None, render_mode=None, on_progress=None):
+    def send_message(self, identifier, text, include_selection, attachments, model_options=None, render_mode=None,
+                     pitch_policy="preserve", on_progress=None):
         """只生成待预览建议；发送自然语言不能直接写入 SynthV 工程。"""
         # 未提供模式的旧 MCP 调用保留原签名，实际默认值仍由会话持久层决定。
         extra = {"render_mode": render_mode} if render_mode is not None else {}
         return self.conversations().send_message(identifier, text, include_selection, attachments,
-                                                 model_options=model_options, on_progress=on_progress, **extra)
+                                                 model_options=model_options, on_progress=on_progress,
+                                                 pitch_policy=pitch_policy, **extra)
 
     def preview_action(self, identifier):
         return self.conversations().preview_action(identifier)
@@ -224,6 +229,10 @@ class AssistantService:
     def apply_action_batch(self, batch_id):
         """只接受上次只读预览签发的批次编号，不接受客户端重组成功项。"""
         return self.conversations().apply_batch(batch_id)
+
+    def restore_action_batch(self, batch_id):
+        """会话撤销只针对这次应用，不能用历史卡片撤销另一方案的最近修改。"""
+        return self.conversations().restore_batch(batch_id)
 
     def list_uploads(self):
         from .assets import list_uploads
@@ -281,7 +290,7 @@ class AssistantService:
         """
         with self.operation_lock:
             if self.recording:
-                raise ValueError("正在录音，请等待结束后补充声线目录。")
+                raise ValueError("当前有任务正在执行，请等待结束后补充声线目录。")
             if not isinstance(payload, dict) or set(payload) != {"name", "selection"}:
                 raise ValueError("补充声线目录只接受名称和当前选区身份。")
             raw_name, selection = payload["name"], payload["selection"]
@@ -337,7 +346,7 @@ class AssistantService:
             raise ValueError("enabled 必须是布尔值。")
         with self.operation_lock:
             if self.recording:
-                raise ValueError("正在录音，请等待结束后切换编辑模式。")
+                raise ValueError("当前有任务正在执行，请等待结束后切换编辑模式。")
             backup = None
             expected_project = None
             if enabled:
@@ -363,7 +372,7 @@ class AssistantService:
         """
         with self.operation_lock:
             if self.recording:
-                raise ValueError("请等待录音结束后预览参数修改。")
+                raise ValueError("请等待当前任务结束后预览参数修改。")
             if not isinstance(parameter, str):
                 raise ValueError("参数名称必须是字符串。")
             selection = None
@@ -384,7 +393,7 @@ class AssistantService:
         """
         with self.operation_lock:
             if self.recording:
-                raise ValueError("请等待录音结束后预览参数修改。")
+                raise ValueError("请等待当前任务结束后预览参数修改。")
             if not isinstance(batch_id, str) or re.fullmatch(r"[0-9a-f]{32}", batch_id) is None:
                 raise ValueError("组合预览编号无效。")
             if not isinstance(actions, list) or not 1 <= len(actions) <= 5:
@@ -420,11 +429,11 @@ class AssistantService:
 
     @exclusive_operation(lambda service: service.operation_path(), guard_for_service=lambda service: service.bridge_binding_lock)
     def edit(self, action: str, args: dict | None = None) -> dict:
-        if action not in {"apply", "apply_batch", "restore"}:
+        if action not in {"apply", "apply_batch", "restore", "restore_batch"}:
             raise ValueError("未知编辑操作。")
         with self.operation_lock:
             if self.recording:
-                raise ValueError("正在录音，暂不能修改参数。")
+                raise ValueError("当前有任务正在执行，暂不能修改参数。")
             result = self.bridge.call(action, args)
             self._log(action, result)
             return result
@@ -433,7 +442,7 @@ class AssistantService:
         """耗时工作放入有界队列，界面与 MCP 不需要长时间保持一个 HTTP 请求。"""
         with self.operation_lock:
             if any(job["state"] == "running" for job in self.jobs.values()):
-                raise ValueError("当前还有录音或 AI 任务，请等待它完成。")
+                raise ValueError("当前还有任务正在执行，请等待它完成。")
             identifier = uuid.uuid4().hex
             self.jobs[identifier] = {"state": "running", "createdAt": time.time()}
             # 完成任务只保留最近50项，避免长期开启时内存持续增长。

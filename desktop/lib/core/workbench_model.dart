@@ -29,6 +29,8 @@ class WorkbenchModel extends ChangeNotifier {
   String reasoning = 'default';
   String renderMode = 'smooth';
   bool includeSelection = false;
+  // 原生音高替换必须由本次草稿显式授权，不从历史消息或平台偏好继承。
+  String pitchPolicy = 'preserve';
   bool sending = false;
   bool navigationBusy = false;
   bool submissionUnknown = false;
@@ -166,6 +168,7 @@ class WorkbenchModel extends ChangeNotifier {
       if (_disposed || generation != _generation) return;
       conversation = result;
       _draftModelChosen = false;
+      pitchPolicy = 'preserve';
       final saved = _drafts[id];
       draft = saved ?? '';
       pendingMessage = null;
@@ -201,6 +204,7 @@ class WorkbenchModel extends ChangeNotifier {
       if (_disposed || generation != _generation) return;
       conversation = created;
       _draftModelChosen = false;
+      pitchPolicy = 'preserve';
       api.invalidatePreviews();
       draft = '';
       pendingMessage = null;
@@ -226,6 +230,24 @@ class WorkbenchModel extends ChangeNotifier {
     modelId = options['model']?.toString() ?? '';
     reasoning = options['reasoningEffort']?.toString() ?? 'default';
     renderMode = conversation?['renderMode']?.toString() ?? 'smooth';
+  }
+
+  /// 仅改变当前草稿的生成策略；忙碌时不能改变已经提交请求的授权含义。
+  /// 不保存到会话模型偏好，重新打开或新建会话均恢复保留现有演唱。
+  void setPitchPolicy(String value) {
+    if (navigationBusy ||
+        sending ||
+        api.busy ||
+        submissionUnknown ||
+        pendingJobId != null ||
+        pitchPolicy == value) {
+      return;
+    }
+    if (!const {'preserve', 'local', 'redraw'}.contains(value)) {
+      return;
+    }
+    pitchPolicy = value;
+    notifyListeners();
   }
 
   Future<void> reloadConversation() async {
@@ -393,11 +415,13 @@ class WorkbenchModel extends ChangeNotifier {
     };
     final mode = renderMode;
     final selection = includeSelection;
+    final currentPitchPolicy = pitchPolicy;
     _previousIds = messages.map((e) => e['id'].toString()).toSet();
     pendingMessage = {
       'role': 'user',
       'text': text,
       'attachments': clips,
+      'pitchPolicy': currentPitchPolicy,
       'delivery': '正在提交',
     };
     draft = '';
@@ -426,6 +450,7 @@ class WorkbenchModel extends ChangeNotifier {
           {
             'text': text,
             'includeSelection': selection,
+            'pitchPolicy': currentPitchPolicy,
             'attachments': clips
                 .map((e) => {'kind': e['kind'], 'id': e['id']})
                 .toList(),
