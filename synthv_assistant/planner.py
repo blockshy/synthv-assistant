@@ -290,9 +290,15 @@ def plan_tuning(text, selection: dict | None, history: list, audio_paths: list[P
             config = dict(get_model_platform_snapshot(options["platformId"]))
         if options["model"]:
             config["model"] = options["model"]
-        if (not config.get("configured") or config.get("invalid") or config.get("provider") not in {"openai", "gemini", "qwen"}
+        # 平台可以仅保存连接、暂不指定默认型号。会话明确选择的型号在本次快照中
+        # 生效，但不能修改平台默认配置；没有最终型号时在任何音频读取或联网前拒绝。
+        connected = config.get("connectionConfigured", config.get("configured"))
+        if (not connected or config.get("invalid") or config.get("provider") not in {"openai", "gemini", "qwen"}
                 or not config.get("key")):
             raise PlannerError("AI 配置未启用、尚未填写密钥或已经损坏，请先在模型设置中保存有效配置。")
+        if not config.get("model"):
+            raise PlannerError("尚未选择模型，请在会话中选择模型，或在模型服务中设置默认模型。")
+        config["configured"] = True
         try:
             model_capabilities = validate_for_config(config, options)
         except ValueError as exc:

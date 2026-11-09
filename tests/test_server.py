@@ -108,6 +108,23 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(status, 403)
         self.service.edit.assert_not_called()
 
+    def test_connection_check_requires_token_and_preserves_version_conflict_boundary(self):
+        route = "/api/model-platforms/default/test-connection"
+        payload = {"revision": "fixture-revision"}
+        self.service.test_platform_connection.return_value = {"status": "ok", "check": "model_catalog"}
+        self.assertEqual(self.request("POST", route, body=payload)[0], 403)
+        self.service.test_platform_connection.assert_not_called()
+        status, _, response = self.request("POST", route, body=payload, headers={"X-SV-Token": "test-token"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(response)["check"], "model_catalog")
+        self.service.test_platform_connection.assert_called_once_with("default", payload)
+        self.service.test_platform_connection.side_effect = SettingsConflictError("平台配置已变化")
+        self.assertEqual(self.request("POST", route, body=payload, headers={"X-SV-Token": "test-token"})[0], 409)
+        self.service.test_platform_connection.side_effect = OSError("private-config-key")
+        status, _, response = self.request("POST", route, body=payload, headers={"X-SV-Token": "test-token"})
+        self.assertEqual(status, 500)
+        self.assertNotIn(b"private-config-key", response)
+
     def test_shared_ui_module_is_served_without_exposing_other_files(self):
         """共享组件是页面启动依赖；白名单只开放该资源，不能顺带开放相邻开发文件。"""
         status, headers, body = self.request("GET", "/ui.js")

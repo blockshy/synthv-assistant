@@ -138,7 +138,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           PageToolbar(
-            title: '连接管理',
+            title: 'SynthV 连接',
             actions: [
               IconButton(
                 tooltip: '刷新连接诊断',

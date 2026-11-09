@@ -50,6 +50,20 @@ class PlannerTests(unittest.TestCase):
         args.update(overrides)
         return planner.plan_tuning(**args)
 
+    def test_connection_only_platform_needs_model_and_accepts_explicit_conversation_model(self):
+        self.config.update(model="", configured=False, connectionConfigured=True)
+        with patch("synthv_assistant.planner._load_audio") as loader:
+            with self.assertRaisesRegex(planner.PlannerError, "尚未选择模型"):
+                self.call(audio_paths=[self.audio], audio_context=[{}])
+        self.http.assert_not_called()
+        loader.assert_not_called()
+        with patch("synthv_assistant.platforms.get_model_platform_snapshot", return_value=self.config):
+            result = self.call(model_options={"platformId": "default", "model": "selected-test-model"})
+        self.assertEqual(result["model"], "selected-test-model")
+        self.assertEqual(self.http.call_args.args[1]["model"], "selected-test-model")
+        self.assertEqual(self.config["model"], "")
+        self.http.assert_called_once()
+
     def test_text_only_works_with_ordinary_model_without_audio_fields(self):
         with patch("synthv_assistant.planner._load_audio") as loader:
             result = self.call()

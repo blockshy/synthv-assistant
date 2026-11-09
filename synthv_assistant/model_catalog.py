@@ -23,6 +23,7 @@ from .config import DATA
 from .platforms import get_model_platform_snapshot
 from .review import _NoRedirect
 from . import settings
+from .operations import OperationBusyError, OperationLock
 
 
 MAX_PAGES = 5
@@ -35,6 +36,10 @@ CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
 
 class ModelCatalogError(ValueError):
     """固定中文目录错误；不返回供应商响应体、认证头、密钥或完整请求地址。"""
+
+    def __init__(self, message: str, *, code: str = "invalid_response"):
+        super().__init__(message)
+        self.code = code
 
 
 def _cache_path(identifier: str):
@@ -115,7 +120,7 @@ def get_cached_platform_models(identifier: str) -> dict:
     """
     config = get_model_platform_snapshot(identifier)
     path = _cache_path(config["id"])
-    if (not config.get("configured") or config.get("invalid") or not config.get("key")
+    if (not config.get("connectionConfigured", config.get("configured")) or config.get("invalid") or not config.get("key")
             or config.get("provider") not in {"openai", "gemini", "qwen"}):
         return _cache_result(config)
     try:
@@ -226,7 +231,8 @@ def _qwen_catalog_base(base: str) -> str:
     if (parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.username or parsed.password
             or parsed.query or parsed.fragment or parsed.path != "/compatible-mode/v1"
             or not (official or workspace)):
-        raise ModelCatalogError("此 Qwen 地址的模型目录路径尚未适配，请手动填写模型 ID；未尝试其他地址。")
+        raise ModelCatalogError("此 Qwen 地址的模型目录路径尚未适配，请手动填写模型 ID；未尝试其他地址。",
+                                code="catalog_unavailable")
     return urlunsplit((parsed.scheme, parsed.netloc, "/api/v1/models", "", ""))
 
 
@@ -236,11 +242,19 @@ def list_platform_models(identifier: str) -> dict:
     Gemini 只展示支持 generateContent 的条目。目录通常不含完整推理、音频或
     参数能力，因此返回结果不承诺任何输入能力，也不自动修改平台选中的模型。
     """
+    return _list_models_for_snapshot(get_model_platform_snapshot(identifier))
+
+
+def _list_models_for_snapshot(config: dict, *, persist_cache: bool = True) -> dict:
+    """单个目录请求始终使用同一份保存快照；测试连接校验版本后直接复用该快照。
+
+    测试连接延后缓存落盘，在设置锁内核对身份后才保存；旧刷新入口保持原有契约，
+    其缓存读取仍按连接身份校验，不会把旧账户目录交给新账户。
+    """
     try:
-        config = get_model_platform_snapshot(identifier)
-        if (not config.get("configured") or config.get("invalid") or not config.get("key")
+        if (not config.get("connectionConfigured", config.get("configured")) or config.get("invalid") or not config.get("key")
                 or config.get("provider") not in {"openai", "gemini", "qwen"}):
-            raise ModelCatalogError("此平台尚未配置或已停用，请先保存有效 API key 再刷新模型。")
+            raise ModelCatalogError("此平台尚未配置或已停用，请先保存有效 API key 再刷新模型。", code="not_configured")
         provider, key = config["provider"], config["key"]
         headers = {"x-goog-api-key": key} if provider == "gemini" else {"Authorization": "Bearer " + key}
         base = _qwen_catalog_base(config["base"]) if provider == "qwen" else config["base"] + "/models"
@@ -301,11 +315,8 @@ def list_platform_models(identifier: str) -> dict:
             message += " 已达到本地分页或数量限制，列表可能不完整。"
         result = {"platformId": config["id"], "models": models, "source": "api", "provider": provider,
                   "pages": pages, "truncated": truncated, "message": message}
-        cached = _save_cache(config, result)
-        result.update(cachePersisted=cached is not None, stale=False,
-                      cachedAt=datetime.fromtimestamp(cached["savedAt"], timezone.utc).isoformat() if cached else None)
-        if cached is None:
-            result["message"] += " 本次目录已获取，但本地缓存未能保存；仍可使用当前列表。"
+        if persist_cache:
+            _attach_cache_result(result, _save_cache(config, result))
         return result
     except ModelCatalogError:
         raise
@@ -314,10 +325,71 @@ def list_platform_models(identifier: str) -> dict:
                     403: "模型目录访问被拒绝，请检查账户权限。",
                     404: "此平台未提供兼容的模型列表接口，可手动填写模型 ID。",
                     429: "模型目录请求受到限流，本次未自动重试。"}
-        raise ModelCatalogError(messages.get(exc.code, "读取模型目录失败，接口响应或重定向不被支持；本次未自动重试。")) from None
+        codes = {401: "authentication_failed", 403: "permission_denied", 404: "catalog_unavailable", 429: "rate_limited"}
+        raise ModelCatalogError(messages.get(exc.code, "读取模型目录失败，接口响应或重定向不被支持；本次未自动重试。"),
+                                code=codes.get(exc.code, "http_error")) from None
     except (TimeoutError, socket.timeout):
-        raise ModelCatalogError("刷新模型目录超时，本次未自动重试。") from None
+        raise ModelCatalogError("刷新模型目录超时，本次未自动重试。", code="timeout") from None
     except error.URLError:
-        raise ModelCatalogError("无法连接模型目录，请检查网络、代理和此平台 API 地址。") from None
+        raise ModelCatalogError("无法连接模型目录，请检查网络、代理和此平台 API 地址。", code="network_error") from None
     except (ValueError, OSError, TypeError, KeyError, IndexError, AttributeError, RecursionError, OverflowError):
         raise ModelCatalogError("无法安全读取此平台的模型目录，请检查配置或手动填写模型 ID。") from None
+
+
+def _attach_cache_result(result: dict, cached: dict | None) -> None:
+    """新鲜目录和缓存状态分别报告；缓存写入失败不能冒充网络请求失败。"""
+    result.update(cachePersisted=cached is not None, stale=False,
+                  cachedAt=datetime.fromtimestamp(cached["savedAt"], timezone.utc).isoformat() if cached else None)
+    if cached is None:
+        result["message"] += " 本次目录已获取，但本地缓存未能保存；仍可使用当前列表。"
+
+
+def test_platform_connection(identifier: str, payload: dict) -> dict:
+    """显式检测已保存连接，仅请求目录，不发送聊天、提示词、音频或生成请求。
+
+    revision 是用户确认的配置版本。测试开始后即固定地址与凭据；配置改变时
+    仍返回被测版本供界面丢弃迟到结果，并阻止旧结果覆盖新身份的目录缓存。
+    错误只返回固定安全代码，不保留供应商响应体，也不自动使用旧缓存伪报成功。
+    """
+    if (not isinstance(payload, dict) or set(payload) != {"revision"}
+            or not isinstance(payload["revision"], str)):
+        raise settings.SettingsError("连接测试只接受已保存平台的配置版本，请先保存并重新读取。")
+    config = dict(get_model_platform_snapshot(identifier))
+    if payload["revision"] != config["revision"]:
+        raise settings.SettingsConflictError("平台配置已变化，请重新加载后再测试连接。")
+    started = time.monotonic()
+    common = {"platformId": config["id"], "revision": config["revision"], "check": "model_catalog"}
+    try:
+        result = _list_models_for_snapshot(config, persist_cache=False)
+    except ModelCatalogError as exc:
+        return {**common, "status": "error", "code": exc.code, "message": str(exc),
+                "elapsedMs": max(0, round((time.monotonic() - started) * 1000)),
+                "checkedAt": datetime.now(timezone.utc).isoformat(), "modelCount": 0,
+                "selectedModelListed": None}
+
+    # 网络检查耗时不包含本地加密与文件写入，也不是模型推理延迟。
+    elapsed = max(0, round((time.monotonic() - started) * 1000))
+    changed, cached = False, None
+    lock_name = "settings.lock" if identifier == "default" else "model-platforms.lock"
+    try:
+        with OperationLock(DATA / lock_name):
+            latest = get_model_platform_snapshot(identifier)
+            changed = (latest["revision"] != config["revision"]
+                       or _configuration_fingerprint(latest) != _configuration_fingerprint(config))
+            if not changed:
+                cached = _save_cache(config, result)
+    except (OperationBusyError, OSError, ValueError, KeyError, TypeError):
+        # 并发保存或无法读取最新身份时保守保留原缓存，不能覆盖新平台资料。
+        changed = True
+    _attach_cache_result(result, cached)
+    model = config.get("model", "")
+    listed = any(entry["id"] == model for entry in result["models"]) if model else None
+    if not listed and result["truncated"]:
+        listed = None
+    result.update(common, status="ok", code="catalog_accessible", elapsedMs=elapsed,
+                  checkedAt=datetime.now(timezone.utc).isoformat(), modelCount=len(result["models"]),
+                  selectedModelListed=listed, configurationChanged=changed)
+    result["message"] = "模型目录访问成功；此检测不验证模型推理、音频输入或账户额度。 " + result["message"]
+    if changed:
+        result["message"] = "测试期间平台配置已变化，请重新加载后再测试；未覆盖当前目录缓存。"
+    return result

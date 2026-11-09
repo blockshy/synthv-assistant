@@ -289,6 +289,8 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                     return self.settings_response(service.set_default_model_platform, args)
                 elif path == "/api/model-capabilities":
                     return self.workbench_response(service.model_capabilities, args)
+                elif re.fullmatch(r"/api/model-platforms/(?:default|[0-9a-f]{32})/test-connection", path):
+                    return self.settings_response(service.test_platform_connection, path.split("/")[3], args)
                 elif re.fullmatch(r"/api/model-platforms/(?:default|[0-9a-f]{32})/models", path):
                     if args:
                         raise ValueError("获取模型目录不接受额外参数。")

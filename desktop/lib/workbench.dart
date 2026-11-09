@@ -18,6 +18,7 @@ import 'pages/settings_page.dart';
 import 'pages/trash_page.dart';
 import 'widgets/audio_clip.dart';
 import 'widgets/proposal_card.dart';
+import 'widgets/model_picker.dart';
 
 /// 三栏工作台只组织页面与会话；所有宿主写入都沿用后端票据流程。
 class Workbench extends StatefulWidget {
@@ -39,7 +40,9 @@ class Workbench extends StatefulWidget {
 class _WorkbenchState extends State<Workbench> {
   late final WorkbenchModel model;
   final _draft = TextEditingController();
-  final _modelInput = TextEditingController();
+  final _settingsKey = GlobalKey<SettingsPageState>();
+  String? _settingsPlatform;
+  bool _checkingDraft = false;
   final _scroll = ScrollController();
   final _composerFocus = FocusNode();
   final _scaffoldKey = GlobalKey<ScaffoldState>();
@@ -47,7 +50,7 @@ class _WorkbenchState extends State<Workbench> {
   double leftWidth = 230, rightWidth = 302;
   bool leftVisible = true, rightVisible = true;
   String search = '';
-  Timer? _statusTimer, _capabilityTimer, _saveTimer;
+  Timer? _statusTimer, _saveTimer;
   bool _loadingStatus = false;
   int _libraryGeneration = 0;
   int _bridgeGeneration = 0;
@@ -105,12 +108,6 @@ class _WorkbenchState extends State<Workbench> {
         selection: TextSelection.collapsed(offset: model.draft.length),
       );
     }
-    if (_modelInput.text != model.modelId) {
-      _modelInput.value = TextEditingValue(
-        text: model.modelId,
-        selection: TextSelection.collapsed(offset: model.modelId.length),
-      );
-    }
     setState(() {});
     if (follow) _toBottom();
   }
@@ -128,12 +125,45 @@ class _WorkbenchState extends State<Workbench> {
     );
   }
 
-  void _navigate(int target) {
+  /// 所有离开设置的入口共用草稿保护，快速连点也只展示一次确认。
+  Future<bool> _canLeaveSettings() async {
+    if (page != 4) return true;
+    if (_checkingDraft) return false;
+    _checkingDraft = true;
+    try {
+      return await _settingsKey.currentState?.maybeLeave() ?? true;
+    } finally {
+      _checkingDraft = false;
+    }
+  }
+
+  Future<void> _navigate(int target) async {
     if (target == page) return;
+    if (!await _canLeaveSettings() || !mounted) return;
     setState(() {
       page = target;
       if (target == 1) _libraryGeneration++;
     });
+  }
+
+  Future<void> _pickModel() async {
+    final result = await showDialog<ModelSelectionResult>(
+      context: context,
+      builder: (_) => ModelPickerDialog(
+        api: widget.api,
+        platforms: model.platforms,
+        platformId: model.platformId,
+        modelId: model.modelId,
+      ),
+    );
+    if (result == null || !mounted) return;
+    if (result.manage) {
+      _settingsPlatform = result.platformId;
+      await _navigate(4);
+      return;
+    }
+    final reset = await model.chooseModel(result.platformId, result.modelId);
+    if (reset && mounted) _notice('已切换模型，推理强度已恢复为新模型默认。');
   }
 
   void _openConnection() {
@@ -262,13 +292,11 @@ class _WorkbenchState extends State<Workbench> {
   @override
   void dispose() {
     _statusTimer?.cancel();
-    _capabilityTimer?.cancel();
     _saveTimer?.cancel();
     widget.api.removeListener(_changed);
     model.removeListener(_changed);
     model.dispose();
     _draft.dispose();
-    _modelInput.dispose();
     _scroll.dispose();
     _composerFocus.dispose();
     super.dispose();
@@ -445,6 +473,7 @@ class _WorkbenchState extends State<Workbench> {
                       model.pendingJobId != null
                   ? null
                   : () async {
+                      if (!await _canLeaveSettings() || !mounted) return;
                       await model.newConversation();
                       if (mounted) setState(() => page = 0);
                     },
@@ -456,7 +485,7 @@ class _WorkbenchState extends State<Workbench> {
           _nav(0, Icons.chat_bubble_outline_rounded, '当前会话'),
           _nav(1, Icons.audio_file_outlined, '音频素材'),
           _nav(2, Icons.mic_none_rounded, '录音与听评'),
-          _nav(5, Icons.cable_outlined, '连接管理'),
+          _nav(5, Icons.cable_outlined, 'SynthV 连接'),
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 12, 8, 4),
             child: Row(
@@ -557,6 +586,10 @@ class _WorkbenchState extends State<Workbench> {
                                     model.pendingJobId != null
                                 ? null
                                 : () async {
+                                    if (!await _canLeaveSettings() ||
+                                        !mounted) {
+                                      return;
+                                    }
                                     await model.openConversation(
                                       item['id'] as String,
                                     );
@@ -571,7 +604,7 @@ class _WorkbenchState extends State<Workbench> {
           const Divider(height: 1),
           const SizedBox(height: 8),
           _nav(3, Icons.delete_outline_rounded, '回收站'),
-          _nav(4, Icons.settings_outlined, '设置'),
+          _nav(4, Icons.dns_outlined, '模型服务'),
           const SizedBox(height: 8),
         ],
       ),
@@ -669,7 +702,9 @@ class _WorkbenchState extends State<Workbench> {
       onChanged: () => unawaited(model.refreshConversations()),
     ),
     4 => SettingsPage(
+      key: _settingsKey,
       api: widget.api,
+      initialPlatformId: _settingsPlatform,
       onChanged: () async {
         await model.refreshPlatforms();
         await model.loadCatalog();
@@ -1134,6 +1169,44 @@ class _WorkbenchState extends State<Workbench> {
             mainAxisSize: MainAxisSize.min,
             children: [
               _modelControls(disabled),
+              if (model.sendBlockReason case final String reason)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.info_outline, size: 14),
+                      const SizedBox(width: 7),
+                      Expanded(
+                        child: Text(
+                          reason,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: disabled
+                            ? null
+                            : () {
+                                if (model.selectedPlatform?['connectionConfigured'] ==
+                                        true ||
+                                    model.selectedPlatform?['configured'] ==
+                                        true) {
+                                  _pickModel();
+                                } else {
+                                  _settingsPlatform = model.platformId;
+                                  _navigate(4);
+                                }
+                              },
+                        child: Text(
+                          model.selectedPlatform?['connectionConfigured'] ==
+                                      true ||
+                                  model.selectedPlatform?['configured'] == true
+                              ? '选择模型'
+                              : '配置服务',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               const SizedBox(height: 8),
               CallbackShortcuts(
                 bindings: {
@@ -1210,7 +1283,10 @@ class _WorkbenchState extends State<Workbench> {
                   Tooltip(
                     message: 'Ctrl + Enter 发送；Enter 换行',
                     child: FilledButton.icon(
-                      onPressed: disabled || model.draft.trim().isEmpty
+                      onPressed:
+                          disabled ||
+                              model.draft.trim().isEmpty ||
+                              model.sendBlockReason != null
                           ? null
                           : () {
                               unawaited(model.send());
@@ -1234,207 +1310,144 @@ class _WorkbenchState extends State<Workbench> {
     );
   }
 
+  /// 会话工具栏只保留日常决策：模型、推理和绘制方式。
+  /// 平台凭据与目录管理留在模型服务页；模型弹层一次返回完整的平台/型号组合。
   Widget _modelControls(bool disabled) => LayoutBuilder(
     builder: (context, constraints) {
-      final four = constraints.maxWidth >= 660;
-      final width = four
-          ? (constraints.maxWidth - 24) / 4
-          : (constraints.maxWidth - 8) / 2;
-      final currentPlatformExists = model.platforms.any(
-        (e) => e['id'] == model.platformId,
-      );
+      final colors = Theme.of(context).colorScheme;
+      final platformName =
+          model.selectedPlatform?['name']?.toString() ?? '未选择服务';
+      final modelName = model.effectiveModel.isEmpty
+          ? '选择模型'
+          : model.effectiveModel;
       final effort = maps(model.capabilities['reasoning']?['options']);
-      if (!effort.any((e) => e['value'] == model.reasoning)) {
+      if (effort.isEmpty) {
+        effort.add({'value': 'default', 'label': '模型默认'});
+      }
+      if (!effort.any((item) => item['value'] == model.reasoning)) {
         effort.add({
           'value': model.reasoning,
-          'label': '${model.reasoning}（需检查）',
+          'label': '${model.reasoning} · 需调整',
         });
       }
-      Widget field(String label, Widget child) => SizedBox(
-        width: width,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.only(left: 2, bottom: 5),
-              child: Text(
-                label,
-                style: TextStyle(
-                  fontSize: 10,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ),
-            SizedBox(height: 34, child: child),
-          ],
-        ),
-      );
-      Widget dropdown(
-        String value,
-        List<DropdownMenuItem<String>> items,
-        ValueChanged<String?>? onChanged,
-      ) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-        decoration: BoxDecoration(
-          border: Border.all(
-            color: Theme.of(context).colorScheme.outlineVariant,
+      Widget option({
+        required String label,
+        required String value,
+        required List<JsonMap> options,
+        required ValueChanged<String?> onChanged,
+        required String tooltip,
+      }) => Tooltip(
+        message: tooltip,
+        child: Container(
+          height: 34,
+          width: 150,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          decoration: BoxDecoration(
+            border: Border.all(color: colors.outlineVariant),
+            borderRadius: BorderRadius.circular(4),
           ),
-          borderRadius: BorderRadius.circular(4),
-        ),
-        child: DropdownButtonHideUnderline(
-          child: DropdownButton<String>(
-            value: value,
-            items: items,
-            onChanged: onChanged,
-            isExpanded: true,
-            isDense: true,
-            style: Theme.of(context).textTheme.bodySmall,
-            iconSize: 16,
-          ),
-        ),
-      );
-      return Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: [
-          field(
-            '平台',
-            dropdown(
-              model.platformId,
-              [
-                if (!currentPlatformExists)
-                  DropdownMenuItem(
-                    value: model.platformId,
-                    child: const Text('默认平台'),
-                  ),
-                for (final platform in model.platforms)
-                  DropdownMenuItem(
-                    value: platform['id'] as String,
-                    child: Text(
-                      platform['name']?.toString() ?? '平台',
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-              ],
-              disabled
-                  ? null
-                  : (value) => unawaited(model.choosePlatform(value!)),
-            ),
-          ),
-          field(
-            '模型',
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _modelInput,
-                    enabled: !disabled,
-                    style: const TextStyle(fontSize: 12),
-                    decoration: InputDecoration(
-                      hintText: '平台默认',
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 9,
-                        vertical: 8,
-                      ),
-                      suffixIconConstraints: const BoxConstraints(
-                        maxWidth: 28,
-                        minWidth: 28,
-                      ),
-                      suffixIcon: model.models.isEmpty
-                          ? null
-                          : PopupMenuButton<String>(
-                              tooltip: '已缓存的模型',
-                              padding: EdgeInsets.zero,
-                              icon: const Icon(
-                                Icons.expand_more_rounded,
-                                size: 16,
-                              ),
-                              onSelected: disabled
-                                  ? null
-                                  : (value) {
-                                      setState(() {
-                                        model.modelId = value;
-                                        _modelInput.text = value;
-                                      });
-                                      unawaited(model.loadCapabilities());
-                                      unawaited(model.savePreferences());
-                                    },
-                              itemBuilder: (_) => model.models
-                                  .map(
-                                    (e) => PopupMenuItem(
-                                      value: e['id'] as String,
-                                      child: Text(
-                                        e['id'] as String,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  )
-                                  .toList(),
-                            ),
-                    ),
-                    onChanged: (value) {
-                      model.modelId = value;
-                      _capabilityTimer?.cancel();
-                      _capabilityTimer = Timer(
-                        const Duration(milliseconds: 350),
-                        () async {
-                          await model.loadCapabilities();
-                          await model.savePreferences();
-                        },
-                      );
-                    },
-                  ),
-                ),
-                IconButton(
-                  tooltip: '从平台刷新模型目录',
-                  onPressed: disabled
-                      ? null
-                      : () => unawaited(model.loadCatalog(refresh: true)),
-                  icon: const Icon(Icons.refresh_rounded, size: 16),
-                ),
-              ],
-            ),
-          ),
-          field(
-            '推理强度',
-            dropdown(
-              model.reasoning,
-              effort
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: value,
+              isExpanded: true,
+              isDense: true,
+              iconSize: 16,
+              style: Theme.of(context).textTheme.bodySmall,
+              onChanged: disabled || options.length < 2 ? null : onChanged,
+              selectedItemBuilder: (_) => options
                   .map(
-                    (e) => DropdownMenuItem(
-                      value: e['value'] as String,
+                    (item) => Align(
+                      alignment: Alignment.centerLeft,
                       child: Text(
-                        e['label'] as String,
+                        '$label · ${item['label']}',
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   )
                   .toList(),
-              disabled
-                  ? null
-                  : (value) {
-                      setState(() => model.reasoning = value!);
-                      unawaited(model.savePreferences());
-                    },
+              items: options
+                  .map(
+                    (item) => DropdownMenuItem<String>(
+                      value: item['value'] as String,
+                      child: Text(item['label'] as String),
+                    ),
+                  )
+                  .toList(),
             ),
           ),
-          field(
-            '绘制方式',
-            dropdown(
-              model.renderMode,
-              const [
-                DropdownMenuItem(value: 'smooth', child: Text('绘制模式')),
-                DropdownMenuItem(value: 'points', child: Text('控制点模式')),
+        ),
+      );
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            SizedBox(
+              height: 34,
+              width: math.min(310, constraints.maxWidth),
+              child: Tooltip(
+                message: '$modelName\n$platformName · 选择平台与模型',
+                child: OutlinedButton(
+                  key: const ValueKey('conversation-model-picker'),
+                  onPressed: disabled ? null : _pickModel,
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.smart_toy_outlined, size: 16),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(modelName, overflow: TextOverflow.ellipsis),
+                      ),
+                      if (model.effectiveModel.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Flexible(
+                          child: Text(
+                            platformName,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: colors.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      ],
+                      const Icon(Icons.expand_more, size: 16),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            option(
+              label: '推理',
+              value: model.reasoning,
+              options: effort,
+              tooltip:
+                  model.capabilities['reasoning']?['note']?.toString() ??
+                  '由所选模型决定可用推理档位',
+              onChanged: (value) {
+                setState(() => model.reasoning = value!);
+                unawaited(model.savePreferences());
+              },
+            ),
+            option(
+              label: '曲线',
+              value: model.renderMode,
+              options: const [
+                {'value': 'smooth', 'label': '绘制模式'},
+                {'value': 'points', 'label': '控制点模式'},
               ],
-              disabled
-                  ? null
-                  : (value) {
-                      setState(() => model.renderMode = value!);
-                      unawaited(model.savePreferences());
-                    },
+              tooltip: '本次参数方案的曲线表达方式',
+              onChanged: (value) {
+                setState(() => model.renderMode = value!);
+                unawaited(model.savePreferences());
+              },
             ),
-          ),
-        ],
+          ],
+        ),
       );
     },
   );

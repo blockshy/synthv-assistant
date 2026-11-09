@@ -140,6 +140,11 @@ class AssistantService:
         from .model_catalog import get_cached_platform_models
         return get_cached_platform_models(identifier)
 
+    def test_platform_connection(self, identifier, payload):
+        """用户显式检测已保存模型连接；不生成回复、不读取音频、不访问宿主。"""
+        from .model_catalog import test_platform_connection
+        return test_platform_connection(identifier, payload)
+
     def model_capabilities(self, payload):
         """能力查询只读取脱敏平台信息；选择框刷新不产生外部请求。"""
         from .model_options import normalize_model_options, capabilities

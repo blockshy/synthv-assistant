@@ -32,7 +32,8 @@ class ModelCatalogTests(unittest.TestCase):
         self.addCleanup(decrypt.stop)
         self.key = "sk-fictional-model-catalog-key-not-real"
         self.config = {"id": "a" * 32, "provider": "openai", "base": "https://mock.example/v1",
-                       "key": self.key, "configured": True, "invalid": False, "timeoutSeconds": 60}
+                       "key": self.key, "configured": True, "invalid": False, "timeoutSeconds": 60,
+                       "revision": "fixture-revision", "model": "gpt-test"}
         snapshot = patch.object(model_catalog, "get_model_platform_snapshot", return_value=self.config)
         transport = patch.object(model_catalog, "_get_json", return_value={"data": [{"id": "gpt-test"}]})
         self.snapshot, self.http = snapshot.start(), transport.start()
@@ -42,6 +43,82 @@ class ModelCatalogTests(unittest.TestCase):
 
     def call(self):
         return model_catalog.list_platform_models(self.config["id"])
+
+    def connection(self, **changes):
+        """只传公开版本号，测试替身确保没有真实凭据或外网流量。"""
+        return model_catalog.test_platform_connection(self.config["id"], {"revision": self.config["revision"], **changes})
+
+    def test_saved_connection_without_default_model_can_fetch_and_test_catalog(self):
+        self.config.update(model="", configured=False, connectionConfigured=True)
+        result = self.connection()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["check"], "model_catalog")
+        self.assertEqual(result["code"], "catalog_accessible")
+        self.assertEqual(result["modelCount"], 1)
+        self.assertIsNone(result["selectedModelListed"])
+        self.assertFalse(result["configurationChanged"])
+        self.assertIsInstance(result["elapsedMs"], int)
+        self.assertGreaterEqual(result["elapsedMs"], 0)
+        self.assertIn("不验证模型推理", result["message"])
+        self.assertNotIn(self.key, json.dumps(result))
+        self.http.reset_mock()
+        self.assertTrue(model_catalog.get_cached_platform_models(self.config["id"])["cacheHit"])
+        self.http.assert_not_called()
+
+    def test_connection_revision_or_extra_credentials_rejected_before_network(self):
+        for payload in ({}, {"revision": None}, {"revision": "old"},
+                        {"revision": self.config["revision"], "apiKey": "never-send"},
+                        {"revision": self.config["revision"], "baseUrl": "https://unexpected.invalid"}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                model_catalog.test_platform_connection(self.config["id"], payload)
+        self.http.assert_not_called()
+
+    def test_connection_error_preserves_existing_cache_and_has_safe_structured_status(self):
+        self.call()
+        path = model_catalog._cache_path(self.config["id"])
+        previous = path.read_bytes()
+        for failure, code in ((error.HTTPError('https://private.invalid/' + self.key, 401, self.key, {}, None), 'authentication_failed'),
+                              (error.HTTPError('https://private.invalid', 404, self.key, {}, None), 'catalog_unavailable'),
+                              (error.URLError(self.key), 'network_error'), (TimeoutError(self.key), 'timeout')):
+            self.http.reset_mock()
+            self.http.side_effect = failure
+            result = self.connection()
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["code"], code)
+            self.assertNotIn("models", result)
+            self.assertNotIn(self.key, json.dumps(result))
+            self.assertNotIn("private.invalid", json.dumps(result))
+            self.assertEqual(path.read_bytes(), previous)
+            self.http.assert_called_once()
+
+    def test_connection_snapshot_change_does_not_overwrite_new_identity_cache(self):
+        original = dict(self.config)
+        replacement = {**original, "key": "fictional-new-account", "revision": "new-revision"}
+        fresh = {"models": [{"id": "new-account-model", "label": "new-account-model"}], "pages": 1, "truncated": False}
+        model_catalog._save_cache(replacement, fresh)
+        path = model_catalog._cache_path(self.config["id"])
+        previous = path.read_bytes()
+        self.snapshot.side_effect = [original, replacement]
+        result = self.connection()
+        self.assertEqual(result["revision"], original["revision"])
+        self.assertTrue(result["configurationChanged"])
+        self.assertFalse(result["cachePersisted"])
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(self.http.call_args.args[1]["Authorization"], "Bearer " + original["key"])
+
+    def test_connection_model_absence_is_unknown_when_catalog_is_truncated(self):
+        self.http.return_value = {"data": [{"id": "other"}], "has_more": True, "last_id": "same"}
+        result = self.connection()
+        self.assertTrue(result["truncated"])
+        self.assertIsNone(result["selectedModelListed"])
+        self.assertEqual(result["status"], "ok")
+
+    def test_disabled_connection_does_not_fetch_or_claim_cached_success(self):
+        self.config.update(configured=False, connectionConfigured=False)
+        result = self.connection()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["code"], "not_configured")
+        self.http.assert_not_called()
 
     def test_openai_uses_selected_snapshot_and_get_models_without_changing_model(self):
         result = self.call()

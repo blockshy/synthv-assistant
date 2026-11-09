@@ -139,11 +139,13 @@ def _validate_values(provider: object, model: object, base: object, timeout: obj
         return {"provider": "none", "model": "", "base": "", "timeoutSeconds": 60.0, "key": ""}
     if not isinstance(model, str):
         raise SettingsError("模型名称格式无效。")
-    model = model.strip() or DEFAULTS[provider][0]
+    # 连接配置可先于模型选择保存。空模型明确表示“尚未选择”，不能偷偷填入
+    # 某个历史预设型号，否则用户无法先获取目录，也可能请求到错误模型。
+    model = model.strip()
     # 兼容服务常使用 namespace/model 路由；OpenAI 的模型字段位于 JSON 中，
     # 可以接受分段 ID。Gemini 会拼入 URL，保持更严格的单段字符白名单。
     pattern = r"[A-Za-z0-9][A-Za-z0-9_.:-]*(?:/[A-Za-z0-9][A-Za-z0-9_.:-]*)*" if provider in {"openai", "qwen"} else r"[A-Za-z0-9_.-]{1,128}"
-    if len(model) > 200 or not re.fullmatch(pattern, model):
+    if len(model) > 200 or (model and not re.fullmatch(pattern, model)):
         raise SettingsError("模型名称应为有效模型 ID，不包含 URL 或空格；Gemini 请勿填写 models/ 前缀。")
     if isinstance(base, str) and not base.strip():
         base = DEFAULTS[provider][1]
@@ -161,10 +163,13 @@ def _validate_values(provider: object, model: object, base: object, timeout: obj
 
 def _decorate_snapshot(values: dict, source: str, revision: str, *, invalid: bool = False, message: str | None = None) -> dict:
     """建立一次性内部快照，不缓存；调用者不能把该结果直接返回给用户。"""
-    configured = bool(not invalid and values["provider"] != "none" and values["key"])
-    return {**values, "configured": configured, "invalid": invalid, "source": source,
+    connection_configured = bool(not invalid and values["provider"] != "none" and values["key"])
+    configured = bool(connection_configured and values["model"])
+    return {**values, "configured": configured, "connectionConfigured": connection_configured,
+            "invalid": invalid, "source": source,
             "storage": STORAGE, "revision": revision,
             "message": message or ("听评配置已生效；调用听评时才会上传所选音频。" if configured else
+                                   "连接配置已保存，请获取模型目录或填写默认模型后使用。" if connection_configured else
                                    "听评接口未配置或已停用；本地分析可用，尚未调用模型试听。")}
 
 
@@ -178,7 +183,8 @@ def _environment_snapshot() -> dict:
     defaults = DEFAULTS.get(provider, ("", "", ""))
     try:
         timeout = float(os.environ.get("SYNTHV_AUDIO_TIMEOUT_SECONDS", "60"))
-        values = _validate_values(provider, os.environ.get("SYNTHV_AUDIO_MODEL", ""),
+        # 仅环境变量入口保留历史缺省型号；网页/桌面显式保存的空模型不走该兼容分支。
+        values = _validate_values(provider, os.environ.get("SYNTHV_AUDIO_MODEL", "").strip() or defaults[0],
                                   os.environ.get("SYNTHV_AUDIO_BASE_URL", ""), timeout,
                                   os.environ.get(defaults[2], "") if defaults[2] else "")
         return _decorate_snapshot(values, "environment", "environment")
@@ -223,7 +229,8 @@ def _public_settings(snapshot: dict) -> dict:
     """通过字段白名单返回表单值，不包含 key、密文、密钥长度或密钥片段。"""
     return {"provider": snapshot["provider"], "model": snapshot["model"], "baseUrl": snapshot["base"],
             "timeoutSeconds": snapshot["timeoutSeconds"], "keyConfigured": bool(snapshot["key"]),
-            "configured": snapshot["configured"], "source": snapshot["source"], "storage": STORAGE,
+            "configured": snapshot["configured"], "connectionConfigured": snapshot["connectionConfigured"],
+            "source": snapshot["source"], "storage": STORAGE,
             "revision": snapshot["revision"], "message": snapshot["message"]}
 
 

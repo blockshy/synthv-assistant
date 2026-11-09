@@ -101,7 +101,7 @@ def _read_registry() -> dict:
             # 命名平台被停用时，保存操作会同时回退到 default，因此悬空或停用目标表示
             # 文件不满足持久化约束。不能悄悄改选另一平台，避免请求发往意外供应商。
             selected = next((item for item in checked if item["id"] == default_id), None)
-            if selected is None or selected["provider"] == "none" or not selected["key"]:
+            if selected is None or selected["provider"] == "none" or not selected["key"] or not selected["model"]:
                 raise ValueError
         return {"revision": envelope["revision"], "items": checked, "defaultPlatformId": default_id}
     except (ValueError, TypeError, KeyError, UnicodeError, OSError, RecursionError, OverflowError):

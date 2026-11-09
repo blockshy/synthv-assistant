@@ -3,12 +3,89 @@ import 'dart:ui' show PointerDeviceKind;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:synthv_desktop/core/api.dart';
 import 'package:synthv_desktop/theme.dart';
 import 'package:synthv_desktop/workbench.dart';
 
 import 'workbench_model_test.dart' show ModelApi;
 
+/// 给完整工作台提供可编辑的合成平台；不读取真实保存配置或发送供应商请求。
+class _NavigationApi extends ModelApi {
+  @override
+  Future<dynamic> getJson(String path) async {
+    if (path == '/api/model-platforms') {
+      calls.add('GET $path');
+      return {
+        'revision': 'registry-fixture',
+        'defaultPlatformId': 'default',
+        'items': <JsonMap>[
+          {
+            'id': 'default',
+            'name': '默认配置',
+            'provider': 'openai',
+            'model': 'fixture-model',
+            'baseUrl': 'https://example.invalid/v1',
+            'timeoutSeconds': 60,
+            'configured': true,
+            'connectionConfigured': true,
+            'keyConfigured': true,
+            'revision': 'platform-fixture',
+          },
+        ],
+      };
+    }
+    return super.getJson(path);
+  }
+}
+
 void main() {
+  testWidgets('设置草稿保护覆盖页面导航，取消保留编辑，放弃后才离开', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    await tester.binding.setSurfaceSize(const Size(1440, 900));
+    final api = _NavigationApi();
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: WorkbenchTheme.build(Brightness.dark),
+        home: Workbench(
+          api: api,
+          mode: ThemeMode.system,
+          onThemeChanged: (_) {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('模型服务').first);
+    await tester.pumpAndSettle();
+    final base = find.descendant(
+      of: find.byKey(const ValueKey('field:API Base URL')),
+      matching: find.byType(TextField),
+    );
+    await tester.ensureVisible(base);
+    await tester.enterText(base, 'https://changed.invalid/v1');
+    await tester.tap(find.text('音频素材').first);
+    await tester.pumpAndSettle();
+    expect(find.text('保存平台修改？'), findsOneWidget);
+    await tester.tap(find.text('继续编辑'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(base).controller!.text,
+      'https://changed.invalid/v1',
+    );
+    await tester.tap(find.text('音频素材').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('放弃修改'));
+    await tester.pumpAndSettle();
+    expect(base, findsNothing);
+    expect(
+      api.calls.where((call) => call == 'POST /api/model-platforms'),
+      isEmpty,
+    );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    api.dispose();
+    await tester.binding.setSurfaceSize(null);
+  });
+
   testWidgets('鼠标单次位移可拖动左右分隔条并保存宽度', (tester) async {
     SharedPreferences.setMockInitialValues({});
     await tester.binding.setSurfaceSize(const Size(1536, 816));

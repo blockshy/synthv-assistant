@@ -52,6 +52,29 @@ class PlatformTests(unittest.TestCase):
     def create(self, **changes):
         return platforms.save_model_platform(self.payload(**changes))
 
+    def test_connection_can_be_saved_before_model_without_becoming_new_chat_default(self):
+        """先保存连接再获取目录，不用虚构默认模型跨过表单或后端校验。"""
+        created = self.create(model="")
+        self.assertEqual(created["model"], "")
+        self.assertTrue(created["connectionConfigured"])
+        self.assertFalse(created["configured"])
+        readback = platforms.get_model_platform(created["id"])
+        self.assertEqual(readback, created)
+        with self.assertRaisesRegex(platforms.PlatformError, "模型"):
+            platforms.set_default_model_platform({"id": created["id"], "revision": created["revision"]})
+        selected = platforms.save_model_platform(self.payload(id=created["id"], model="chosen-model", apiKey=""))
+        self.assertTrue(selected["configured"])
+        registry = platforms.set_default_model_platform({"id": selected["id"], "revision": selected["revision"]})
+        self.assertEqual(registry["defaultPlatformId"], selected["id"])
+
+    def test_clearing_selected_default_model_reverts_default_but_keeps_connection(self):
+        chosen = self.create()
+        platforms.set_default_model_platform({"id": chosen["id"], "revision": chosen["revision"]})
+        cleared = platforms.save_model_platform(self.payload(id=chosen["id"], model="", apiKey=""))
+        self.assertTrue(cleared["connectionConfigured"])
+        self.assertFalse(cleared["configured"])
+        self.assertEqual(platforms.list_model_platforms()["defaultPlatformId"], "default")
+
     def test_empty_list_contains_unchanged_default_and_does_not_create_registry(self):
         result = platforms.list_model_platforms()
         self.assertEqual(result["defaultPlatformId"], "default")

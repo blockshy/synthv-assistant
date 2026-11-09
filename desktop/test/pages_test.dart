@@ -216,17 +216,23 @@ void main() {
     await _show(tester, SettingsPage(api: api, onChanged: () {}));
     expect(api.posts, isEmpty);
     expect(api.reads, contains('/api/model-platforms/default/models'));
+    await tester.tap(find.byKey(const ValueKey('settings-tab:1')));
+    await tester.pumpAndSettle();
     await tester.ensureVisible(_field('默认模型 ID'));
     await tester.enterText(_field('默认模型 ID'), 'edited-test-model');
+    await tester.tap(find.byKey(const ValueKey('settings-tab:0')));
+    await tester.pumpAndSettle();
     await tester.ensureVisible(_field('API 密钥'));
     await tester.enterText(_field('API 密钥'), 'synthetic-key-never-sent');
-    await tester.tap(find.text('保存并生效'));
+    await tester.tap(find.byKey(const ValueKey('save-platform')));
     await tester.pumpAndSettle();
     expect(api.posts.single.body['model'], 'edited-test-model');
     expect(
       tester.widget<TextField>(_field('API 密钥')).controller!.text,
       isEmpty,
     );
+    await tester.tap(find.byKey(const ValueKey('settings-tab:1')));
+    await tester.pumpAndSettle();
     expect(
       tester.widget<TextField>(_field('默认模型 ID')).controller!.text,
       'edited-test-model',
@@ -235,23 +241,18 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('取消切换平台时选择器恢复原平台，草稿与保存目标保持一致', (tester) async {
+  testWidgets('取消新增平台时保留原平台的模型草稿', (tester) async {
     final api = _PageApi();
     addTearDown(api.dispose);
     await _show(tester, SettingsPage(api: api, onChanged: () {}), height: 700);
+    await tester.tap(find.byKey(const ValueKey('settings-tab:1')));
+    await tester.pumpAndSettle();
     await tester.ensureVisible(_field('默认模型 ID'));
     await tester.enterText(_field('默认模型 ID'), 'unsaved-model');
-    final selector = find.byKey(const ValueKey('platform:default:0'));
-    await tester.ensureVisible(selector);
-    await tester.tap(selector);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('新增平台').last);
+    await tester.tap(find.byTooltip('新增模型平台').first);
     await tester.pumpAndSettle();
     await tester.tap(find.text('继续编辑'));
     await tester.pumpAndSettle();
-    final restored = find.byKey(const ValueKey('platform:default:1'));
-    expect(restored, findsOneWidget);
-    expect(tester.state<FormFieldState<String>>(restored).value, 'default');
     expect(
       tester.widget<TextField>(_field('默认模型 ID')).controller!.text,
       'unsaved-model',

@@ -115,6 +115,17 @@ class SettingsValidationTests(SettingsBase):
 class SettingsDpapiTests(SettingsBase):
     """调用系统 DPAPI 验证落盘与恢复，所有凭据都是专门构造的测试字符串。"""
 
+    def test_legacy_default_connection_preserves_empty_model_without_environment_fallback(self):
+        """兼容固定平台同样支持先保存连接；读回空型号不能再次暗填历史预设。"""
+        os.environ.update(SYNTHV_AUDIO_PROVIDER="openai", SYNTHV_AUDIO_MODEL="environment-model",
+                          OPENAI_API_KEY="fictional-environment-key")
+        public = settings.update_audio_settings(self.payload(model=""))
+        self.assertEqual(public["model"], "")
+        self.assertTrue(public["connectionConfigured"])
+        self.assertFalse(public["configured"])
+        self.assertEqual(settings.get_audio_settings(), public)
+        self.assertEqual(settings.get_audio_configuration_snapshot()["key"], "fake-settings-key-for-tests")
+
     def test_full_configuration_is_encrypted_and_public_results_are_redacted(self):
         public = settings.update_audio_settings(self.payload(baseUrl="https://private-test.example/v1"))
         stored = self.path.read_bytes()

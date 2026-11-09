@@ -65,7 +65,8 @@ class QwenTests(unittest.TestCase):
         self.assertFalse((self.root / "audio-settings.json").exists())
 
     def test_qwen_platform_persists_as_default_without_plaintext_key_or_cross_provider_reuse(self):
-        payload = {"name": "Qwen 示例", "provider": "qwen", "model": "", "baseUrl": "",
+        # 设置默认平台需要用户明确选中型号；空型号仅用于先保存连接、获取目录。
+        payload = {"name": "Qwen 示例", "provider": "qwen", "model": "qwen3.8-flash", "baseUrl": "",
                    "timeoutSeconds": 60, "revision": "empty", "apiKey": self.key}
         created = platforms.save_model_platform(payload)
         self.assertEqual(created["model"], "qwen3.8-flash")

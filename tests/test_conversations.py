@@ -78,6 +78,15 @@ class ConversationTests(unittest.TestCase):
     def read_saved(self):
         return json.loads((self.directory / "conversations" / (self.identifier + ".json")).read_text(encoding="utf-8"))
 
+    def test_connection_only_platform_can_be_saved_as_draft_without_unknown_reasoning(self):
+        config = {"provider": "gemini", "model": "", "connectionConfigured": True, "configured": False}
+        with patch("synthv_assistant.platforms.get_model_platform", return_value=config):
+            result = self.manager.update_model_options(self.identifier, {"platformId": "default", "model": ""})
+            self.assertEqual(result["modelOptions"]["model"], "")
+            with self.assertRaisesRegex(ConversationError, "先选择模型"):
+                self.manager.update_model_options(self.identifier, {"platformId": "default", "model": "", "reasoningEffort": "high"})
+        self.planner.assert_not_called()
+
     def test_drawing_preference_persists_without_rewriting_existing_proposals(self):
         """新请求绑定模式快照；历史动作不会因用户切换偏好而变成另一种表示。"""
         action = self.proposed()

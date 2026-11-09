@@ -367,7 +367,12 @@ class ConversationManager:
         options = normalize_model_options(payload)
         config = dict(get_model_platform(options["platformId"]))
         config["model"] = options["model"] or config["model"]
-        validate_for_config(config, options)
+        # 允许先保存仅含平台的会话草稿；真正发送仍由 planner 检查最终模型。
+        # 未选择型号时不能预先启用未知推理档位，避免把空值当作某个具体模型。
+        if config["model"]:
+            validate_for_config(config, options)
+        elif options["reasoningEffort"] != "default":
+            raise ConversationError("请先选择模型，再设置推理强度。")
         with self._lock(_identifier(identifier)), self._lock():
             document = self._read(identifier)
             document["modelOptions"] = options

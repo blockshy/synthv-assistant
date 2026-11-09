@@ -44,8 +44,51 @@ class WorkbenchModel extends ChangeNotifier {
   Future<void> _preferenceQueue = Future<void>.value();
   String? _submittedConversationId;
   bool _disposed = false;
+  bool _draftModelChosen = false;
   String get conversationId => conversation?['id']?.toString() ?? '';
   List<JsonMap> get messages => maps(conversation?['messages']);
+
+  /// 展示实际会使用的平台和模型；“平台默认”只是选择方式，不能代替模型名称。
+  JsonMap? get selectedPlatform =>
+      platforms.where((item) => item['id'] == platformId).firstOrNull;
+  String get effectiveModel => modelId.trim().isNotEmpty
+      ? modelId.trim()
+      : selectedPlatform?['model']?.toString() ?? '';
+
+  /// 能力快照同时属于模型选择与连接配置。公开版本号覆盖密钥替换等不可见变化，
+  /// 不读取或保存密钥本身；列表名称等展示内容不参与身份判断。
+  List<Object?> get _capabilityIdentity {
+    final platform = selectedPlatform;
+    return [
+      platformId,
+      modelId,
+      effectiveModel,
+      platform?['provider'],
+      platform?['baseUrl'],
+      platform?['keyConfigured'],
+      platform?['connectionConfigured'],
+      platform?['configured'],
+      platform?['revision'],
+    ];
+  }
+
+  /// 配置缺失提前在输入区给出可操作的入口；后端仍是最终的请求校验边界。
+  /// 空清单可能是初始化尚未完成，由 navigationBusy/原读取错误负责提示。
+  String? get sendBlockReason {
+    if (platforms.isEmpty) return null;
+    final platform = selectedPlatform;
+    if (platform == null) return '所选模型服务不存在，请重新选择。';
+    if (platform['provider'] == 'none') return '请先配置一个模型服务。';
+    if (platform['connectionConfigured'] != true &&
+        platform['configured'] != true) {
+      return '请先完成所选服务的连接配置。';
+    }
+    if (effectiveModel.isEmpty) return '请选择本次会话使用的模型。';
+    if (attachments.isNotEmpty && capabilities['audioInput'] == 'unsupported') {
+      return '当前模型不支持音频，请更换模型或移除附件。';
+    }
+    return null;
+  }
 
   Future<void> initialize() async {
     navigationBusy = true;
@@ -74,9 +117,17 @@ class WorkbenchModel extends ChangeNotifier {
 
   Future<void> refreshPlatforms() async {
     final response = await api.getJson('/api/model-platforms');
+    if (_disposed) return;
+    final previousIdentity = _capabilityIdentity;
     platforms = maps(response['items']);
-    if (conversation == null) {
+    if (conversation == null && !_draftModelChosen) {
       platformId = response['defaultPlatformId']?.toString() ?? 'default';
+    }
+    if (!listEquals(previousIdentity, _capabilityIdentity)) {
+      // 平台默认模型或连接身份变化后，旧音频/推理说明立即失效。
+      // 同时作废在途读取，防止它稍后又把已清空的旧能力写回来。
+      ++_capabilityGeneration;
+      capabilities = {};
     }
     notifyListeners();
   }
@@ -119,6 +170,7 @@ class WorkbenchModel extends ChangeNotifier {
       );
       if (_disposed || generation != _generation) return;
       conversation = result;
+      _draftModelChosen = false;
       final saved = _drafts[id];
       draft = saved?.$1 ?? '';
       attachments = List<JsonMap>.from(saved?.$2 ?? []);
@@ -154,6 +206,7 @@ class WorkbenchModel extends ChangeNotifier {
       );
       if (_disposed || generation != _generation) return;
       conversation = created;
+      _draftModelChosen = false;
       api.invalidatePreviews();
       draft = '';
       attachments = [];
@@ -218,29 +271,72 @@ class WorkbenchModel extends ChangeNotifier {
 
   Future<void> loadCapabilities() async {
     final generation = ++_capabilityGeneration;
+    final selectedPlatformId = platformId;
+    final selectedModelId = modelId;
+    final identity = _capabilityIdentity;
+    // 新读取尚未完成或失败时保持未知状态，不能用上一模型的 unsupported 禁发。
+    capabilities = {};
+    notifyListeners();
+    bool isCurrent() =>
+        !_disposed &&
+        generation == _capabilityGeneration &&
+        selectedPlatformId == platformId &&
+        selectedModelId == modelId &&
+        listEquals(identity, _capabilityIdentity);
     try {
       final result = await api.postJson('/api/model-capabilities', {
-        'platformId': platformId,
-        'model': modelId,
+        'platformId': selectedPlatformId,
+        'model': selectedModelId,
       });
-      if (generation != _capabilityGeneration) return;
+      if (!isCurrent()) return;
       capabilities = Map<String, dynamic>.from(result as Map);
-      // 保留不兼容的旧选项，并在发送前交由后端拒绝；不悄悄降低用户推理强度。
+      // 单纯刷新能力不更改已存选项；只有用户主动切换模型时才按新能力调整，
+      // 并由 chooseModel 返回复位结果供界面提示。
       notifyListeners();
     } catch (e) {
-      if (generation != _capabilityGeneration) return;
+      if (!isCurrent()) return;
       error = e.toString();
       notifyListeners();
     }
   }
 
   Future<void> choosePlatform(String value) async {
-    if (navigationBusy || sending || api.busy) return;
-    platformId = value;
-    modelId = '';
+    await chooseModel(value, '');
+  }
+
+  /// 一次选择原子更新平台与模型，避免先换平台后误发到其默认模型。
+  /// 新模型不支持旧推理档位时才复位，并将结果交给界面明确告知用户。
+  Future<bool> chooseModel(String platform, String selectedModel) async {
+    if (navigationBusy ||
+        sending ||
+        api.busy ||
+        submissionUnknown ||
+        pendingJobId != null) {
+      return false;
+    }
+    navigationBusy = true;
+    platformId = platform;
+    modelId = selectedModel.trim();
+    _draftModelChosen = true;
     models = [];
+    capabilities = {};
+    error = '';
     notifyListeners();
-    await Future.wait([savePreferences(), loadCatalog(), loadCapabilities()]);
+    var resetEffort = false;
+    try {
+      await Future.wait([loadCatalog(), loadCapabilities()]);
+      final available = maps(capabilities['reasoning']?['options']);
+      if (available.isNotEmpty &&
+          !available.any((option) => option['value'] == reasoning)) {
+        reasoning = 'default';
+        resetEffort = true;
+      }
+    } finally {
+      navigationBusy = false;
+      notifyListeners();
+    }
+    await savePreferences();
+    return resetEffort;
   }
 
   /// 显式修改会话选项后保存；不在初始化读取或目录缓存命中时写回配置。
@@ -294,6 +390,11 @@ class WorkbenchModel extends ChangeNotifier {
         pendingJobId != null ||
         api.busy ||
         draft.trim().isEmpty) {
+      return;
+    }
+    if (sendBlockReason case final String reason) {
+      error = reason;
+      notifyListeners();
       return;
     }
     final text = draft.trim();

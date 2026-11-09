@@ -8,6 +8,18 @@ const conversationId = '11111111111111111111111111111111';
 const taskId = '22222222222222222222222222222222';
 const otherConversationId = '33333333333333333333333333333333';
 
+/// 公开配置夹具只含连接状态和版本，不包含真实地址、账户或密钥。
+const _capabilityPlatform = <String, dynamic>{
+  'id': 'default',
+  'provider': 'openai',
+  'baseUrl': 'https://models.example.invalid/v1',
+  'keyConfigured': true,
+  'connectionConfigured': true,
+  'configured': true,
+  'model': 'text-model',
+  'revision': 'connection-v1',
+};
+
 /// 测试只模拟本机 API；不载入真实配置、不请求云端、不连接 SynthV。
 class ModelApi extends WorkbenchApi {
   ModelApi() : super(port: 1, token: 'fixture-token');
@@ -43,7 +55,15 @@ class ModelApi extends WorkbenchApi {
     if (path == '/api/model-platforms') {
       return {
         'items': [
-          {'id': 'default', 'name': '默认平台'},
+          {
+            'id': 'default',
+            'name': '默认平台',
+            'provider': 'openai',
+            'model': 'fixture-model',
+            'configured': true,
+            'connectionConfigured': true,
+            'keyConfigured': true,
+          },
         ],
         'defaultPlatformId': 'default',
       };
@@ -89,6 +109,7 @@ class ModelApi extends WorkbenchApi {
 /// 可控的迟到读回和偏好保存，用于重现实际网络等待顺序。
 class RacingApi extends ModelApi {
   final Map<String, Completer<dynamic>> delayedReads = {};
+  final Map<(String, String), Completer<dynamic>> delayedCapabilities = {};
   final List<(String, JsonMap)> writes = [];
   Completer<void>? blockFirstPreference;
   @override
@@ -100,6 +121,14 @@ class RacingApi extends ModelApi {
   @override
   Future<dynamic> postJson(String path, [JsonMap body = const {}]) async {
     writes.add((path, Map<String, dynamic>.from(body)));
+    if (path == '/api/model-capabilities') {
+      final delayed =
+          delayedCapabilities[(
+            body['platformId'].toString(),
+            body['model'].toString(),
+          )];
+      if (delayed != null) return delayed.future;
+    }
     if (path.endsWith('/model-options') && blockFirstPreference != null) {
       final pending = blockFirstPreference!;
       blockFirstPreference = null;
@@ -110,6 +139,212 @@ class RacingApi extends ModelApi {
 }
 
 void main() {
+  test('一次模型选择同时保存平台与型号，不支持的推理档位明确返回复位结果', () async {
+    final api = RacingApi();
+    final model = WorkbenchModel(api)..conversation = api.document;
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    model.reasoning = 'high';
+    final reset = await model.chooseModel(
+      otherConversationId,
+      ' chosen-model ',
+    );
+    expect(reset, isTrue);
+    expect(model.platformId, otherConversationId);
+    expect(model.modelId, 'chosen-model');
+    final saved = api.writes
+        .where((call) => call.$1.endsWith('/model-options'))
+        .single;
+    expect(saved.$2, {
+      'platformId': otherConversationId,
+      'model': 'chosen-model',
+      'reasoningEffort': 'default',
+    });
+    expect(
+      api.calls.where(
+        (call) => call.startsWith('POST') && call.endsWith('/models'),
+      ),
+      isEmpty,
+    );
+  });
+
+  test('刷新平台配置不覆盖尚未建立会话的显式模型选择', () async {
+    final api = ModelApi();
+    final model = WorkbenchModel(api);
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    await model.initialize();
+    await model.chooseModel(otherConversationId, 'manual-model');
+    await model.refreshPlatforms();
+    expect(model.platformId, otherConversationId);
+    expect(model.modelId, 'manual-model');
+    expect(model.effectiveModel, 'manual-model');
+  });
+
+  test('仅保存连接但未选择模型时发送前引导选择，显式型号可用于会话', () async {
+    final api = ModelApi();
+    final model = WorkbenchModel(api)..draft = '合成请求';
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    model.platforms = [
+      {
+        'id': 'default',
+        'provider': 'openai',
+        'model': '',
+        'connectionConfigured': true,
+        'configured': false,
+      },
+    ];
+    await model.send();
+    expect(model.error, contains('选择'));
+    expect(model.draft, '合成请求');
+    expect(api.calls, isEmpty);
+    await model.chooseModel('default', 'manual-model');
+    expect(model.sendBlockReason, isNull);
+    expect(model.effectiveModel, 'manual-model');
+  });
+
+  test('切换会话后能力读取失败，不沿用旧模型的音频禁用状态', () async {
+    final api = RacingApi();
+    final model = WorkbenchModel(api)
+      ..conversation = api.document
+      ..platforms = [_capabilityPlatform]
+      ..modelId = 'text-model'
+      ..capabilities = {
+        'provider': 'openai',
+        'model': 'text-model',
+        'audioInput': 'unsupported',
+      };
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    api.delayedReads['/api/conversations/$otherConversationId'] =
+        Completer<dynamic>()..complete({
+          ...api.document,
+          'id': otherConversationId,
+          'modelOptions': {
+            'platformId': 'default',
+            'model': 'gpt-audio',
+            'reasoningEffort': 'default',
+          },
+        });
+    final failed = Completer<dynamic>();
+    api.delayedCapabilities[('default', 'gpt-audio')] = failed;
+
+    final opened = model.openConversation(otherConversationId);
+    await Future<void>.delayed(Duration.zero);
+    expect(model.capabilities, isEmpty);
+    failed.completeError(const ApiException('合成能力读取失败'));
+    await opened;
+    model.attachments = [
+      {'kind': 'recording', 'id': 'fixture-audio'},
+    ];
+    expect(model.modelId, 'gpt-audio');
+    expect(model.capabilities, isEmpty);
+    expect(model.error, '合成能力读取失败');
+    expect(model.sendBlockReason, isNull);
+  });
+
+  for (final changedField in ['platform', 'model']) {
+    test('能力请求返回前$changedField选择改变，迟到内容不能覆盖当前状态', () async {
+      final api = RacingApi();
+      final model = WorkbenchModel(api)
+        ..platforms = [
+          _capabilityPlatform,
+          {..._capabilityPlatform, 'id': otherConversationId},
+        ]
+        ..modelId = 'text-model';
+      addTearDown(model.dispose);
+      addTearDown(api.dispose);
+      final stale = Completer<dynamic>();
+      api.delayedCapabilities[('default', 'text-model')] = stale;
+      final loaded = model.loadCapabilities();
+
+      // 不开启第二次读取，直接验证请求捕获的选择身份，而非仅依赖递增代次。
+      if (changedField == 'platform') {
+        model.platformId = otherConversationId;
+      } else {
+        model.modelId = 'gpt-audio';
+      }
+      stale.complete({
+        'provider': 'openai',
+        'model': 'text-model',
+        'audioInput': 'unsupported',
+      });
+      await loaded;
+      expect(model.capabilities, isEmpty);
+      expect(model.error, isEmpty);
+      expect(api.writes.single.$2, {
+        'platformId': 'default',
+        'model': 'text-model',
+      });
+    });
+  }
+
+  test('平台默认模型变化立即清空旧能力，普通列表刷新保留一致快照', () async {
+    final api = RacingApi();
+    final model = WorkbenchModel(api)
+      ..conversation = api.document
+      ..platforms = [_capabilityPlatform]
+      ..capabilities = {
+        'provider': 'openai',
+        'model': 'text-model',
+        'audioInput': 'unsupported',
+      };
+    addTearDown(model.dispose);
+    addTearDown(api.dispose);
+    api.delayedReads['/api/model-platforms'] = Completer<dynamic>()
+      ..complete({
+        'items': [_capabilityPlatform],
+        'defaultPlatformId': 'default',
+      });
+    await model.refreshPlatforms();
+    expect(model.capabilities['audioInput'], 'unsupported');
+
+    api.delayedReads['/api/model-platforms'] = Completer<dynamic>()
+      ..complete({
+        'items': [
+          {..._capabilityPlatform, 'model': 'gpt-audio'},
+        ],
+        'defaultPlatformId': 'default',
+      });
+    await model.refreshPlatforms();
+    expect(model.effectiveModel, 'gpt-audio');
+    expect(model.capabilities, isEmpty);
+  });
+
+  for (final change in [
+    ('baseUrl', 'https://other.example.invalid/v1'),
+    ('revision', 'connection-v2'),
+  ]) {
+    test('连接${change.$1}变化后旧能力请求失效，不恢复过期音频标记', () async {
+      final api = RacingApi();
+      final model = WorkbenchModel(api)
+        ..conversation = api.document
+        ..platforms = [_capabilityPlatform];
+      addTearDown(model.dispose);
+      addTearDown(api.dispose);
+      final stale = Completer<dynamic>();
+      api.delayedCapabilities[('default', '')] = stale;
+      final loaded = model.loadCapabilities();
+      api.delayedReads['/api/model-platforms'] = Completer<dynamic>()
+        ..complete({
+          'items': [
+            {..._capabilityPlatform, change.$1: change.$2},
+          ],
+          'defaultPlatformId': 'default',
+        });
+      await model.refreshPlatforms();
+      stale.complete({
+        'provider': 'openai',
+        'model': 'text-model',
+        'audioInput': 'unsupported',
+      });
+      await loaded;
+      expect(model.capabilities, isEmpty);
+      expect(model.error, isEmpty);
+    });
+  }
+
   test('状态读取失败立即撤掉在线与可写快照，通知界面并允许后续恢复', () async {
     final api = RacingApi();
     final model = WorkbenchModel(api);
