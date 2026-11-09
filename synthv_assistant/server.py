@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import mimetypes
 import re
 import secrets
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit
 
 from .config import ROOT
 from .service import AssistantService
@@ -259,19 +259,25 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                 return
             try:
                 path = urlsplit(self.path).path
+                # 0.4 起撤下音频入口。先认证、再在解析文件、存盘和创建任务前拒绝，
+                # 旧客户端也不能继续录音或把本地历史资料发送给云端模型。
+                # 配置兼容路由仍由平台设置使用，历史资料的受控读取保持可用。
+                if path in {"/api/uploads", "/api/record", "/api/compare", "/api/review"}:
+                    # 对有界的旧请求消费并丢弃正文，避免 Windows 在关闭仍有未读
+                    # 数据的连接时发送 RST，导致客户端看不到明确的 410 退役说明。
+                    retired_length = int(self.headers.get("Content-Length", "0"))
+                    if not self.headers.get("Transfer-Encoding") and 0 <= retired_length <= 12_000_000:
+                        remaining = retired_length
+                        if hasattr(self, "connection"):
+                            self.connection.settimeout(5)
+                        while remaining:
+                            chunk = self.rfile.read(min(65536, remaining))
+                            if not chunk:
+                                break
+                            remaining -= len(chunk)
+                    self.close_connection = True
+                    return self.response_json({"error": "音频功能已移除；已有历史资料保留在本机。"}, 410)
                 length = int(self.headers.get("Content-Length", "0"))
-                if path == "/api/uploads":
-                    # 原始音频不做 Base64 封装；认证和大小检查必须发生在读文件之前。
-                    from .assets import MAX_UPLOAD_BYTES
-                    if self.headers.get("Transfer-Encoding") or not 44 < length <= MAX_UPLOAD_BYTES:
-                        raise ValueError("上传文件大小无效，单个文件不得超过 12 MB。")
-                    if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/octet-stream":
-                        raise ValueError("请通过工作台上传 WAV 或 MP3 文件。")
-                    filename = unquote(self.headers.get("X-File-Name", ""), errors="strict")
-                    raw = self.rfile.read(length)
-                    if len(raw) != length:
-                        raise ValueError("音频上传不完整，请重新上传。")
-                    return self.workbench_response(service.save_upload, filename, raw)
                 if not 0 < length <= 65536:
                     raise ValueError("请求大小无效。")
                 args = json.loads(self.rfile.read(length), object_pairs_hook=_unique_json_object)
@@ -334,7 +340,9 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                         raise ValueError("恢复资料不接受额外字段。")
                     return self.workbench_response(service.restore_resource, path.split("/")[3], path.split("/")[4])
                 elif re.fullmatch(r"/api/conversations/[0-9a-f]{32}/messages", path):
-                    # 排队只返回任务编号；纯文字和音频请求都通过同一有界任务入口。
+                    # 音频退役后只排队文字和选区请求，不读取或上传历史附件。
+                    if args.get("attachments", []) != []:
+                        raise ValueError("音频附件已停止接收，请仅发送文字和选区；历史资料不受影响。")
                     identifier = path.split("/")[3]
                     optional = [args["modelOptions"]] if "modelOptions" in args else []
                     if "renderMode" in args:
@@ -376,12 +384,6 @@ def make_server(port: int = 8765, service: AssistantService | None = None, *, de
                     result = service.edit("apply", {"previewId": args.get("previewId")})
                 elif path == "/api/restore":
                     result = service.edit("restore")
-                elif path == "/api/record":
-                    result = {"jobId": service.submit(service.record, args.get("startSeconds"), args.get("durationSeconds"), args.get("label", "片段"))}
-                elif path == "/api/compare":
-                    result = service.compare(args.get("beforeId"), args.get("afterId"))
-                elif path == "/api/review":
-                    result = {"jobId": service.submit(service.review, args.get("recordingIds"), args.get("prompt"))}
                 else:
                     return self.response_json({"error": "接口不存在。"}, 404)
                 self.response_json(result)

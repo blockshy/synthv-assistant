@@ -135,6 +135,23 @@ end
         self.assertEqual(self.host.pitchReads, 1)
         self.assertIsNone(self.host.queued)
 
+    def test_callable_userdata_binding_returns_host_pitch_without_mutation(self):
+        """Lupa 的 Python callable 呈现 userdata，复现实际宿主的绑定类型。"""
+        calls = []
+
+        def computed(_sv, reference, start, interval, frames):
+            calls.append((start, interval, frames))
+            return self.lua.table_from([60.125] * frames)
+
+        self.lua.globals().SV.getComputedPitchForGroup = computed
+        self.assertEqual(self.lua.eval("type(SV.getComputedPitchForGroup)"), "userdata")
+        pitch = self.selection()["computedPitch"]
+        self.assertEqual(pitch["status"], "ready")
+        self.assertEqual(pitch["samples"][0], [0, 60.125])
+        self.assertEqual(pitch["samples"][-1], [1, 60.125])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((self.host.mutations, self.host.undos), (0, 0))
+
     def test_missing_api_and_invalid_responses_are_unavailable_without_error_text(self):
         expected = {"status": "unavailable", "unit": "MIDI", "samples": []}
         self.assertEqual(self.selection()["computedPitch"], expected)

@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../widgets/workbench_expansion_tile.dart';
+
 /// 功能页共用的紧凑标题栏。主要内容留给工作区，不重复显示宣传式副标题。
 class PageToolbar extends StatelessWidget {
   const PageToolbar({super.key, required this.title, this.actions = const []});
@@ -133,11 +135,17 @@ class PageFooter extends StatelessWidget {
 
 /// 长说明按需展开；云端发送、不可逆删除等决策提示应直接留在对应操作旁。
 class PageNotes extends StatelessWidget {
-  const PageNotes({super.key, required this.children});
+  const PageNotes({
+    super.key,
+    required this.children,
+    this.storageId = 'page-notes',
+  });
   final List<Widget> children;
+  final String storageId;
 
   @override
-  Widget build(BuildContext context) => ExpansionTile(
+  Widget build(BuildContext context) => WorkbenchExpansionTile(
+    storageId: storageId,
     tilePadding: EdgeInsets.zero,
     childrenPadding: const EdgeInsets.only(bottom: 12),
     dense: true,

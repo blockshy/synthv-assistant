@@ -520,6 +520,44 @@ end
                 self.assertFalse(self.call("preview", parameter="tension", **arguments)["ok"])
         self.assertEqual(self.host.mutations, 0)
 
+    def test_vocal_mode_readonly_dimensions_merge_without_inventing_full_catalog(self):
+        """只合并官方三维已有值；局部覆盖不抹掉主组值，也不猜声库完整名单。"""
+        self.lua.execute('''
+host.voice={vocalModeParams={Airy={timbre=35},Cute={pitch=200,timbre=10}}}
+local track=SV:getMainEditor():getCurrentTrack()
+function track:getGroupReference(_)
+  return {isMain=function() return true end,getVoice=function()
+    return {vocalModeParams={Airy={pitch=20,timbre=30,pronunciation=40}}}
+  end}
+end
+''')
+        selection = self.call("get_selection")["result"]
+        self.assertEqual(selection["hostVersion"], "mock-2.2.1")
+        modes = selection["vocalModes"]
+        self.assertFalse(modes["complete"])
+        self.assertEqual(modes["source"], "group-settings")
+        self.assertEqual(modes["items"][0]["values"], {"pitch": 20, "timbre": 35, "pronunciation": 40})
+        self.assertEqual(modes["items"][1]["values"], {"timbre": 10})
+        self.assertEqual(selection["parameters"]["vocalMode_Airy"]["voiceValues"], modes["items"][0]["values"])
+        self.assertNotIn("vocalMode_Airy_pitch", selection["parameters"])
+        self.assertEqual((self.host.mutations, self.host.undos), (0, 0))
+
+    def test_voicing_discovery_requires_host_channel_and_enforces_delta_limit(self):
+        selection = self.call("get_selection")["result"]
+        self.assertEqual(selection["parameters"]["voicing"]["maxDelta"], 0.3)
+        self.assertTrue(self.call("preview", parameter="voicing", delta=0.1)["ok"])
+        self.assertFalse(self.call("preview", parameter="voicing", delta=0.31)["ok"])
+        self.lua.execute('''
+local group=SV:getMainEditor():getCurrentGroup():getTarget()
+function group:getParameter(name)
+  if name=="voicing" then error("unsupported") end
+  return host.curve
+end
+''')
+        self.assertNotIn("voicing", self.call("get_selection")["result"]["parameters"])
+        self.assertFalse(self.call("preview", parameter="voicing", delta=0.1)["ok"])
+        self.assertEqual(self.host.mutations, 0)
+
     def test_vocal_modes_are_discovered_and_voice_changes_expire_preview(self):
         """只接受当前宿主目录中的模式，切换声线默认配置后即使点数未变也必须重做预览。"""
         self.lua.execute('host.voice={vocalModeParams={Airy={pitch=20,timbre=30,pronunciation=40}}}')

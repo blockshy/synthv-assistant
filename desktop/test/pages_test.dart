@@ -69,7 +69,10 @@ class _PageApi extends WorkbenchApi {
     if (path == '/api/trash') {
       return {
         'items': [
-          {'kind': 'upload', 'id': 'test-trash', 'label': '待清理素材'},
+          {'kind': 'conversation', 'id': 'test-trash', 'title': '待清理会话'},
+          // 历史音频记录仍存在，但退役后的页面不能再提供恢复或删除入口。
+          {'kind': 'upload', 'id': 'legacy-upload', 'label': '历史音频素材'},
+          {'kind': 'recording', 'id': 'legacy-recording', 'label': '历史录音'},
         ],
       };
     }
@@ -292,6 +295,11 @@ void main() {
       TrashPage(api: api, onChanged: () => changes++),
       height: 450,
     );
+    expect(find.text('待清理会话'), findsOneWidget);
+    expect(find.text('历史音频素材'), findsNothing);
+    expect(find.text('历史录音'), findsNothing);
+    expect(find.byTooltip('永久删除'), findsOneWidget);
+    expect(find.byTooltip('恢复资料'), findsOneWidget);
     await tester.tap(find.byTooltip('永久删除'));
     await tester.pumpAndSettle();
     expect(api.posts, isEmpty);
@@ -302,7 +310,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('确认永久删除'));
     await tester.pumpAndSettle();
-    expect(api.posts.single.path, '/api/trash/upload/test-trash/purge');
+    expect(api.posts.single.path, '/api/trash/conversation/test-trash/purge');
     expect(api.posts.single.body, {'confirm': true});
     expect(changes, 1);
     expect(tester.takeException(), isNull);

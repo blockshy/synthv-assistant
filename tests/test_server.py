@@ -244,21 +244,33 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(status, 200)
             method.assert_called_once_with(identifier)
 
-    def test_raw_upload_is_authenticated_bounded_and_decodes_name(self):
-        # 上传采用原始字节，不受 JSON 的 64 KiB 上限影响，也不接受任意目标路径。
+    def test_retired_audio_routes_never_create_jobs_or_save_uploads(self):
+        # 退役入口仍先认证，但任何合法请求也不得再落盘、录音或上传云端。
         data = b"a" * 70000
         self.service.save_upload.return_value = {"id": "d" * 32}
         headers = {"X-SV-Token": "test-token", "Content-Type": "application/octet-stream",
                    "X-File-Name": "%E6%B5%8B%E8%AF%95.wav"}
         status, _, _ = self.request("POST", "/api/uploads", headers=headers, body=data)
-        self.assertEqual(status, 200)
-        self.service.save_upload.assert_called_once_with("测试.wav", data)
-        self.service.save_upload.reset_mock()
+        self.assertEqual(status, 410)
         for extra in ({"X-SV-Token": "bad"}, {"Content-Length": "12000001"},
                       {"Content-Length": "70001"}, {"Content-Type": "application/json"}):
             with self.subTest(extra=extra):
                 self.assertGreaterEqual(self.request("POST", "/api/uploads", headers={**headers, **extra}, body=data)[0], 400)
         self.service.save_upload.assert_not_called()
+        for path in ("/api/record", "/api/compare", "/api/review"):
+            self.assertEqual(self.request("POST", path)[0], 403)
+            status, _, body = self.request("POST", path, headers=headers)
+            self.assertEqual(status, 410)
+            self.assertIn("保留", json.loads(body)["error"])
+        self.service.submit.assert_not_called()
+        self.service.compare.assert_not_called()
+
+    def test_audio_attachment_is_rejected_before_a_message_job_is_created(self):
+        status, _, _ = self.request("POST", "/api/conversations/" + "a" * 32 + "/messages",
+                                    headers={"X-SV-Token": "test-token"},
+                                    body={"text": "仅文字", "attachments": [{"kind": "upload", "id": "b" * 32}]})
+        self.assertEqual(status, 400)
+        self.service.submit.assert_not_called()
 
     def test_valid_audio_range_returns_exact_bytes_and_headers(self):
         audio = self.directory / "test.wav"

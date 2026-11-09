@@ -12,13 +12,12 @@ import 'core/workbench_model.dart';
 import 'main.dart' show DesktopTitleBar;
 import 'pages/inspector.dart';
 import 'pages/connection_page.dart';
-import 'pages/library_page.dart';
-import 'pages/recording_page.dart';
 import 'pages/settings_page.dart';
 import 'pages/trash_page.dart';
-import 'widgets/audio_clip.dart';
 import 'widgets/proposal_card.dart';
 import 'widgets/model_picker.dart';
+import 'widgets/workbench_dropdown.dart';
+import 'widgets/workbench_expansion_tile.dart';
 
 /// 三栏工作台只组织页面与会话；所有宿主写入都沿用后端票据流程。
 class Workbench extends StatefulWidget {
@@ -52,7 +51,6 @@ class _WorkbenchState extends State<Workbench> {
   String search = '';
   Timer? _statusTimer, _saveTimer;
   bool _loadingStatus = false;
-  int _libraryGeneration = 0;
   int _bridgeGeneration = 0;
 
   /// 显式切换连接后立即销毁旧检查器草稿，不等待下一次心跳轮询才失效。
@@ -142,7 +140,6 @@ class _WorkbenchState extends State<Workbench> {
     if (!await _canLeaveSettings() || !mounted) return;
     setState(() {
       page = target;
-      if (target == 1) _libraryGeneration++;
     });
   }
 
@@ -169,12 +166,6 @@ class _WorkbenchState extends State<Workbench> {
   void _openConnection() {
     _scaffoldKey.currentState?.closeEndDrawer();
     _navigate(5);
-  }
-
-  void _attach(List<JsonMap> clips) {
-    model.attach(clips);
-    setState(() => page = 0);
-    _composerFocus.requestFocus();
   }
 
   Future<void> _manage(String action) async {
@@ -278,7 +269,6 @@ class _WorkbenchState extends State<Workbench> {
         widget.api.invalidatePreviews();
         model.conversation = null;
         model.draft = '';
-        model.attachments = [];
         model.pendingMessage = null;
         await model.refreshConversations();
         return;
@@ -308,7 +298,7 @@ class _WorkbenchState extends State<Workbench> {
       final wide = bounds.maxWidth >= 1160;
       final left = leftVisible && bounds.maxWidth >= 940;
       final right = rightVisible && wide;
-      final rightContext = page == 0 || page == 2;
+      final rightContext = page == 0;
       final actualLeft = math.min(leftWidth, bounds.maxWidth * .23);
       final actualRight = math.min(rightWidth, bounds.maxWidth * .28);
       return Scaffold(
@@ -483,8 +473,6 @@ class _WorkbenchState extends State<Workbench> {
           ),
           // 返回当前草稿只切换页面；不能通过新建会话丢弃尚未发送的内容。
           _nav(0, Icons.chat_bubble_outline_rounded, '当前会话'),
-          _nav(1, Icons.audio_file_outlined, '音频素材'),
-          _nav(2, Icons.mic_none_rounded, '录音与听评'),
           _nav(5, Icons.cable_outlined, 'SynthV 连接'),
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 12, 8, 4),
@@ -691,12 +679,6 @@ class _WorkbenchState extends State<Workbench> {
 
   Widget _page() => switch (page) {
     5 => ConnectionPage(api: widget.api, onChanged: _connectionChanged),
-    1 => LibraryPage(
-      key: ValueKey(_libraryGeneration),
-      api: widget.api,
-      onAttach: _attach,
-    ),
-    2 => RecordingPage(api: widget.api, onAttach: _attach),
     3 => TrashPage(
       api: widget.api,
       onChanged: () => unawaited(model.refreshConversations()),
@@ -859,11 +841,10 @@ class _WorkbenchState extends State<Workbench> {
                     size.maxWidth,
                   ),
                   _starter(
-                    Icons.headphones_outlined,
-                    '听一听 A / B',
-                    '请先判断两段音频是否可比，再结合我的目标比较同一位置的差异，不预设 B 更好。',
+                    Icons.show_chart,
+                    '梳理参数与声线',
+                    '根据附带选区实际可用的参数目录，说明通用参数、声库声线与音高曲线的区别，先不生成修改。',
                     size.maxWidth,
-                    audio: true,
                   ),
                 ],
               ),
@@ -874,36 +855,27 @@ class _WorkbenchState extends State<Workbench> {
     ),
   );
 
-  Widget _starter(
-    IconData icon,
-    String title,
-    String prompt,
-    double width, {
-    bool audio = false,
-  }) => SizedBox(
-    width: width,
-    child: TextButton(
-      onPressed: () {
-        setState(() {
-          model.draft = prompt;
-          _draft.text = prompt;
-          if (audio) {
-            page = 1;
-            _libraryGeneration++;
-          }
-        });
-        _composerFocus.requestFocus();
-      },
-      child: Row(
-        children: [
-          Icon(icon, size: 17),
-          const SizedBox(width: 10),
-          Expanded(child: Text(title)),
-          const Icon(Icons.chevron_right, size: 16),
-        ],
-      ),
-    ),
-  );
+  Widget _starter(IconData icon, String title, String prompt, double width) =>
+      SizedBox(
+        width: width,
+        child: TextButton(
+          onPressed: () {
+            setState(() {
+              model.draft = prompt;
+              _draft.text = prompt;
+            });
+            _composerFocus.requestFocus();
+          },
+          child: Row(
+            children: [
+              Icon(icon, size: 17),
+              const SizedBox(width: 10),
+              Expanded(child: Text(title)),
+              const Icon(Icons.chevron_right, size: 16),
+            ],
+          ),
+        ),
+      );
 
   Widget _message(JsonMap message) {
     final user = message['role'] == 'user';
@@ -1031,10 +1003,11 @@ class _WorkbenchState extends State<Workbench> {
                                   ),
                                 ),
                               ),
-                              AudioClip(
-                                key: ValueKey(clip['id']),
-                                api: widget.api,
-                                clip: clip,
+                              // 历史仅保留附件名称，不再加载播放器或传输音频。
+                              // 对应文件与消息元数据仍由本地资料库原样保留。
+                              Text(
+                                '历史附件 · 已保留在本机',
+                                style: Theme.of(context).textTheme.bodySmall,
                               ),
                             ],
                           ),
@@ -1058,7 +1031,8 @@ class _WorkbenchState extends State<Workbench> {
                 Theme(
                   data: Theme.of(context)
                       .copyWith(dividerColor: Colors.transparent),
-                  child: ExpansionTile(
+                  child: WorkbenchExpansionTile(
+                    storageId: 'reasoning-${message['id']}',
                     tilePadding: EdgeInsets.zero,
                     dense: true,
                     title: const Text('思考摘要', style: TextStyle(fontSize: 12)),
@@ -1124,8 +1098,8 @@ class _WorkbenchState extends State<Workbench> {
           ],
         ),
         if ((model.progress['reasoning']?.toString() ?? '').isNotEmpty)
-          ExpansionTile(
-            key: ValueKey('live-${model.conversationId}'),
+          WorkbenchExpansionTile(
+            storageId: 'live-${model.conversationId}',
             initiallyExpanded: true,
             tilePadding: EdgeInsets.zero,
             title: const Text('思考摘要', style: TextStyle(fontSize: 12)),
@@ -1241,31 +1215,9 @@ class _WorkbenchState extends State<Workbench> {
                   ),
                 ),
               ),
-              for (final clip in model.attachments)
-                Row(
-                  children: [
-                    Expanded(
-                      child: AudioClip(api: widget.api, clip: clip),
-                    ),
-                    IconButton(
-                      tooltip: '移除本次附件',
-                      onPressed: disabled
-                          ? null
-                          : () =>
-                                setState(() => model.attachments.remove(clip)),
-                      icon: const Icon(Icons.close_rounded, size: 16),
-                    ),
-                  ],
-                ),
               const SizedBox(height: 6),
               Row(
                 children: [
-                  IconButton(
-                    tooltip: '选择音频附件',
-                    onPressed: disabled ? null : () => _navigate(1),
-                    icon: const Icon(Icons.attach_file_rounded),
-                  ),
-                  const SizedBox(width: 4),
                   SizedBox(
                     width: 24,
                     height: 24,
@@ -1338,42 +1290,31 @@ class _WorkbenchState extends State<Workbench> {
         required String tooltip,
       }) => Tooltip(
         message: tooltip,
-        child: Container(
+        child: SizedBox(
           height: 34,
           width: 150,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            border: Border.all(color: colors.outlineVariant),
-            borderRadius: BorderRadius.circular(4),
-          ),
-          child: DropdownButtonHideUnderline(
-            child: DropdownButton<String>(
-              value: value,
-              isExpanded: true,
-              isDense: true,
-              iconSize: 16,
-              style: Theme.of(context).textTheme.bodySmall,
-              onChanged: disabled || options.length < 2 ? null : onChanged,
-              selectedItemBuilder: (_) => options
-                  .map(
-                    (item) => Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        '$label · ${item['label']}',
-                        overflow: TextOverflow.ellipsis,
-                      ),
+          child: WorkbenchDropdown<String>(
+            value: value,
+            onChanged: disabled || options.length < 2 ? null : onChanged,
+            selectedItemBuilder: (_) => options
+                .map(
+                  (item) => Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      '$label · ${item['label']}',
+                      overflow: TextOverflow.ellipsis,
                     ),
-                  )
-                  .toList(),
-              items: options
-                  .map(
-                    (item) => DropdownMenuItem<String>(
-                      value: item['value'] as String,
-                      child: Text(item['label'] as String),
-                    ),
-                  )
-                  .toList(),
-            ),
+                  ),
+                )
+                .toList(),
+            items: options
+                .map(
+                  (item) => DropdownMenuItem<String>(
+                    value: item['value'] as String,
+                    child: Text(item['label'] as String),
+                  ),
+                )
+                .toList(),
           ),
         ),
       );

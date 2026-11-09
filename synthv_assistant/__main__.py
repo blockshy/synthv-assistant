@@ -21,7 +21,7 @@ def _port(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """集中定义 CLI，使入口行为可以脱离真实 SynthV 进行测试。"""
-    parser = argparse.ArgumentParser(prog="synthv-assistant", description="Synthesizer V Studio 2 本地调教与听音助手")
+    parser = argparse.ArgumentParser(prog="synthv-assistant", description="Synthesizer V Studio 2 本地调教参数工作台")
     commands = parser.add_subparsers(dest="command", title="子命令")
     parser.set_defaults(command="serve")
     serve = commands.add_parser("serve", help="启动本地网页控制台（默认）")
@@ -32,8 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("desktop", help="供 Flutter 启动器管理的私有本机 API；stdout 输出握手，stdin 控制生存期")
     script = commands.add_parser("build-script", help="生成单文件 Lua 桥接，不自动安装到 SynthV")
     script.add_argument("--output", type=Path, help="可选的生成文件位置；默认 data/install/SynthVAssistant.lua")
-    commands.add_parser("build-capture", help="使用本机 .NET SDK 构建 Windows 进程音频采集器")
-    commands.add_parser("status", help="以 JSON 输出连接、采集和听评配置状态")
+    # 仅为维护历史实现保留构建命令；新工作台不安装或调用采集器。
+    commands.add_parser("build-capture", help="历史开发命令：构建已退役的采集器，不启用音频入口")
+    commands.add_parser("status", help="以 JSON 输出本机连接状态及保留的兼容配置状态")
     return parser
 
 
@@ -73,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
                 port = getattr(args, "port", 8765)
                 http_server = make_server(port=port, service=service)
                 print(f"SynthV Assistant 已启动：http://127.0.0.1:{port}/", flush=True)
-                print("按 Ctrl+C 停止。音频听评默认不启用，网页可直接进行本地录音和技术分析。", flush=True)
+                print("按 Ctrl+C 停止。旧网页仅保留兼容；音频操作已退役，请使用 Flutter 桌面工作台。", flush=True)
                 http_server.serve_forever(poll_interval=0.25)
             finally:
                 if http_server is not None:

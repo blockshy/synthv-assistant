@@ -154,6 +154,79 @@ Future<void> _show(
 }
 
 void main() {
+  testWidgets('离开设置主页面再返回后，已展开高级设置和输入框均可正常恢复', (tester) async {
+    final api = _ProviderApi();
+    addTearDown(api.dispose);
+    tester.view.physicalSize = const Size(900, 500);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    late StateSetter navigate;
+    var settingsVisible = true;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: WorkbenchTheme.build(Brightness.dark),
+        home: StatefulBuilder(
+          builder: (context, setState) {
+            navigate = setState;
+            return Scaffold(
+              body: settingsVisible
+                  ? SettingsPage(api: api, onChanged: () {})
+                  : const Center(child: Text('其他主页面')),
+            );
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('高级设置'));
+    await tester.tap(find.text('高级设置'));
+    await tester.pumpAndSettle();
+    await tester.drag(
+      find.byKey(const PageStorageKey('provider-config-scroll')),
+      const Offset(0, -160),
+    );
+    await tester.pumpAndSettle();
+    // 与工作台主页面导航一致：移除 SettingsPage，但保留同一路由的 PageStorage。
+    navigate(() => settingsVisible = false);
+    await tester.pumpAndSettle();
+    navigate(() => settingsVisible = true);
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(find.byType(ErrorWidget), findsNothing);
+    expect(_field('等待超时（秒）'), findsOneWidget);
+    expect(api.posts, isEmpty);
+  });
+
+  testWidgets('滚动连接配置后切换标签再返回，滚动位置不覆盖高级设置展开状态', (tester) async {
+    final api = _ProviderApi();
+    addTearDown(api.dispose);
+    await _show(tester, api, width: 900, height: 420);
+    // 真实滚动会向 PageStorage 写入 double；展开控件只能读取自己的 bool。
+    // 仅切页但不滚动的布局测试无法发现两种状态共享存储键的问题。
+    await tester.drag(
+      find.byKey(const PageStorageKey('provider-config-scroll')),
+      const Offset(0, -180),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('settings-tab:1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('settings-tab:0')));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(find.byType(ErrorWidget), findsNothing);
+    expect(find.text('高级设置'), findsOneWidget);
+    await tester.ensureVisible(find.text('高级设置'));
+    await tester.tap(find.text('高级设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('settings-tab:1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('settings-tab:0')));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(_field('等待超时（秒）'), findsOneWidget);
+  });
+
   for (final width in [360.0, 900.0]) {
     for (final brightness in Brightness.values) {
       testWidgets('模型服务在 $width / $brightness 下两页签与新增流程保持底栏可见', (tester) async {

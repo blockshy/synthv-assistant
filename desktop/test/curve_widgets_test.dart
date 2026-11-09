@@ -260,9 +260,11 @@ void main() {
     await tester.pumpAndSettle();
     expect(api.gets, ['/api/status']);
     await _tap(tester, '读取当前选区');
-    final delta = find.byType(TextField).first;
+    // 使用参数输入的语义键，不依赖检查器增加工程信息后输入框的排列位置。
+    final delta = find.byKey(const ValueKey('inspector-delta'));
+    await tester.ensureVisible(delta);
     await tester.enterText(delta, '5');
-    await _tap(tester, '生成宿主预览');
+    await _tap(tester, '生成预览');
     expect(api.posts, isEmpty);
     expect(find.text('请输入当前范围内的非零增量。'), findsOneWidget);
     expect(tester.takeException(), isNull);

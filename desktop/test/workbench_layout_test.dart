@@ -62,7 +62,7 @@ void main() {
     );
     await tester.ensureVisible(base);
     await tester.enterText(base, 'https://changed.invalid/v1');
-    await tester.tap(find.text('音频素材').first);
+    await tester.tap(find.text('回收站').first);
     await tester.pumpAndSettle();
     expect(find.text('保存平台修改？'), findsOneWidget);
     await tester.tap(find.text('继续编辑'));
@@ -71,7 +71,7 @@ void main() {
       tester.widget<TextField>(base).controller!.text,
       'https://changed.invalid/v1',
     );
-    await tester.tap(find.text('音频素材').first);
+    await tester.tap(find.text('回收站').first);
     await tester.pumpAndSettle();
     await tester.tap(find.text('放弃修改'));
     await tester.pumpAndSettle();
@@ -160,11 +160,16 @@ void main() {
         await tester.pumpAndSettle();
         expect(tester.takeException(), isNull);
         expect(find.text('调教会话'), findsOneWidget);
+        // 音频功能退役后，主导航、附件按钮和欢迎入口均不再提供可触发操作。
+        expect(find.text('音频素材'), findsNothing);
+        expect(find.text('录音与听评'), findsNothing);
+        expect(find.byTooltip('选择音频附件'), findsNothing);
+        expect(find.text('听一听 A / B'), findsNothing);
         final composer = find.widgetWithText(TextField, '描述希望怎样演唱，或讨论这段调教…');
         await tester.enterText(composer, '未发送的测试草稿');
         await tester.pump();
         if (size.width >= 940) {
-          await tester.tap(find.text('音频素材').first);
+          await tester.tap(find.text('回收站').first);
           await tester.pumpAndSettle();
           expect(tester.takeException(), isNull);
           await tester.tap(find.text('当前会话').first);

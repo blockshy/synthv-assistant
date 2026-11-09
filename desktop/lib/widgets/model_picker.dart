@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../core/api.dart';
 import '../theme.dart';
+import 'workbench_dropdown.dart';
 
 /// 会话模型选择的唯一提交结果；空模型 ID 表示继续跟随该平台的默认模型。
 /// 打开管理页时只返回意图，不在弹层内部修改平台配置或当前会话。
@@ -326,26 +327,19 @@ class _ModelPickerDialogState extends State<ModelPickerDialog> {
     children: [
       const Text('模型服务'),
       const SizedBox(height: 4),
-      SizedBox(
-        height: WorkbenchTheme.controlHeight,
-        child: DropdownButtonFormField<String>(
-          key: ValueKey('model-picker-platform-$_platformId'),
-          initialValue: _platformId.isEmpty ? null : _platformId,
-          isExpanded: true,
-          decoration: const InputDecoration(
-            contentPadding: EdgeInsets.symmetric(horizontal: 10),
-          ),
-          hint: const Text('尚未添加模型服务'),
-          items: widget.platforms.map((platform) {
-            final id = platform['id'].toString();
-            final name = (platform['name'] ?? id).toString();
-            return DropdownMenuItem(
-              value: id,
-              child: Text(name, overflow: TextOverflow.ellipsis),
-            );
-          }).toList(),
-          onChanged: widget.platforms.isEmpty ? null : _switchPlatform,
-        ),
+      WorkbenchDropdown<String>(
+        key: ValueKey('model-picker-platform-$_platformId'),
+        value: _platformId.isEmpty ? null : _platformId,
+        hint: const Text('尚未添加模型服务'),
+        items: widget.platforms.map((platform) {
+          final id = platform['id'].toString();
+          final name = (platform['name'] ?? id).toString();
+          return DropdownMenuItem(
+            value: id,
+            child: Text(name, overflow: TextOverflow.ellipsis),
+          );
+        }).toList(),
+        onChanged: widget.platforms.isEmpty ? null : _switchPlatform,
       ),
     ],
   );

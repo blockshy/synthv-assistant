@@ -13,7 +13,7 @@ import math
 LEGACY_PARAMETERS = frozenset({"breathiness", "tension", "gender", "loudness", "pitchDelta"})
 PARAMETER_LIMITS = {"breathiness": 0.3, "tension": 0.3, "gender": 0.3,
                     "loudness": 6.0, "pitchDelta": 100.0, "toneShift": 200.0,
-                    "vibratoEnv": 0.3}
+                    "vibratoEnv": 0.3, "voicing": 0.3}
 MAX_CURVE_POINTS = 64
 MAX_PREVIEW_POINTS = 256
 MAX_PREVIEW_CONTROL_POINTS = 4000
@@ -310,6 +310,13 @@ def public_parameter_catalog(selection: dict) -> dict:
             public["available"] = definition["available"]
         if definition.get("source") in ("host", "user"):
             public["source"] = definition["source"]
+        if definition.get("kind") == "vocalMode":
+            # getVoice 的三维默认项和自动化轨道是不同数据。只公开已知数值，
+            # 不返回原始对象，也不将它解释成可独立绘制的参数名称或偏移量。
+            values = definition.get("voiceValues")
+            if isinstance(values, dict):
+                public["voiceValues"] = {key: values[key] for key in ("pitch", "timbre", "pronunciation")
+                                         if key in values and finite(values[key], 0, 150)}
         if definition.get("kind") in ("automation", "vocalMode"):
             current = _public_current_values(definition.get("currentValues"))
             # Python 再执行与桥接一致的总采样预算，避免伪造目录或旧桥接扩张

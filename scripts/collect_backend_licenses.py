@@ -123,37 +123,48 @@ def collect(project_root: Path) -> dict:
         raise ValueError("请先构建桌面后台，再收集发行许可。")
     destination = backend / "licenses"
     destination.mkdir(parents=True, exist_ok=True)
+    capture = backend / "_internal/native/ProcessAudioCapture"
+    if not capture.exists() and (destination / "dotnet-runtime").exists():
+        # 独立重跑收集器时不能把旧版本的 .NET 声明混进无采集器的新产物。
+        # 不递归删除未知目录；要求从受控打包入口重建完整输出再核对。
+        raise ValueError("产物不含音频采集器，但保留了旧 .NET 许可目录；请重新构建后台后再收集。")
     sources = included_sources(project_root / "build/desktop-backend/synthv-backend/Analysis-00.toc")
     packages = collect_python_distributions(sources, destination, metadata.distributions())
     # 使用与构建解释器匹配的 PSF 许可证；Windows 官方发行文本同时列出
     # 随解释器分发的部分原生依赖声明，不能只写一个“Python / PSF”标签。
     python_license = Path(sys.base_prefix) / "LICENSE.txt"
     copy_notice(python_license, destination / "python-runtime/LICENSE.txt")
-    capture = backend / "_internal/native/ProcessAudioCapture"
-    runtime_version, runtime_pack = dotnet_notice_sources(project_root, capture)
-    for name in ("LICENSE.TXT", "THIRD-PARTY-NOTICES.TXT"):
-        copy_notice(runtime_pack / name, destination / "dotnet-runtime" / name)
+    # 新发行包不再包含采集器，不能固定写入 .NET 版本或虚构随包组件。
+    # 保留按实际产物审计旧发行包的能力；存在采集器时仍须匹配完整运行时许可。
+    runtime_version = None
+    if capture.exists():
+        runtime_version, runtime_pack = dotnet_notice_sources(project_root, capture)
+        for name in ("LICENSE.TXT", "THIRD-PARTY-NOTICES.TXT"):
+            copy_notice(runtime_pack / name, destination / "dotnet-runtime" / name)
     manifest = {"format": 1, "pythonVersion": sys.version.split()[0],
-                "dotnetRuntimeVersion": runtime_version,
+                **({"dotnetRuntimeVersion": runtime_version} if runtime_version else {}),
                 "sources": {"pythonRuntime": "构建解释器随附 LICENSE.txt",
-                            "dotnetRuntime": "与产物版本一致的 Microsoft.NETCore.App.Runtime.win-x64 NuGet 包",
+                            **({"dotnetRuntime": "与产物版本一致的 Microsoft.NETCore.App.Runtime.win-x64 NuGet 包"}
+                               if runtime_version else {}),
                             "pythonPackages": "PyInstaller 实际输入清单匹配已安装 wheel RECORD；另含 exe 启动器许可"},
                 "pythonDistributions": packages,
                 "limitations": ["本清单收集随附许可资料，不保证自动判断所有版权、通知、源码提供或再分发义务。",
                                 "依赖更新后需重新构建、收集并复核；不要将第三方组件统一改标为项目 MIT 许可证。"]}
     (destination / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    runtime_note = ("dotnet-runtime：随包自包含 .NET 运行时精确版本的 LICENSE 与第三方声明。\n"
+                    if runtime_version else "")
     (destination / "README.txt").write_text(
         "SynthV Assistant 桌面后台第三方许可资料\n\n"
         "python-runtime：构建时 Python 发行版的原始许可文本。\n"
-        "dotnet-runtime：随包自包含 .NET 运行时精确版本的 LICENSE 与第三方声明。\n"
-        "python-packages：实际打包输入所关联 Python 分发包的原始许可/版权/通知文本；"
+        + runtime_note + "python-packages：实际打包输入所关联 Python 分发包的原始许可/版权/通知文本；"
         "包含 PyInstaller 启动器许可与例外条款。\n"
         "manifest.json：版本、相对文件名及收集来源，不含开发机器绝对路径或用户资料。\n\n"
         "这些原始条款保留各自效力，本项目的 MIT 许可证不会替换它们。"
         "此资料收集不构成已穷尽所有分发义务的保证；发行者仍需按实际分发内容复核。\n",
         encoding="utf-8")
-    return {"pythonDistributions": len(packages), "dotnetRuntimeVersion": runtime_version,
-            "licenseFiles": sum(len(item["files"]) for item in packages) + 3}
+    return {"pythonDistributions": len(packages),
+            **({"dotnetRuntimeVersion": runtime_version} if runtime_version else {}),
+            "licenseFiles": sum(len(item["files"]) for item in packages) + 1 + (2 if runtime_version else 0)}
 
 
 if __name__ == "__main__":

@@ -6,23 +6,15 @@ Python/Lua 执行工具，也不接受本机任意文件路径。stdout 专用�
 
 from __future__ import annotations
 
-import base64
-import io
 import re
-import wave
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import AudioContent, TextContent, ToolAnnotations
+from mcp.types import ToolAnnotations
 from pydantic import StrictFloat, StrictInt
 
 from .service import AssistantService
-from .config import DATA
-from .metadata import LibraryMetadata
-from .parameters import ParameterError, validate_preview_payload
-
-
-MAX_MCP_AUDIO_BYTES = 12_000_000
+from .parameters import ParameterError, validate_preview_payload, public_parameter_catalog, public_computed_pitch
 
 
 class ParameterMCPServer(FastMCP):
@@ -60,12 +52,15 @@ def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
     )
     readonly = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
     local_change = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
-    external_call = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
 
     @server.tool(annotations=readonly)
     def status() -> dict:
-        """读取桥接、音频采集器、写入模式及听评配置状态；不回显 API key。"""
-        return assistant.status()
+        """读取桥接与写入模式；不暴露已退役的录音、音频目录或供应商配置。"""
+        state = assistant.status()
+        # 与业务层保持字段一致；锁状态为未知或读取失败时也必须保留，避免客户端
+        # 把缺失的跨进程占用信息误判成空闲。音频状态仍不进入 MCP 返回值。
+        return {key: state[key] for key in ("bridge", "writeEnabled", "operationBusy", "operationStatusError")
+                if key in state}
 
     @server.tool(annotations=readonly)
     def get_project() -> dict:
@@ -76,6 +71,33 @@ def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
     def get_selection() -> dict:
         """读取当前选中音符、时间范围及参数；此工具不改变选区。"""
         return assistant.get_selection()
+
+    @server.tool(annotations=readonly)
+    def get_parameter_catalog() -> dict:
+        """读取当前选区的可编辑参数、声线默认项及宿主已计算音高，不改动工程。
+
+        先依据目录选择参数名称、单位与 maxDelta，再调用预览工具。声线目录只含
+        宿主设置中出现或用户手动核对的名称，complete=false；voiceValues 的
+        pitch/timbre/pronunciation 为只读默认项，不是三个独立自动化通道。
+        pitchCurve 写入真正的 PitchControlCurve；computedPitch 只是只读参考。
+        """
+        selection = assistant.get_selection()
+        if not isinstance(selection, dict):
+            raise ValueError("宿主未返回有效选区，请重新读取。")
+        catalog = public_parameter_catalog(selection)
+        modes = []
+        for parameter, definition in catalog.items():
+            if definition.get("kind") == "vocalMode":
+                modes.append({"name": definition["modeName"], "parameter": parameter,
+                              "source": definition.get("source", "host"),
+                              "values": definition.get("voiceValues", {})})
+        # 仅使用经过公共契约筛选的有界字段，不将工程路径、曲线指纹或宿主原始
+        # getVoice 对象传给调用模型；缺少计算音高时保留未知状态，不补造基线。
+        result = {"parameters": catalog, "vocalModes": {"complete": False, "items": modes}}
+        pitch = public_computed_pitch(selection.get("computedPitch"))
+        if pitch is not None:
+            result["computedPitch"] = pitch
+        return result
 
     @server.tool(annotations=local_change)
     def set_write_mode(enabled: bool) -> dict:
@@ -120,16 +142,6 @@ def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
         """恢复助手最近一次参数修改；宿主检查之后未发生冲突编辑。"""
         return assistant.edit("restore")
 
-    @server.tool(annotations=local_change)
-    def start_recording(start_seconds: float, duration_seconds: float, label: str = "片段") -> dict:
-        """按进程录制 SynthV 当前混音并自动播放指定片段；时长 1～30 秒。
-
-        不录麦克风，不改变轨道独奏/静音。立即返回 jobId；使用 get_job 等待完成，
-        结果包含录音 id、技术分析与实际捕获状态。录音期间不要修改参数。
-        """
-        identifier = assistant.submit(assistant.record, start_seconds, duration_seconds, label)
-        return {"jobId": identifier, "message": "录音任务已提交，请通过 get_job 查询结果。"}
-
     @server.tool(annotations=readonly)
     def get_job(job_id: str) -> dict:
         """查询本 MCP 进程创建的任务，state 为 running、done 或 error。"""
@@ -141,63 +153,6 @@ def create_mcp_server(service: AssistantService | None = None) -> FastMCP:
                 raise ValueError("任务不存在，可能由其他助手进程创建或当前服务已重启。")
             return {"jobId": job_id, **job}
 
-    @server.tool(annotations=readonly)
-    def list_recordings() -> dict:
-        """列出本助手生成的录音与分析，返回的录音 id 可用于对比和听评。"""
-        return assistant.list_recordings()
-
-    @server.tool(annotations=readonly)
-    def compare_recordings(before_id: str, after_id: str) -> dict:
-        """本地比较两个录音的电平、时长、潜在削波；不联网，不产生听感质量分。"""
-        return assistant.compare(before_id, after_id)
-
-    @server.tool(annotations=external_call)
-    def review_recordings(recording_ids: list[str], prompt: str) -> dict:
-        """将 1～2 段录音送给已配置的音频模型听评，立即返回 jobId。
-
-        此操作配置供应商后会上传真实音频及片段上下文，可能产生 API 费用。
-        默认供应商为 none，未配置时任务结果明确返回 not_configured，不伪造听感。
-        两段录音按传入顺序标记 A、B；如需前后对比，请在 prompt 中说明关系。
-        模型只给建议，不自动改动 SynthV；录音不可比时也可以不选优胜版本。
-        """
-        identifier = assistant.submit(assistant.review, recording_ids, prompt)
-        return {"jobId": identifier, "message": "听评任务已提交；配置供应商后会上传所选音频，请用 get_job 获取结果。"}
-
-    @server.tool(annotations=readonly, structured_output=False)
-    def get_recording_audio(recording_id: str) -> list[TextContent | AudioContent]:
-        """向当前 MCP 客户端返回真实 WAV 音频，最大 12 MB，不调用额外听评服务。
-
-        客户端及其模型必须能接收 MCP AudioContent 并支持音频输入；服务器无法
-        保证每个客户端都会把音频转交模型。此工具不接受任意文件路径。
-        """
-        # 从可用性检查到读取完成持有素材锁，永久删除不能在二者之间移除音频。
-        # 该锁只保护本机读取；返回内存中的内容后即可释放，不长期阻止资料管理。
-        with LibraryMetadata(DATA).use_assets([{"kind": "recording", "id": recording_id}]):
-            try:
-                path = assistant.recording_path(recording_id)
-                if path.stat().st_size > MAX_MCP_AUDIO_BYTES:
-                    raise ValueError("录音超过 MCP 内联音频的 12 MB 上限，请使用更短片段。")
-                # 有界读取防止外部程序同时扩展文件导致超量内存分配。
-                with path.open("rb") as audio_file:
-                    audio = audio_file.read(MAX_MCP_AUDIO_BYTES + 1)
-            except OSError:
-                raise ValueError("无法读取录音文件，请检查文件是否完整并稍后重试。") from None
-        if len(audio) > MAX_MCP_AUDIO_BYTES:
-            raise ValueError("录音超过 MCP 内联音频的 12 MB 上限。")
-        try:
-            with wave.open(io.BytesIO(audio), "rb") as reader:
-                expected = reader.getnframes() * reader.getnchannels() * reader.getsampwidth()
-                if reader.getnframes() <= 0 or expected > MAX_MCP_AUDIO_BYTES:
-                    raise ValueError("音频为空或音频数据大小无效。")
-                if len(reader.readframes(reader.getnframes())) != expected:
-                    raise ValueError("音频尚未写入完整，请等待录音任务结束。")
-        except (wave.Error, EOFError):
-            raise ValueError("录音不是可读取的完整 WAV。") from None
-        return [
-            TextContent(type="text", text="以下是实际录制的 SynthV WAV 音频。只有客户端和模型支持音频输入时才能直接听评；技术指标不能代替试听。"),
-            AudioContent(type="audio", mimeType="audio/wav", data=base64.b64encode(audio).decode("ascii")),
-        ]
-
     return server
 
 
@@ -207,7 +162,7 @@ def run_mcp() -> None:
     try:
         create_mcp_server(service).run(transport="stdio")
     finally:
-        # 等待已开始的短录音收尾，避免服务退出时遗留音频辅助进程。
+        # 等待已经开始的受控后台任务收尾，避免 stdio 退出留下未完成工作。
         service.executor.shutdown(wait=True, cancel_futures=True)
 
 

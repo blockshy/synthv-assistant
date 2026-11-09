@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 
 import '../core/api.dart';
 import '../widgets/curve_preview.dart';
+import '../widgets/parameter_draft_editor.dart';
+import '../widgets/workbench_dropdown.dart';
+import '../widgets/workbench_expansion_tile.dart';
 import 'page_chrome.dart';
 
 /// 工程检查器只在用户点击读取时取得选区。状态轮询不读取完整工程、模型配置或音频。
@@ -17,15 +20,17 @@ class Inspector extends StatefulWidget {
 }
 
 class _InspectorState extends State<Inspector> {
-  JsonMap _status = {}, _selection = {}, _preview = {};
+  JsonMap _status = {}, _project = {}, _selection = {}, _preview = {};
   String? _parameter, _message;
   String _renderMode = 'smooth';
-  bool _curve = false, _error = false, _refreshing = false;
+  bool _curve = false, _refreshing = false;
   int _previewEpoch = -1;
   Timer? _timer;
   final _delta = TextEditingController(text: '0.05');
   final _points = TextEditingController(text: '0 0\n0.5 0.05\n1 0');
   final _modeName = TextEditingController();
+  final List<String> _draftHistory = [];
+  String _category = 'automation';
 
   @override
   void initState() {
@@ -81,6 +86,16 @@ class _InspectorState extends State<Inspector> {
   }
 
   JsonMap get _definition => _catalog[_parameter] ?? {};
+  String _kind(String parameter, JsonMap definition) =>
+      parameter == 'pitchCurve'
+      ? 'pitch'
+      : definition['kind'] == 'vocalMode'
+      ? 'vocalMode'
+      : 'automation';
+  Map<String, JsonMap> get _categoryCatalog => {
+    for (final entry in _catalog.entries)
+      if (_kind(entry.key, entry.value) == _category) entry.key: entry.value,
+  };
   bool get _nativePitch => _parameter == 'pitchCurve';
   List<double> get _bounds {
     if (_nativePitch) {
@@ -122,6 +137,7 @@ class _InspectorState extends State<Inspector> {
               oldBridge['ipcDirectory'] != newBridge['ipcDirectory']);
       if (targetChanged || _connected && newBridge['connected'] != true) {
         widget.api.invalidatePreviews();
+        _project = {};
         _selection = {};
         _preview = {};
         _parameter = null;
@@ -132,6 +148,7 @@ class _InspectorState extends State<Inspector> {
       if (_connected) widget.api.invalidatePreviews();
       setState(() {
         _status = {};
+        _project = {};
         _selection = {};
         _preview = {};
         _parameter = null;
@@ -144,7 +161,6 @@ class _InspectorState extends State<Inspector> {
   Future<void> _run(Future<void> Function() action) async {
     setState(() {
       _message = null;
-      _error = false;
     });
     try {
       await widget.api.exclusive(action);
@@ -152,7 +168,6 @@ class _InspectorState extends State<Inspector> {
       if (mounted) {
         setState(() {
           _message = error.toString();
-          _error = true;
         });
       }
     }
@@ -177,13 +192,62 @@ class _InspectorState extends State<Inspector> {
       _selection = result;
       final names = _catalog.keys;
       _parameter = names.contains(_parameter) ? _parameter : names.firstOrNull;
+      if (_parameter != null) _category = _kind(_parameter!, _definition);
       _message = (result['noteCount'] as num? ?? 0) > 0
           ? '选区已读取。'
           : '请先在 SynthV 中选中音符，再读取选区。';
       _resetDraft();
+      _draftHistory.clear();
     });
     await _refreshStatus();
   });
+
+  /// 工程读取与选区读取分开；查看轨道概况不会自动读取完整音符或产生修改。
+  Future<void> _readProject() => _run(() async {
+    final result = Map<String, dynamic>.from(
+      await widget.api.getJson('/api/project') as Map,
+    );
+    if (!mounted) return;
+    final old = _selection['projectFile'];
+    if (old != null && old != result['projectFile']) {
+      _invalidate();
+      _selection = {};
+      _parameter = null;
+    }
+    setState(() {
+      _project = result;
+      _message = '工程概况已读取。';
+    });
+  });
+
+  void _chooseParameter(String? value) {
+    _invalidate();
+    setState(() {
+      _parameter = value;
+      _draftHistory.clear();
+      if (value != null) _category = _kind(value, _definition);
+      _resetDraft();
+    });
+  }
+
+  /// 草稿撤销与宿主恢复分离：撤销画笔操作只修改本地输入，不提交宿主请求。
+  void _changeDraft(List<List<double>> points) {
+    final original = _points.text;
+    _invalidate();
+    setState(() {
+      _draftHistory.add(original);
+      if (_draftHistory.length > 20) _draftHistory.removeAt(0);
+      _points.text = points
+          .map((p) => '${p[0].toStringAsFixed(8)} ${p[1].toStringAsFixed(6)}')
+          .join('\n');
+    });
+  }
+
+  void _undoDraft() {
+    if (_draftHistory.isEmpty) return;
+    _invalidate();
+    setState(() => _points.text = _draftHistory.removeLast());
+  }
 
   void _resetDraft() {
     if (_nativePitch) {
@@ -255,6 +319,8 @@ class _InspectorState extends State<Inspector> {
             ? 10.0
             : _parameter == 'loudness'
             ? 1.0
+            : _definition['kind'] == 'vocalMode'
+            ? 5.0
             : .05,
       );
       _delta.text = curveNumber(amount);
@@ -389,21 +455,71 @@ class _InspectorState extends State<Inspector> {
     });
   });
 
+  /// 展示字段使用后端实际读回值；缺项保留“—”，不从软件名称猜测版本或声库。
+  Widget _property(String label, Object? value) => Padding(
+    padding: const EdgeInsets.only(bottom: 7),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 68,
+          child: Text(label, style: Theme.of(context).textTheme.bodySmall),
+        ),
+        Expanded(
+          child: SelectableText(
+            value == null || '$value'.isEmpty ? '—' : '$value',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _choice(
+    String label,
+    String? value,
+    List<DropdownMenuItem<String>> items,
+    ValueChanged<String?>? changed,
+  ) => PageProperty(
+    label: label,
+    child: WorkbenchDropdown<String>(
+      key: ValueKey('inspector-choice:$label'),
+      value: value,
+      items: items,
+      onChanged: changed,
+      hint: const Text('没有可用参数'),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) => ListenableBuilder(
     listenable: widget.api,
     builder: (context, _) {
-      final busy = widget.api.busy;
-      final theme = Theme.of(context);
-      final catalog = _catalog;
-      final selected = catalog.containsKey(_parameter) ? _parameter : null;
+      final busy = widget.api.busy, theme = Theme.of(context);
       final validSelection = (_selection['noteCount'] as num? ?? 0) > 0;
+      final projectFile =
+          '${_selection['projectFile'] ?? _project['projectFile'] ?? ''}';
+      final projectName = projectFile.split(RegExp(r'[\\/]')).last;
+      final host =
+          _selection['hostVersion'] ??
+          _project['hostVersion'] ??
+          (_status['bridge'] as Map?)?['hostVersion'];
+      final notes = (_selection['notes'] as List? ?? [])
+          .whereType<Map>()
+          .toList();
+      final currentValues = _definition['currentValues'];
+      final voiceValues = _definition['voiceValues'];
+      final available = _categoryCatalog;
+      final selected = available.containsKey(_parameter) ? _parameter : null;
+      final rawPitch = (_selection['parameters'] as Map?)?['pitchCurve'];
       List<List<double>> draft;
       try {
         draft = _parsePoints();
       } catch (_) {
         draft = [];
       }
+      final validPreview =
+          _preview.isNotEmpty && _previewEpoch == widget.api.previewEpoch;
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -419,6 +535,7 @@ class _InspectorState extends State<Inspector> {
           ),
           Expanded(
             child: ListView(
+              key: const PageStorageKey('inspector:viewport'),
               padding: const EdgeInsets.all(12),
               children: [
                 Row(
@@ -426,20 +543,18 @@ class _InspectorState extends State<Inspector> {
                     Icon(_connected ? Icons.link : Icons.link_off, size: 16),
                     const SizedBox(width: 8),
                     Expanded(
-                      child: Text(
-                        _connected ? 'SynthV 已连接' : 'SynthV 未连接',
-                        style: theme.textTheme.bodyMedium,
-                      ),
+                      child: Text(_connected ? 'SynthV 已连接' : 'SynthV 未连接'),
                     ),
                   ],
                 ),
-                const SizedBox(height: 8),
-                if (!_connected)
+                if (!_connected) ...[
+                  const SizedBox(height: 8),
                   OutlinedButton.icon(
                     onPressed: widget.onConnection,
                     icon: const Icon(Icons.cable_outlined, size: 16),
                     label: const Text('诊断与修复连接'),
                   ),
+                ],
                 SwitchListTile.adaptive(
                   contentPadding: EdgeInsets.zero,
                   dense: true,
@@ -447,276 +562,509 @@ class _InspectorState extends State<Inspector> {
                   value: _writeEnabled,
                   onChanged: busy || !_connected ? null : _setWrite,
                 ),
-                OutlinedButton.icon(
-                  onPressed: busy || !_connected ? null : _readSelection,
-                  icon: const Icon(Icons.select_all, size: 16),
-                  label: const Text('读取当前选区'),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: busy || !_connected ? null : _readProject,
+                        child: const Text('读取工程'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: busy || !_connected ? null : _readSelection,
+                        child: const Text('读取当前选区'),
+                      ),
+                    ),
+                  ],
                 ),
-                if (validSelection)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: Text(
-                      '${_selection['noteCount']} 个音符 · ${_selection['startSeconds']}–${_selection['endSeconds']} 秒',
-                      style: theme.textTheme.bodySmall,
+                const SizedBox(height: 14),
+                PageSection(
+                  title: '工程与选区',
+                  children: [
+                    _property('工程', projectName.isEmpty ? '尚未读取' : projectName),
+                    _property('宿主版本', host),
+                    if (_project['trackCount'] != null)
+                      _property('轨道数量', _project['trackCount']),
+                    _property('音符组', _selection['groupName']),
+                    _property(
+                      '选中音符',
+                      validSelection ? '${_selection['noteCount']} 个' : '尚未读取',
                     ),
-                  ),
-                const SizedBox(height: 18),
-                if (!validSelection)
-                  Text(
-                    _connected ? '读取选区后显示可编辑参数。' : '连接后可读取选区和声库参数。',
-                    style: theme.textTheme.bodySmall,
-                  ),
-                if (validSelection) ...[
-                  Text('参数编辑', style: theme.textTheme.titleSmall),
-                  const SizedBox(height: 10),
-                  DropdownButtonFormField<String>(
-                    key: ValueKey('parameter:$selected'),
-                    initialValue: selected,
-                    isExpanded: true,
-                    decoration: const InputDecoration(labelText: '参数 / 声线'),
-                    items: [
-                      for (final entry in catalog.entries)
-                        DropdownMenuItem(
-                          value: entry.key,
-                          child: Text(
-                            '${entry.value['label'] ?? entry.key}',
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                    ],
-                    onChanged: busy
-                        ? null
-                        : (value) {
-                            _invalidate();
-                            setState(() {
-                              _parameter = value;
-                              _resetDraft();
-                            });
-                          },
-                  ),
-                  if (selected != null) ...[
-                    const SizedBox(height: 10),
-                    Text(
-                      _nativePitch
-                          ? '绝对 MIDI · ${curveNumber(_bounds[0])}–${curveNumber(_bounds[1])}'
-                          : '增量范围 ±${curveNumber(_bounds[1])} ${_definition['unit'] ?? ''}',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                    const SizedBox(height: 10),
-                    if (_supportsCurves) ...[
-                      DropdownButtonFormField<String>(
-                        key: ValueKey('input:$_parameter:$_curve'),
-                        initialValue: _nativePitch
-                            ? 'curve'
-                            : _curve
-                            ? 'curve'
-                            : 'delta',
-                        decoration: const InputDecoration(labelText: '输入方式'),
-                        items: [
-                          if (!_nativePitch)
-                            const DropdownMenuItem(
-                              value: 'delta',
-                              child: Text('整体增量'),
-                            ),
-                          const DropdownMenuItem(
-                            value: 'curve',
-                            child: Text('绘制曲线'),
-                          ),
-                        ],
-                        onChanged: busy || _nativePitch
-                            ? null
-                            : (value) {
-                                _invalidate();
-                                setState(() => _curve = value == 'curve');
-                              },
+                    if (validSelection) ...[
+                      _property(
+                        '时间范围',
+                        '${curveNumber((_selection['startSeconds'] as num?) ?? 0)}–${curveNumber((_selection['endSeconds'] as num?) ?? 0)} 秒',
                       ),
-                      const SizedBox(height: 10),
-                      DropdownButtonFormField<String>(
-                        key: ValueKey('render:$_parameter:$_renderMode'),
-                        initialValue: _renderMode,
-                        decoration: const InputDecoration(labelText: '宿主表示方式'),
-                        items: const [
-                          DropdownMenuItem(
-                            value: 'smooth',
-                            child: Text('绘制模式 · 精简曲线'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'points',
-                            child: Text('控制点模式'),
-                          ),
-                        ],
-                        onChanged: busy || _nativePitch
-                            ? null
-                            : (value) {
-                                _invalidate();
-                                setState(() => _renderMode = value!);
-                              },
+                      _property(
+                        '组移调',
+                        '${_selection['groupPitchOffset'] ?? 0} 半音',
                       ),
                     ],
-                    const SizedBox(height: 12),
-                    if (_curve || _nativePitch) ...[
-                      if (draft.isNotEmpty)
-                        SizedBox(
-                          height: 145,
-                          child: _DraftPad(
-                            points: draft,
-                            bounds: _bounds,
-                            enabled: !busy,
-                            onChanged: (points) {
-                              _invalidate();
-                              setState(
-                                () => _points.text = points
-                                    .map(
-                                      (p) =>
-                                          '${p[0].toStringAsFixed(6)} ${p[1].toStringAsFixed(6)}',
-                                    )
-                                    .join('\n'),
-                              );
-                            },
-                          ),
-                        ),
-                      const SizedBox(height: 8),
-                      Text(
-                        _nativePitch
-                            ? '拖动绘制绝对 MIDI 音高；原生曲线会替换该段生成音高。首尾覆盖选区，手绘自动精简。'
-                            : '拖动绘制增量；首尾保持覆盖选区，手绘自动精简。',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                      const SizedBox(height: 8),
-                      ExpansionTile(
-                        key: ValueKey('nodes:$_parameter'),
+                    if (notes.isNotEmpty)
+                      WorkbenchExpansionTile(
+                        storageId: 'inspector:notes',
                         tilePadding: EdgeInsets.zero,
                         title: Text(
-                          '精确节点 · ${draft.length} / 64',
+                          '音符明细 · ${notes.length}',
                           style: theme.textTheme.bodySmall,
                         ),
                         children: [
-                          TextField(
-                            controller: _points,
-                            enabled: !busy,
-                            minLines: 3,
-                            maxLines: 7,
-                            style: const TextStyle(
-                              fontFamily: 'Consolas',
-                              fontSize: 11,
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxHeight: 240),
+                            child: ListView.builder(
+                              shrinkWrap: true,
+                              itemCount: notes.length,
+                              itemBuilder: (context, index) {
+                                final note = notes[index];
+                                final pitch = note['pitch'] is num
+                                    ? (note['pitch'] as num) +
+                                          ((_selection['groupPitchOffset']
+                                                  as num?) ??
+                                              0)
+                                    : null;
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 5,
+                                  ),
+                                  child: Text(
+                                    '${index + 1}. ${note['lyrics'] ?? ''}  ·  MIDI ${pitch ?? '—'}\n'
+                                    '${note['onsetSeconds'] is num ? curveNumber(note['onsetSeconds']) : '—'} 秒  /  ${note['durationSeconds'] is num ? curveNumber(note['durationSeconds']) : '—'} 秒',
+                                    style: theme.textTheme.bodySmall,
+                                  ),
+                                );
+                              },
                             ),
-                            decoration: const InputDecoration(
-                              labelText: '曲线节点 · 每行 位置 数值',
-                              alignLabelWithHint: true,
-                            ),
-                            onChanged: (_) => _invalidate(),
                           ),
                         ],
                       ),
-                    ] else
-                      TextField(
-                        controller: _delta,
-                        enabled: !busy,
-                        decoration: const InputDecoration(labelText: '调整增量'),
-                        onChanged: (_) => _invalidate(),
+                    if (_project['tracks'] is List)
+                      WorkbenchExpansionTile(
+                        storageId: 'inspector:tracks',
+                        tilePadding: EdgeInsets.zero,
+                        title: Text('轨道概况', style: theme.textTheme.bodySmall),
+                        children: [
+                          for (final track
+                              in (_project['tracks'] as List).whereType<Map>())
+                            _property(
+                              '${track['index'] ?? ''}',
+                              '${track['name'] ?? '未命名轨道'} · ${(track['groups'] as List? ?? []).length} 组',
+                            ),
+                        ],
                       ),
-                    const SizedBox(height: 12),
-                    FilledButton.icon(
-                      onPressed: busy || !_connected || !validSelection
-                          ? null
-                          : _previewChange,
-                      icon: const Icon(Icons.visibility_outlined, size: 16),
-                      label: const Text('生成宿主预览'),
-                    ),
                   ],
-                  if (_supportsCurves) ...[
-                    const SizedBox(height: 12),
-                    ExpansionTile(
-                      tilePadding: EdgeInsets.zero,
-                      title: const Text(
-                        '补充声库专属参数',
-                        style: TextStyle(fontSize: 12),
-                      ),
-                      children: [
-                        TextField(
-                          controller: _modeName,
-                          enabled: !busy,
-                          decoration: const InputDecoration(
-                            labelText: '声线面板原名，如 Airy',
+                ),
+                if (!validSelection)
+                  Text(
+                    _connected
+                        ? '在 SynthV 选中音符后读取，即可查看可编辑参数。'
+                        : '连接后可读取选区与参数目录。',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                if (validSelection) ...[
+                  PageSection(
+                    title: '参数编辑',
+                    children: [
+                      _choice(
+                        '参数分类',
+                        _category,
+                        const [
+                          DropdownMenuItem(
+                            value: 'automation',
+                            child: Text('通用参数'),
                           ),
-                        ),
-                        const SizedBox(height: 8),
+                          DropdownMenuItem(
+                            value: 'vocalMode',
+                            child: Text('声库声线'),
+                          ),
+                          DropdownMenuItem(value: 'pitch', child: Text('原生音高')),
+                        ],
+                        busy
+                            ? null
+                            : (value) {
+                                setState(() => _category = value!);
+                                _chooseParameter(
+                                  _categoryCatalog.keys.firstOrNull,
+                                );
+                              },
+                      ),
+                      if (_category == 'vocalMode') ...[
                         Text(
-                          '请核对当前声库面板，补充目录不会修改工程。',
+                          '目录来自当前组设置与手动补充，可能不含声库所有模式。',
                           style: theme.textTheme.bodySmall,
                         ),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: TextButton(
-                            onPressed: busy ? null : _addMode,
-                            child: const Text('补充参数'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                  if (_preview.isNotEmpty) ...[
-                    const Divider(height: 28),
-                    Text('宿主实际预览', style: theme.textTheme.titleSmall),
-                    const SizedBox(height: 10),
-                    CurvePreview(previews: [_preview]),
-                    const SizedBox(height: 8),
-                    Text(
-                      '原有 ${_preview['beforePointCount'] ?? '—'} 点 → ${_preview['pointCount'] ?? '—'} 点，精简 ${_preview['pointReduction'] ?? '—'} 点',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                    if (_preview['capabilityWarnings'] is List)
-                      for (final warning
-                          in (_preview['capabilityWarnings'] as List)
-                              .whereType<String>())
-                        Padding(
-                          padding: const EdgeInsets.only(top: 6),
-                          child: Text(
-                            warning,
+                        const SizedBox(height: 8),
+                        if (available.isNotEmpty)
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              for (final entry in available.entries)
+                                ActionChip(
+                                  label: Text(
+                                    '${entry.value['modeName'] ?? entry.key}',
+                                  ),
+                                  avatar: selected == entry.key
+                                      ? const Icon(Icons.check, size: 14)
+                                      : null,
+                                  tooltip: entry.value['source'] == 'user'
+                                      ? '用户依据声库面板补充'
+                                      : '宿主已保存声线设置',
+                                  onPressed: busy
+                                      ? null
+                                      : () => _chooseParameter(entry.key),
+                                ),
+                            ],
+                          )
+                        else
+                          Text(
+                            '尚未读取到声线。可按宿主面板原名补充，不预设 Airy / Chest / Cute。',
                             style: theme.textTheme.bodySmall,
                           ),
+                        const SizedBox(height: 10),
+                      ],
+                      if (available.isNotEmpty)
+                        _choice('调整参数', selected, [
+                          for (final entry in available.entries)
+                            DropdownMenuItem(
+                              value: entry.key,
+                              child: Text(
+                                '${entry.value['label'] ?? entry.key}',
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                        ], busy ? null : _chooseParameter),
+                      if (_category == 'pitch' && available.isEmpty)
+                        Text(
+                          rawPitch is Map
+                              ? '${rawPitch['unavailableReason'] ?? '当前桥接未开放原生音高，请更新桥接并重新读取选区。'}'
+                              : '当前桥接未返回原生音高能力，请更新桥接并重新读取选区。',
+                          style: theme.textTheme.bodySmall,
                         ),
-                    const SizedBox(height: 10),
-                    FilledButton.icon(
-                      onPressed:
-                          busy ||
-                              !_writeEnabled ||
-                              _previewEpoch != widget.api.previewEpoch
-                          ? null
-                          : _applyChange,
-                      icon: const Icon(Icons.check, size: 16),
-                      label: const Text('确认应用此预览'),
-                    ),
-                  ],
-                  const SizedBox(height: 16),
-                  OutlinedButton.icon(
-                    onPressed: busy || !_connected || !_writeEnabled
-                        ? null
-                        : _restore,
-                    icon: const Icon(Icons.undo, size: 16),
-                    label: const Text('恢复最近一次修改'),
+                      if (selected != null) ...[
+                        _property(
+                          '允许增量',
+                          _nativePitch
+                              ? '绝对 MIDI ${curveNumber(_bounds[0])}–${curveNumber(_bounds[1])}'
+                              : '±${curveNumber(_bounds[1])} ${_definition['unit'] ?? ''}',
+                        ),
+                        if (_definition['range'] is List)
+                          _property(
+                            '宿主范围',
+                            (_definition['range'] as List).join(' ～ '),
+                          ),
+                        if (currentValues is Map &&
+                            currentValues['minimum'] is num &&
+                            currentValues['maximum'] is num)
+                          _property(
+                            '当前采样',
+                            '${curveNumber(currentValues['minimum'])} ～ ${curveNumber(currentValues['maximum'])} ${_definition['unit'] ?? ''}',
+                          ),
+                        if (voiceValues is Map && voiceValues.isNotEmpty) ...[
+                          Text(
+                            '组声线设置（只读，不是自动化曲线）',
+                            style: theme.textTheme.bodySmall,
+                          ),
+                          for (final component in [
+                            ('pitch', '音高'),
+                            ('timbre', '音色'),
+                            ('pronunciation', '发音'),
+                          ])
+                            if (voiceValues[component.$1] is num)
+                              _property(
+                                component.$2,
+                                '${voiceValues[component.$1]}%',
+                              ),
+                        ],
+                        if (_supportsCurves) ...[
+                          _choice(
+                            '编辑方式',
+                            _nativePitch || _curve ? 'curve' : 'delta',
+                            [
+                              if (!_nativePitch)
+                                const DropdownMenuItem(
+                                  value: 'delta',
+                                  child: Text('整体增量'),
+                                ),
+                              const DropdownMenuItem(
+                                value: 'curve',
+                                child: Text('曲线草稿'),
+                              ),
+                            ],
+                            busy || _nativePitch
+                                ? null
+                                : (value) {
+                                    _invalidate();
+                                    setState(() => _curve = value == 'curve');
+                                  },
+                          ),
+                          _choice(
+                            '宿主表示',
+                            _renderMode,
+                            const [
+                              DropdownMenuItem(
+                                value: 'smooth',
+                                child: Text('绘制模式 · 精简曲线'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'points',
+                                child: Text('控制点模式'),
+                              ),
+                            ],
+                            busy || _nativePitch
+                                ? null
+                                : (value) {
+                                    _invalidate();
+                                    setState(() => _renderMode = value!);
+                                  },
+                          ),
+                        ],
+                        if (_nativePitch)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              '原生音高通过 PitchControlCurve 连续曲线写入；会替换选区内生成音高，不是音分增量。',
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          ),
+                        if (_curve || _nativePitch) ...[
+                          if (draft.isNotEmpty)
+                            ParameterDraftEditor(
+                              key: ValueKey('draft:$_parameter'),
+                              points: draft,
+                              bounds: _bounds,
+                              selection: _selection,
+                              parameter: _parameter!,
+                              enabled: !busy,
+                              onChanged: _changeDraft,
+                            )
+                          else
+                            Text(
+                              '草稿节点无效，请重置或在精确节点中修正。',
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 6,
+                            children: [
+                              OutlinedButton.icon(
+                                onPressed: busy || _draftHistory.isEmpty
+                                    ? null
+                                    : _undoDraft,
+                                icon: const Icon(Icons.undo, size: 15),
+                                label: const Text('撤销草稿'),
+                              ),
+                              OutlinedButton.icon(
+                                onPressed: busy
+                                    ? null
+                                    : () {
+                                        _invalidate();
+                                        setState(() {
+                                          _resetDraft();
+                                          _draftHistory.clear();
+                                        });
+                                      },
+                                icon: const Icon(Icons.restart_alt, size: 15),
+                                label: Text(_nativePitch ? '按音符重置' : '重置草稿'),
+                              ),
+                            ],
+                          ),
+                          if (_nativePitch &&
+                              (_selection['computedPitch']
+                                      as Map?)?['status'] !=
+                                  'ready')
+                            Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: Text(
+                                (_selection['computedPitch']
+                                            as Map?)?['status'] ==
+                                        'pending'
+                                    ? '宿主尚在计算音高，完成合成后重新读取。'
+                                    : '未取得宿主计算音高；图中的音符仅是乐谱参照。',
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ),
+                          WorkbenchExpansionTile(
+                            storageId: 'inspector:nodes:$_parameter',
+                            tilePadding: EdgeInsets.zero,
+                            title: Text(
+                              '精确节点 · ${draft.length}/64',
+                              style: theme.textTheme.bodySmall,
+                            ),
+                            children: [
+                              const Text(
+                                '每行：位置比例 数值。首尾为 0、1，时间严格递增。',
+                                style: TextStyle(fontSize: 11),
+                              ),
+                              const SizedBox(height: 6),
+                              TextField(
+                                key: const ValueKey('inspector-points'),
+                                controller: _points,
+                                enabled: !busy,
+                                minLines: 3,
+                                maxLines: 7,
+                                style: const TextStyle(
+                                  fontFamily: 'Consolas',
+                                  fontSize: 11,
+                                ),
+                                decoration: const InputDecoration(
+                                  hintText: '0 0\n0.5 0.05\n1 0',
+                                ),
+                                onChanged: (_) => _invalidate(),
+                              ),
+                            ],
+                          ),
+                        ] else
+                          PageProperty(
+                            label: '调整增量',
+                            child: TextField(
+                              key: const ValueKey('inspector-delta'),
+                              controller: _delta,
+                              enabled: !busy,
+                              onChanged: (_) => _invalidate(),
+                            ),
+                          ),
+                      ],
+                      if (_supportsCurves && _category == 'vocalMode')
+                        WorkbenchExpansionTile(
+                          storageId: 'inspector:add-vocal-mode',
+                          tilePadding: EdgeInsets.zero,
+                          title: Text(
+                            '补充声线模式',
+                            style: theme.textTheme.bodySmall,
+                          ),
+                          children: [
+                            TextField(
+                              key: const ValueKey('inspector-vocal-mode-name'),
+                              controller: _modeName,
+                              enabled: !busy,
+                              decoration: const InputDecoration(
+                                hintText: '按 SynthV 面板原样填写，如 Airy',
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              '仅扩展本次桥接目录，不修改工程，也不证明该声库确有此模式。',
+                              style: theme.textTheme.bodySmall,
+                            ),
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: TextButton(
+                                onPressed: busy ? null : _addMode,
+                                child: const Text('补充参数'),
+                              ),
+                            ),
+                          ],
+                        ),
+                    ],
                   ),
-                ],
-                if (_message != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 14),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                  if ((_selection['capabilityWarnings'] as List? ?? [])
+                      .isNotEmpty)
+                    WorkbenchExpansionTile(
+                      storageId: 'inspector:capabilities',
+                      tilePadding: EdgeInsets.zero,
+                      title: Text('能力与限制', style: theme.textTheme.bodySmall),
                       children: [
-                        Icon(
-                          _error ? Icons.error_outline : Icons.info_outline,
-                          size: 15,
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: SelectableText(
-                            _message!,
-                            style: theme.textTheme.bodySmall,
+                        for (final warning
+                            in (_selection['capabilityWarnings'] as List)
+                                .whereType<String>())
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              warning,
+                              style: theme.textTheme.bodySmall,
+                            ),
                           ),
+                      ],
+                    ),
+                  if (_preview.isNotEmpty)
+                    PageSection(
+                      title: validPreview ? '宿主实际预览' : '预览已失效',
+                      children: [
+                        CurvePreview(previews: [_preview]),
+                        const SizedBox(height: 8),
+                        Text(
+                          '原有 ${_preview['beforePointCount'] ?? '—'} 点 → ${_preview['pointCount'] ?? '—'} 点，精简 ${_preview['pointReduction'] ?? '—'} 点',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                        if (_preview['capabilityWarnings'] is List)
+                          for (final warning
+                              in (_preview['capabilityWarnings'] as List)
+                                  .whereType<String>())
+                            Padding(
+                              padding: const EdgeInsets.only(top: 6),
+                              child: Text(
+                                warning,
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ),
+                        WorkbenchExpansionTile(
+                          storageId: 'inspector:preview-details',
+                          tilePadding: EdgeInsets.zero,
+                          title: Text('修改明细', style: theme.textTheme.bodySmall),
+                          children: [
+                            _property(
+                              '参数',
+                              _preview['label'] ?? _preview['parameter'],
+                            ),
+                            _property(
+                              '表示方式',
+                              _preview['representation'] ??
+                                  _preview['renderMode'],
+                            ),
+                            _property('宿主摘要', _preview['summary']),
+                            _property(
+                              '时间范围',
+                              '${_preview['startSeconds'] ?? '—'}–${_preview['endSeconds'] ?? '—'} 秒',
+                            ),
+                          ],
                         ),
                       ],
                     ),
+                ],
+              ],
+            ),
+          ),
+          if (_message != null)
+            PageNotice(
+              message: _message!,
+              onDismiss: () => setState(() => _message = null),
+            ),
+          // 应用与恢复始终可见，不要求用户滚过整段音符、参数和曲线后寻找确认入口。
+          PageFooter(
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed:
+                        busy ||
+                            !_connected ||
+                            !validSelection ||
+                            selected == null
+                        ? null
+                        : _previewChange,
+                    child: const Text('生成预览'),
                   ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: busy || !_writeEnabled || !validPreview
+                        ? null
+                        : _applyChange,
+                    child: const Text('确认应用'),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                IconButton(
+                  tooltip: '恢复最近一次宿主修改',
+                  onPressed: busy || !_connected || !_writeEnabled
+                      ? null
+                      : _restore,
+                  icon: const Icon(Icons.undo, size: 17),
+                ),
               ],
             ),
           ),
@@ -724,173 +1072,4 @@ class _InspectorState extends State<Inspector> {
       );
     },
   );
-}
-
-/// 手绘只编辑本地草稿，不请求宿主。拖动结束后精简近似共线点，保留范围外草稿。
-class _DraftPad extends StatefulWidget {
-  const _DraftPad({
-    required this.points,
-    required this.bounds,
-    required this.enabled,
-    required this.onChanged,
-  });
-  final List<List<double>> points;
-  final List<double> bounds;
-  final bool enabled;
-  final ValueChanged<List<List<double>>> onChanged;
-  @override
-  State<_DraftPad> createState() => _DraftPadState();
-}
-
-class _DraftPadState extends State<_DraftPad> {
-  final List<List<double>> _stroke = [];
-  double _width = 1;
-
-  void _record(Offset position) {
-    final x = ((position.dx - 6) / math.max(1, _width - 12)).clamp(0.0, 1.0);
-    final y =
-        widget.bounds[1] -
-        ((position.dy - 8) / 129).clamp(0.0, 1.0) *
-            (widget.bounds[1] - widget.bounds[0]);
-    setState(() {
-      _stroke.removeWhere((point) => (point[0] - x).abs() < .005);
-      _stroke.add([x, y]);
-    });
-  }
-
-  List<List<double>> _simplify(List<List<double>> points) {
-    if (points.length <= 2) return points;
-    final first = points.first, last = points.last;
-    double maximum = 0;
-    var index = 0;
-    for (var i = 1; i < points.length - 1; i++) {
-      final expected =
-          first[1] +
-          (last[1] - first[1]) *
-              (points[i][0] - first[0]) /
-              math.max(1e-12, last[0] - first[0]);
-      final error = (points[i][1] - expected).abs();
-      if (error > maximum) {
-        maximum = error;
-        index = i;
-      }
-    }
-    if (maximum <= (widget.bounds[1] - widget.bounds[0]) * .005) {
-      return [first, last];
-    }
-    return [
-      ..._simplify(points.sublist(0, index + 1))
-          .takeWhile((p) => !identical(p, points[index])),
-      ..._simplify(points.sublist(index)),
-    ];
-  }
-
-  void _finish() {
-    if (_stroke.isEmpty) return;
-    _stroke.sort((a, b) => a[0].compareTo(b[0]));
-    final merged = [
-      ...widget.points.where(
-        (p) => p[0] < _stroke.first[0] || p[0] > _stroke.last[0],
-      ),
-      ..._stroke,
-    ]..sort((a, b) => a[0].compareTo(b[0]));
-    if (merged.first[0] != 0) merged.insert(0, [0, merged.first[1]]);
-    if (merged.last[0] != 1) merged.add([1, merged.last[1]]);
-    final reduced = _simplify(merged);
-    setState(() => _stroke.clear());
-    if (reduced.length > 64) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('手绘复杂度超过 64 点，未替换草稿；请分段减少起伏。')),
-      );
-      return;
-    }
-    widget.onChanged(reduced);
-  }
-
-  @override
-  Widget build(BuildContext context) => LayoutBuilder(
-    builder: (context, constraints) {
-      _width = constraints.maxWidth;
-      return DecoratedBox(
-        decoration: BoxDecoration(
-          border: Border.all(
-            color: Theme.of(context).colorScheme.outlineVariant,
-          ),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: MouseRegion(
-          cursor: widget.enabled
-              ? SystemMouseCursors.precise
-              : SystemMouseCursors.basic,
-          child: GestureDetector(
-            onPanStart: widget.enabled
-                ? (event) {
-                    _stroke.clear();
-                    _record(event.localPosition);
-                  }
-                : null,
-            onPanUpdate: widget.enabled
-                ? (event) => _record(event.localPosition)
-                : null,
-            onPanEnd: widget.enabled ? (_) => _finish() : null,
-            onPanCancel: () => setState(() => _stroke.clear()),
-            child: CustomPaint(
-              size: Size.infinite,
-              painter: _DraftPainter(
-                points: _stroke.isEmpty
-                    ? widget.points
-                    : (_stroke.toList()..sort((a, b) => a[0].compareTo(b[0]))),
-                bounds: widget.bounds,
-                color: Theme.of(context).colorScheme.onSurface,
-              ),
-            ),
-          ),
-        ),
-      );
-    },
-  );
-}
-
-class _DraftPainter extends CustomPainter {
-  _DraftPainter({
-    required this.points,
-    required this.bounds,
-    required this.color,
-  });
-  final List<List<double>> points;
-  final List<double> bounds;
-  final Color color;
-  @override
-  void paint(Canvas canvas, Size size) {
-    final rect = Rect.fromLTRB(6, 8, size.width - 6, size.height - 8);
-    for (var i = 1; i <= 3; i++) {
-      canvas.drawLine(
-        Offset(rect.left, rect.top + rect.height * i / 4),
-        Offset(rect.right, rect.top + rect.height * i / 4),
-        Paint()..color = color.withValues(alpha: .08),
-      );
-    }
-    final path = Path();
-    for (var i = 0; i < points.length; i++) {
-      final x = rect.left + points[i][0] * rect.width;
-      final y =
-          rect.bottom -
-          (points[i][1] - bounds[0]) / (bounds[1] - bounds[0]) * rect.height;
-      if (i == 0) {
-        path.moveTo(x, y);
-      } else {
-        path.lineTo(x, y);
-      }
-    }
-    canvas.drawPath(
-      path,
-      Paint()
-        ..color = color
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.8,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant _DraftPainter oldDelegate) => true;
 }

@@ -225,6 +225,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
                   ],
                 ),
                 const PageNotes(
+                  storageId: 'connection-notes',
                   children: [
                     Text('连接目标与资料目录分别保存。连接旧脚本不会移动会话、音频或密钥。'),
                     SizedBox(height: 8),

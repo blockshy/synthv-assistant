@@ -171,6 +171,18 @@ class ParameterTests(unittest.TestCase):
         self.assertEqual(public["vocalMode_Soft"]["source"], "user")
         self.assertNotIn("source", public["tension"])
 
+    def test_voicing_uses_current_catalog_and_voice_values_are_readonly_bounded_metadata(self):
+        self.assertEqual(validate_change("voicing", 0.3, selection=self.selection)["delta"], 0.3)
+        with self.assertRaises(ParameterError):
+            validate_change("voicing", 0.31, selection=self.selection)
+        with self.assertRaises(ParameterError):
+            validate_change("voicing", 0.1, selection={})
+        mode = self.selection["parameters"]["vocalMode_Soft"]
+        mode["voiceValues"] = {"pitch": 150, "timbre": True, "pronunciation": -1, "path": "private"}
+        self.assertEqual(public_parameter_catalog(self.selection)["vocalMode_Soft"]["voiceValues"], {"pitch": 150})
+        with self.assertRaises(ParameterError):
+            validate_change("vocalMode_Soft_pitch", 10, selection=self.selection)
+
     def test_public_preview_normalizes_unavailable_before_and_strips_private_fields(self):
         source = {"previewId": "test", "curvePreview": [{"position": 0, "after": 60},
                   {"position": 1, "before": 61, "after": 62}], "curve": [[0, 60], [1, 62]],

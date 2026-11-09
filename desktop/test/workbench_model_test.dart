@@ -235,9 +235,6 @@ void main() {
     expect(model.capabilities, isEmpty);
     failed.completeError(const ApiException('合成能力读取失败'));
     await opened;
-    model.attachments = [
-      {'kind': 'recording', 'id': 'fixture-audio'},
-    ];
     expect(model.modelId, 'gpt-audio');
     expect(model.capabilities, isEmpty);
     expect(model.error, '合成能力读取失败');

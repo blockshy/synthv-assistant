@@ -693,16 +693,16 @@ class ConversationTests(unittest.TestCase):
             self.send()
         self.planner.assert_not_called()
 
-    def test_attachments_use_resolved_paths_but_persist_only_public_metadata(self):
+    def test_new_audio_attachments_are_rejected_without_reading_or_saving(self):
         identifier = "a" * 32
         path = self.directory / "not-read.wav"
         self.assets.return_value = ([path], [{"kind": "upload", "id": identifier, "name": "示例.wav",
                                             "url": "/uploads/" + identifier + ".wav", "projectFile": "do-not-leak"}])
-        result = self.send(include_selection=False, attachments=[{"kind": "upload", "id": identifier}])
-        self.assertEqual(self.planner.call_args.args[3], [path])
-        self.assertNotIn("projectFile", self.planner.call_args.args[4][0])
-        self.assertEqual(result["messages"][0]["attachments"][0]["name"], "示例.wav")
-        self.assertNotIn("do-not-leak", json.dumps(result))
+        with self.assertRaisesRegex(ConversationError, "停止接收"):
+            self.send(include_selection=False, attachments=[{"kind": "upload", "id": identifier}])
+        self.assets.assert_not_called()
+        self.planner.assert_not_called()
+        self.assertEqual(self.read_saved()["messages"], [])
 
     def test_model_failure_is_persisted_as_redacted_error_message(self):
         self.planner.side_effect = RuntimeError("apiKey=sk-fictional-secret https://private.example")
@@ -827,27 +827,19 @@ class ConversationTests(unittest.TestCase):
             self.manager.restore_conversation(self.identifier)
             self.assertEqual(self.manager.list_conversations()["items"][0]["id"], self.identifier)
 
-    def test_model_request_holds_conversation_and_audio_delete_locks(self):
-        audio_id = "e" * 32
-        attachment = {"kind": "upload", "id": audio_id}
-        self.assets.return_value = ([self.directory / "fake.wav"], [{**attachment, "label": "音频", "note": "private-audio-note"}])
-
+    def test_text_model_request_holds_conversation_delete_lock(self):
         def planning(*args, **_options):
             # 同步调用替身代表模型正在运行；删除与备注修改必须非阻塞拒绝。
             with self.assertRaises(ValueError):
                 self.manager.delete_conversation(self.identifier)
             with self.assertRaises(ValueError):
-                self.manager.library.delete("upload", audio_id, "使用中")
-            with self.assertRaises(ValueError):
                 self.manager.purge_conversation(self.identifier, {"confirm": True})
-            with self.assertRaises(ValueError):
-                self.manager.library.purge("upload", audio_id, {"confirm": True})
-            self.assertNotIn("private-audio-note", str(args))
+            self.assertEqual(args[3:5], ([], []))
             return self.plan
 
         self.planner.side_effect = planning
-        self.send(include_selection=False, attachments=[attachment])
-        self.assertIsNone(self.manager.library.read("upload", audio_id)["deletedAt"])
+        self.send(include_selection=False)
+        self.assets.assert_not_called()
 
     def test_history_attachment_is_unavailable_after_delete_and_available_after_restore(self):
         identifier = "f" * 32
@@ -856,8 +848,12 @@ class ConversationTests(unittest.TestCase):
         (directory / (identifier + ".wav")).write_bytes(b"fake-audio-only-used-as-file-marker")
         (directory / (identifier + ".json")).write_text("{}", encoding="utf-8")
         attachment = {"kind": "upload", "id": identifier}
-        self.assets.return_value = ([directory / (identifier + ".wav")], [{**attachment, "name": "历史片段"}])
-        first = self.send(include_selection=False, attachments=[attachment])
+        # 直接构造升级前已存在的历史消息；新版不能通过新发送入口制造音频记录。
+        self.send(include_selection=False)
+        document = self.read_saved()
+        document["messages"][0]["attachments"] = [{**attachment, "name": "历史片段"}]
+        self.manager._save(document)
+        first = self.manager.get_conversation(self.identifier)
         self.assertTrue(first["messages"][0]["attachments"][0]["available"])
         self.manager.library.delete("upload", identifier, "历史片段")
         history = self.manager.get_conversation(self.identifier)["messages"][0]["attachments"][0]

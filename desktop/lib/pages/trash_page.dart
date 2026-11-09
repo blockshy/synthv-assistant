@@ -32,6 +32,8 @@ class _TrashPageState extends State<TrashPage> {
         setState(() {
           _items = (result['items'] as List)
               .map((item) => Map<String, dynamic>.from(item as Map))
+              // 音频入口已退役；历史素材及其回收标记保持原样，仅管理会话。
+              .where((item) => item['kind'] == 'conversation')
               .toList();
           _error = null;
         });

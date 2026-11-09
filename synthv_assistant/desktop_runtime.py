@@ -17,7 +17,7 @@ import time
 
 
 PROTOCOL_VERSION = 1
-APPLICATION_VERSION = "0.3.0"
+APPLICATION_VERSION = "0.4.0"
 
 
 def configure_desktop_data() -> Path:

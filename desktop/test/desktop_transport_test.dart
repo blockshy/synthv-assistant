@@ -148,16 +148,34 @@ Future<void> _exerciseTransport({required bool ownerEof}) async {
 
     final wav = _syntheticWav();
     final file = await File('${temporary.path}/合成测试音频.wav').writeAsBytes(wav);
-    final uploaded = await client
-        .uploadFile(file.path)
-        .timeout(
-          const Duration(seconds: 8),
-          onTimeout: () => throw TimeoutException('阶段：上传合成音频（含首次 NumPy 加载）'),
-        );
-    expect(uploaded['name'], '合成测试音频.wav');
-    expect(uploaded['durationSeconds'], closeTo(.1, .0001));
+    // 新上传返回明确的退役错误，不能被连接重置掩盖为“结果未知”。
+    await expectLater(
+      client.uploadFile(file.path).timeout(const Duration(seconds: 8)),
+      throwsA(
+        isA<ApiException>().having((e) => e.message, '退役说明', contains('已移除')),
+      ),
+    );
+    expect((await client.getJson('/api/uploads'))['items'], isEmpty);
+    // 直接种入升级前的合成历史资料，只验证受控读取仍兼容；不通过退役上传入口。
+    const assetId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    final stored = Directory('${data.path}/uploads')
+      ..createSync(recursive: true);
+    await File('${stored.path}/$assetId.wav').writeAsBytes(wav);
+    await File('${stored.path}/$assetId.json').writeAsString(
+      jsonEncode({
+        'id': assetId,
+        'kind': 'upload',
+        'name': '历史合成.wav',
+        'label': '历史合成',
+        'url': '/uploads/$assetId.wav',
+        'format': 'wav',
+        'durationSeconds': .1,
+        'createdAt': '2026-01-01T00:00:00Z',
+        'analysis': <String, dynamic>{},
+      }),
+    );
     final readback = await client
-        .readAudio(uploaded['url'] as String)
+        .readAudio('/uploads/$assetId.wav')
         .timeout(
           const Duration(seconds: 8),
           onTimeout: () => throw TimeoutException('阶段：读取合成音频'),
@@ -204,27 +222,23 @@ Future<void> _exerciseTransport({required bool ownerEof}) async {
 
 void main() {
   for (final eof in [false, true]) {
-    test(
-      '真实 Dart/Python 本机传输、并发、音频及 ${eof ? 'EOF' : 'shutdown'} 退出不经过代理',
-      () async {
-        final badProxy = HttpClient.findProxyFromEnvironment(
-          Uri.parse('http://127.0.0.1:12345/api/status'),
-          environment: {'http_proxy': 'http://127.0.0.1:1', 'no_proxy': ''},
-        );
-        expect(badProxy, startsWith('PROXY'));
-        var proxyLookups = 0;
-        await HttpOverrides.runZoned(
-          () async {
-            await _exerciseTransport(ownerEof: eof);
-          },
-          findProxyFromEnvironment: (uri, environment) {
-            proxyLookups++;
-            return badProxy;
-          },
-        );
-        expect(proxyLookups, 0, reason: '本机认证令牌和音频必须直连回环服务，不允许交给环境代理');
-      },
-      timeout: const Timeout(Duration(minutes: 2)),
-    );
+    test('真实本机传输、音频退役与历史读取及 ${eof ? 'EOF' : 'shutdown'} 退出不经过代理', () async {
+      final badProxy = HttpClient.findProxyFromEnvironment(
+        Uri.parse('http://127.0.0.1:12345/api/status'),
+        environment: {'http_proxy': 'http://127.0.0.1:1', 'no_proxy': ''},
+      );
+      expect(badProxy, startsWith('PROXY'));
+      var proxyLookups = 0;
+      await HttpOverrides.runZoned(
+        () async {
+          await _exerciseTransport(ownerEof: eof);
+        },
+        findProxyFromEnvironment: (uri, environment) {
+          proxyLookups++;
+          return badProxy;
+        },
+      );
+      expect(proxyLookups, 0, reason: '本机认证令牌和音频必须直连回环服务，不允许交给环境代理');
+    }, timeout: const Timeout(Duration(minutes: 2)));
   }
 }

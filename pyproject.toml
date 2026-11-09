@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "synthv-assistant"
 version = "0.1.0"
-description = "Synthesizer V Studio 2 本地调教与听音助手"
+description = "Synthesizer V Studio 2 本地调教参数工作台"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"

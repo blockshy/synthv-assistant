@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../core/api.dart';
+import '../widgets/workbench_dropdown.dart';
+import '../widgets/workbench_expansion_tile.dart';
 import 'page_chrome.dart';
 
 /// 模型服务按“平台列表 → 连接配置 → 模型目录”组织。外层工作台通过公开的
@@ -689,7 +691,7 @@ class SettingsPageState extends State<SettingsPage> {
             Padding(
               padding: const EdgeInsets.only(bottom: 14),
               child: Text(
-                '内置平台同时用于独立 A/B 听评与 MCP 听评；新会话默认可单独指定。',
+                '内置平台保留为默认配置兼容入口；新会话默认平台可单独指定。',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),
@@ -722,12 +724,9 @@ class SettingsPageState extends State<SettingsPage> {
                 ),
               PageProperty(
                 label: '服务类型',
-                child: DropdownButtonFormField<String>(
+                child: WorkbenchDropdown<String>(
                   key: ValueKey('provider:$_selectedId:$_provider'),
-                  initialValue: _provider,
-                  isExpanded: true,
-                  iconSize: 18,
-                  style: Theme.of(context).textTheme.bodyMedium,
+                  value: _provider,
                   items: [
                     for (final entry in _protocols.entries)
                       DropdownMenuItem(
@@ -820,7 +819,8 @@ class SettingsPageState extends State<SettingsPage> {
                 ),
             ],
           ),
-          ExpansionTile(
+          WorkbenchExpansionTile(
+            storageId: 'provider-advanced:${_selectedId ?? "new"}',
             tilePadding: EdgeInsets.zero,
             childrenPadding: const EdgeInsets.only(top: 8),
             dense: true,

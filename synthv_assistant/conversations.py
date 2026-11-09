@@ -461,14 +461,10 @@ class ConversationManager:
             raise ConversationError("请输入 1 至 4000 个字符的调教要求。")
         if not isinstance(include_selection, bool):
             raise ConversationError("是否包含选区必须是布尔值。")
-        if not isinstance(attachments, list) or len(attachments) > 2:
-            raise ConversationError("一次最多选择两个音频附件。")
-        for item in attachments:
-            if (not isinstance(item, dict) or set(item) != {"kind", "id"}
-                    or not isinstance(item.get("kind"), str)
-                    or item.get("kind") not in {"upload", "recording"}):
-                raise ConversationError("附件必须通过已上传音频或录音编号选择。")
-            _identifier(item.get("id"))
+        # 保留旧会话的附件字段和资源索引，但新请求不再接收音频。
+        # 在锁定资料、保存消息、读取文件或模型调用之前拒绝所有旧客户端附件。
+        if not isinstance(attachments, list) or attachments:
+            raise ConversationError("音频附件已停止接收，请仅发送文字和选区；历史资料不受影响。")
         text = text.strip()
         with self._lock(identifier), self.library.use_assets(attachments):
             # 本锁只阻止同一会话重复发送；模型等待期间其他会话和本地录音仍可进行。

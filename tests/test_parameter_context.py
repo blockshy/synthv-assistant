@@ -173,7 +173,8 @@ for index=1,64 do host.voice.vocalModeParams["Mode"..index]={} end
 ''')
         catalog = self.selection()["parameters"]
         summaries = [item["currentValues"] for item in catalog.values() if "currentValues" in item]
-        self.assertEqual(len(summaries), 71)
+        # 八项通用自动化与 64 项声线共用同一采样预算，新增通道不能突破上限。
+        self.assertEqual(len(summaries), 72)
         self.assertLessEqual(sum(len(item["samples"]) for item in summaries), 512)
         self.assertTrue(all(2 <= len(item["samples"]) <= 33 for item in summaries))
         self.assertTrue(all(item["samples"][0][0] == 0 and item["samples"][-1][0] == 1 for item in summaries))

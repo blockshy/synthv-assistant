@@ -82,10 +82,11 @@ Future<void> _openPicker(
   List<JsonMap> platforms = _platforms,
   String modelId = '',
   bool settle = true,
+  Brightness brightness = Brightness.dark,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
-      theme: WorkbenchTheme.build(Brightness.dark),
+      theme: WorkbenchTheme.build(brightness),
       home: Builder(
         builder: (context) => Scaffold(
           body: TextButton(
@@ -131,6 +132,62 @@ Future<void> _switchToSecond(WidgetTester tester, {bool settle = true}) async {
 }
 
 void main() {
+  for (final brightness in Brightness.values) {
+    testWidgets('模型服务下拉与搜索框在 $brightness 下边框等高且正文不变粗', (tester) async {
+      final api = _CatalogApi();
+      addTearDown(api.dispose);
+      await _openPicker(tester, api, [], brightness: brightness);
+      // InputDecorator 本身的布局高度仍可能包含未填色的空白；通过其公开的
+      // containerOf 读取真正绘制边框与填充的区域，避免只测外框而漏掉 24px 矮框。
+      final dropdown = find.descendant(
+        of: find.byKey(const ValueKey('model-picker-platform-first')),
+        matching: find.byType(InputDecorator),
+      );
+      final search = find.descendant(
+        of: find.byKey(const ValueKey('model-picker-search')),
+        matching: find.byType(InputDecorator),
+      );
+      final dropdownText = find.descendant(
+        of: dropdown,
+        matching: find.text('主服务'),
+      );
+      final searchText = find.descendant(
+        of: search,
+        matching: find.byType(EditableText),
+      );
+      final dropdownContainer = InputDecorator.containerOf(
+        tester.element(dropdownText),
+      )!;
+      final searchContainer = InputDecorator.containerOf(
+        tester.element(searchText),
+      )!;
+      final dropdownRect =
+          dropdownContainer.localToGlobal(Offset.zero) & dropdownContainer.size;
+      final searchRect =
+          searchContainer.localToGlobal(Offset.zero) & searchContainer.size;
+      expect(dropdownRect.height, WorkbenchTheme.controlHeight);
+      expect(dropdownRect.height, searchRect.height);
+      expect(dropdownRect.top, searchRect.top);
+      expect(
+        tester.getCenter(dropdownText).dy,
+        closeTo(tester.getCenter(searchText).dy, 1),
+      );
+      final field = tester.widget<DropdownButtonFormField<String>>(
+        find.byType(DropdownButtonFormField<String>),
+      );
+      // DropdownButtonFormField 没有公开 style；检验最终渲染树中的下拉按钮。
+      final button = tester.widget<DropdownButton<String>>(
+        find.descendant(
+          of: find.byWidget(field),
+          matching: find.byType(DropdownButton<String>),
+        ),
+      );
+      expect(button.style?.fontSize, 13);
+      expect(button.style?.fontWeight, FontWeight.w400);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
   testWidgets('切换服务与编辑草稿后取消，不返回配置且不执行任何写入', (tester) async {
     final api = _CatalogApi();
     addTearDown(api.dispose);

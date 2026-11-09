@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../core/api.dart';
 import 'curve_preview.dart';
+import 'workbench_expansion_tile.dart';
 
 List<JsonMap> _objects(dynamic value) => value is List
     ? value
@@ -350,8 +351,9 @@ class _ProposalCardState extends State<ProposalCard> {
         .where((e) => e['actionId'] == action['id'])
         .map((e) => e['message'])
         .join('\n');
-    return ExpansionTile(
-      key: ValueKey(action['id']),
+    return WorkbenchExpansionTile(
+      // 展开状态使用独立存储键，不能继承消息列表的滚动偏移存储位置。
+      storageId: 'proposal-action-${action['id']}',
       tilePadding: EdgeInsets.zero,
       childrenPadding: const EdgeInsets.only(bottom: 10),
       title: Text(

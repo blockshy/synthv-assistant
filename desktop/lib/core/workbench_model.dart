@@ -8,7 +8,7 @@ List<JsonMap> maps(dynamic value) => value is List
     ? value.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
     : <JsonMap>[];
 
-/// 会话状态独立于页面生命周期，切换素材/设置后仍保留未发送文字和附件。
+/// 会话状态独立于页面生命周期，切换工程/设置后仍保留未发送文字。
 /// 新消息先在内存显示，正式记录返回后按旧消息编号去重，不伪造持久化成功。
 class WorkbenchModel extends ChangeNotifier {
   WorkbenchModel(this.api);
@@ -24,7 +24,6 @@ class WorkbenchModel extends ChangeNotifier {
   String? pendingJobId;
   String error = '';
   String draft = '';
-  List<JsonMap> attachments = [];
   String platformId = 'default';
   String modelId = '';
   String reasoning = 'default';
@@ -39,7 +38,7 @@ class WorkbenchModel extends ChangeNotifier {
   int _catalogGeneration = 0;
   Timer? _timer;
   DateTime? _startedAt;
-  final Map<String, (String, List<JsonMap>)> _drafts = {};
+  final Map<String, String> _drafts = {};
   Set<String> _previousIds = {};
   Future<void> _preferenceQueue = Future<void>.value();
   String? _submittedConversationId;
@@ -84,9 +83,6 @@ class WorkbenchModel extends ChangeNotifier {
       return '请先完成所选服务的连接配置。';
     }
     if (effectiveModel.isEmpty) return '请选择本次会话使用的模型。';
-    if (attachments.isNotEmpty && capabilities['audioInput'] == 'unsupported') {
-      return '当前模型不支持音频，请更换模型或移除附件。';
-    }
     return null;
   }
 
@@ -147,8 +143,7 @@ class WorkbenchModel extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _storeDraft() =>
-      _drafts[conversationId] = (draft, List<JsonMap>.from(attachments));
+  void _storeDraft() => _drafts[conversationId] = draft;
 
   Future<void> openConversation(String id) async {
     if (navigationBusy ||
@@ -172,8 +167,7 @@ class WorkbenchModel extends ChangeNotifier {
       conversation = result;
       _draftModelChosen = false;
       final saved = _drafts[id];
-      draft = saved?.$1 ?? '';
-      attachments = List<JsonMap>.from(saved?.$2 ?? []);
+      draft = saved ?? '';
       pendingMessage = null;
       error = '';
       _readOptions();
@@ -209,7 +203,6 @@ class WorkbenchModel extends ChangeNotifier {
       _draftModelChosen = false;
       api.invalidatePreviews();
       draft = '';
-      attachments = [];
       pendingMessage = null;
       error = '';
       _readOptions();
@@ -370,19 +363,6 @@ class WorkbenchModel extends ChangeNotifier {
     return _preferenceQueue;
   }
 
-  void attach(List<JsonMap> clips) {
-    final combined = <String, JsonMap>{
-      for (final clip in [...attachments, ...clips])
-        '${clip['kind']}:${clip['id']}': clip,
-    };
-    if (combined.length > 2) {
-      error = '每条消息最多附带两段音频，请先移除已有附件。';
-    } else {
-      attachments = combined.values.toList();
-    }
-    notifyListeners();
-  }
-
   Future<void> send() async {
     if (navigationBusy ||
         sending ||
@@ -398,7 +378,9 @@ class WorkbenchModel extends ChangeNotifier {
       return;
     }
     final text = draft.trim();
-    final clips = List<JsonMap>.from(attachments);
+    // 新版工作台只发送文字与显式选区。旧会话附件仅留在历史消息字段，
+    // 不进入草稿，也不能因当前模型不支持音频而阻止文字发送。
+    final clips = <JsonMap>[];
     if (text.length > 4000) {
       error = '每条消息最多 4,000 字符。';
       notifyListeners();
@@ -419,7 +401,6 @@ class WorkbenchModel extends ChangeNotifier {
       'delivery': '正在提交',
     };
     draft = '';
-    attachments = [];
     error = '';
     _beginProgress();
     api.invalidatePreviews();
@@ -462,7 +443,6 @@ class WorkbenchModel extends ChangeNotifier {
       await _failed(e);
       if (pendingJobId == null && draft.isEmpty) {
         draft = text;
-        attachments = clips;
       }
     } finally {
       _endProgress();

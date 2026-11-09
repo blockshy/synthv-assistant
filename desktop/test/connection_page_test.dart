@@ -151,12 +151,17 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('读取当前选区'));
     await tester.pumpAndSettle();
-    expect(find.text('生成宿主预览'), findsOneWidget);
+    // 新检查器把操作固定在底栏；选区失效时禁用按钮，而不是移除整行操作。
+    final preview = find.widgetWithText(OutlinedButton, '生成预览');
+    expect(tester.widget<OutlinedButton>(preview).onPressed, isNotNull);
+    expect(find.byKey(const ValueKey('inspector-choice:参数分类')), findsOneWidget);
     final previousEpoch = api.previewEpoch;
     api.session = 'another-session';
     await tester.pump(const Duration(seconds: 4));
     await tester.pumpAndSettle();
-    expect(find.text('生成宿主预览'), findsNothing);
+    expect(tester.widget<OutlinedButton>(preview).onPressed, isNull);
+    expect(find.byKey(const ValueKey('inspector-choice:参数分类')), findsNothing);
+    expect(find.byKey(const ValueKey('inspector-delta')), findsNothing);
     expect(api.previewEpoch, greaterThan(previousEpoch));
     expect(api.posts, isEmpty);
     await tester.pumpWidget(const SizedBox.shrink());

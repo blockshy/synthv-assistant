@@ -1,12 +1,12 @@
 --[[
-SynthV Assistant：面向 Studio 2.2.1 的小范围桥接。
+SynthV Assistant：面向 Studio 2.1.2 及以上、按运行时能力检测的选区桥接。
 只执行下方白名单中的动作，不执行来自模型的 Lua/系统命令。
 参数修改采用“预览 → 检查选区和原始曲线 → 应用”的流程；默认只读。
 JSON 解析器及 IPC_DIR 由 Python 安装器注入本文件前部。
 ]]
 
 function getClientInfo()
-  return {name="SynthV Assistant", category="SynthV Assistant", author="Local", versionNumber=2, minEditorVersion=0x020102}
+  return {name="SynthV Assistant", category="SynthV Assistant", author="Local", versionNumber=3, minEditorVersion=0x020102}
 end
 
 local session = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock()*1000000))
@@ -18,7 +18,7 @@ local stopping=false
 -- 此表只活在桥接会话内，不写工程、声库或默认声线，也不接收模型自动注册。
 local declaredModes={}
 -- 通用参数与声库参数共用目录，但后者必须由当前宿主真实返回，不能按名称猜测。
-local parameterOrder={"breathiness","tension","loudness","gender","pitchDelta","toneShift","vibratoEnv"}
+local parameterOrder={"breathiness","tension","loudness","gender","pitchDelta","toneShift","vibratoEnv","voicing"}
 local parameterSpecs={
   breathiness={label="气声",unit="参数值",limit=0.3,tolerance=0.002},
   tension={label="张力",unit="参数值",limit=0.3,tolerance=0.002},
@@ -27,6 +27,7 @@ local parameterSpecs={
   pitchDelta={label="音高偏移",unit="音分",limit=100,tolerance=0.5},
   toneShift={label="音色偏移",unit="音分",limit=200,tolerance=0.5},
   vibratoEnv={label="颤音包络",unit="参数值",limit=0.3,tolerance=0.002},
+  voicing={label="浊音 / 清音",unit="参数值",limit=0.3,tolerance=0.002},
 }
 -- 限制预演成本，避免在编辑器的脚本回调中进行无界计算。
 local MAX_CURVE_POINTS, OUTSIDE_EPSILON = 4000, 1e-7
@@ -115,7 +116,14 @@ local function voiceContext(editor,ref)
     if type(voice.vocalModeParams)=="table" then
       for name,values in pairs(voice.vocalModeParams) do
         if type(name)=="string" and #name>0 and #name<=80 and not name:find("%c") and type(values)=="table" then
-          modes[name]=values
+          -- 非主组只覆盖部分维度时逐项继承主组值，不能用一个 timbre 覆盖项
+          -- 丢掉宿主已经提供的 pitch/pronunciation。三维值只是声线默认设置，
+          -- 不冒充 vocalMode_Name 自动化，也不补造缺失维度的默认值。
+          local combined=modes[name] or {}
+          for _,dimension in ipairs({"pitch","timbre","pronunciation"}) do
+            if values[dimension]~=nil then combined[dimension]=values[dimension] end
+          end
+          modes[name]=combined
         end
       end
     end
@@ -145,7 +153,22 @@ local function parameterCatalog(editor,ref,group)
   for _,name in ipairs(parameterOrder) do register(name,parameterSpecs[name]) end
   local names={}; for name,_ in pairs(modes) do names[#names+1]=name end; table.sort(names)
   if #names>64 then error("声线模式数量超过当前目录上限，未读取编辑能力。") end
-  for _,name in ipairs(names) do register("vocalMode_"..name,{label=name,unit="百分点",limit=30},name) end
+  local modeItems={}
+  for _,name in ipairs(names) do
+    local parameter="vocalMode_"..name
+    register(parameter,{label=name,unit="百分点",limit=30},name)
+    local values={}
+    for _,dimension in ipairs({"pitch","timbre","pronunciation"}) do
+      local value=modes[name][dimension]
+      if finite(value) and value>=0 and value<=150 then values[dimension]=value end
+    end
+    local source=declared[name] and "user" or "host"
+    if catalog[parameter] and next(values) then catalog[parameter].voiceValues=values end
+    -- 目录保留宿主已报告但自动化不可访问的模式，UI 可以说明不可绘制原因，
+    -- 不能因为读取不到通道而假装声库没有该模式。complete 永远不夸大为完整枚举。
+    modeItems[#modeItems+1]={name=name,parameter=parameter,source=source,
+      available=catalog[parameter]~=nil and catalog[parameter].available,values=next(values) and values or nil}
+  end
   if NativePitch then
     local ok,details=pcall(NativePitch.describe,group,ref)
     catalog.pitchCurve={kind="pitch",label="原生音高曲线",unit="MIDI 半音",range={0,127},defaultValue=0,
@@ -153,7 +176,7 @@ local function parameterCatalog(editor,ref,group)
       fingerprint=ok and fingerprint(details.fingerprint) or "unavailable",
       unavailableReason=not (ok and details.available) and (ok and details.message or "原生音高能力检测失败。") or nil}
   end
-  return catalog,voiceFingerprint,#names
+  return catalog,voiceFingerprint,#names,{complete=false,source="group-settings",items=modeItems}
 end
 
 local function sampleParameterContext(catalog,group,ref,axis,first,last,noteCount)
@@ -212,14 +235,17 @@ local function sampleComputedPitch(ref,axis,first,last,noteCount)
   if noteCount<1 or noteCount>128 or not finite(first) or not finite(last) or last<=first then return unavailable end
   local readable,result=pcall(function()
     local startSec,endSec=axis:getSecondsFromBlick(first),axis:getSecondsFromBlick(last)
-    if not finite(startSec) or not finite(endSec) or endSec<=startSec or endSec-startSec>30
-        or type(SV.getComputedPitchForGroup)~="function" then return unavailable end
+    if not finite(startSec) or not finite(endSec) or endSec<=startSec or endSec-startSec>30 then return unavailable end
+    -- 实际宿主的方法绑定可能是可调用 userdata。这里只辨别候选类型，调用仍
+    -- 放在当前 pcall 内；不能像纯 Lua 测试替身那样只接受 function。
+    local callback=SV.getComputedPitchForGroup
+    if type(callback)~="function" and type(callback)~="userdata" then return unavailable end
     -- 不超过 97 帧；极短区间减少帧数，避免相邻位置小于一个 blick。
     -- 官方接口按 blick 等距，公开位置则逐点通过速度图换为真实秒比例。
     local frames=math.min(97,math.floor(last-first)+1)
     if frames<2 then return unavailable end
     local interval=(last-first)/(frames-1)
-    local values=SV:getComputedPitchForGroup(ref,first,interval,frames)
+    local values=callback(SV,ref,first,interval,frames)
     if type(values)~="table" or values==json.null then return unavailable end
     -- 空数组表示尚未完成计算。只报告状态，绝不循环等待或阻塞宿主脚本线程。
     if next(values)==nil then return {status="pending",unit="MIDI",samples={}} end
@@ -262,7 +288,7 @@ local function selection()
       onset=n:getOnset(),duration=n:getDuration(),onsetSeconds=axis:getSecondsFromBlick(onset),
       durationSeconds=axis:getSecondsFromBlick(finish)-axis:getSecondsFromBlick(onset)}
   end
-  local curves,voiceFingerprint,modeCount=parameterCatalog(editor,ref,group)
+  local curves,voiceFingerprint,modeCount,vocalModes=parameterCatalog(editor,ref,group)
   sampleParameterContext(curves,group,ref,axis,first,last,#notes)
   local computedPitch=sampleComputedPitch(ref,axis,first,last,#notes)
   local pitchWarning=nil
@@ -288,6 +314,7 @@ local function selection()
     groupOffset=ref:getTimeOffset(),groupPitchOffset=pitchOffset,notes=notes,noteCount=#notes,voiceFingerprint=voiceFingerprint,
     startSeconds=first and axis:getSecondsFromBlick(first) or nil,
     endSeconds=last and axis:getSecondsFromBlick(last) or nil,parameters=curves,computedPitch=computedPitch,
+    hostVersion=SV:getHostInfo().hostVersion,vocalModes=vocalModes,
     capabilities={curves=true,nativePitch=curves.pitchCurve~=nil and curves.pitchCurve.available,batchPreview=true},
     capabilityWarnings=warnings}
 end
